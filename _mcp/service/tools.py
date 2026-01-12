@@ -9,6 +9,7 @@ sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent.parent
 
 from _mcp.service import models
 from src.query.engine import QueryEngine
+from _mcp.service.task import submit_task, get_task_results, cancel_task
 
 # Shared instances dictionary (populated by application.py at startup)
 shared_instances = {}
@@ -238,13 +239,11 @@ def get_context_handler(codebase_id: str, file_path: str, line_number: int, cont
 
 def submit_task_handler(codebase_id: str, task_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle submit_task tool call - creates a background task."""
-    from _mcp.service.task import submit_task
     return submit_task(tenant=codebase_id, task_type=task_type, params=params)
 
 
 def get_task_results_handler(codebase_id: str) -> Dict[str, Any]:
     """Handle get_task_results tool call - returns all tasks for a codebase."""
-    from _mcp.service.task import get_task_results
     # Filter tasks by codebase_id (tenant)
     all_tasks = get_task_results()
     # Task manager uses tenant field which maps to codebase_id
@@ -253,7 +252,6 @@ def get_task_results_handler(codebase_id: str) -> Dict[str, Any]:
 
 def cancel_task_handler(codebase_id: str, task_id: str) -> Dict[str, Any]:
     """Handle cancel_task tool call - cancels a running/pending task."""
-    from _mcp.service.task import cancel_task
     # Note: cancel_task validates the task belongs to the current tenant
     return cancel_task(task_id=task_id)
 

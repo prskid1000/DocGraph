@@ -4,12 +4,11 @@ from __future__ import annotations
 from typing import Any, Dict, Optional
 from _mcp.context import get_current_data
 from _mcp.logger import app_logger as logger
+from _mcp.service.task import get_task_results, cancel_task
 
 
 def get_task_status() -> Dict[str, Any]:
     """Get task status for the current codebase via API."""
-    from _mcp.service.task.task_manager import get_task_results
-    
     codebase_id = get_current_data('codebase_id')
     
     if not codebase_id:
@@ -31,8 +30,6 @@ def get_task_status() -> Dict[str, Any]:
 
 def cancel_task_request(task_id: str) -> Dict[str, Any]:
     """Cancel a task via API."""
-    from _mcp.service.task.task_manager import cancel_task
-    
     current_codebase_id = get_current_data('codebase_id')
     
     if not current_codebase_id:
