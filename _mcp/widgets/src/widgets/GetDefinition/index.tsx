@@ -92,10 +92,6 @@ function GetDefinitionWidget() {
     <div className="p-2 sm:p-4 max-w-7xl mx-auto bg-white max-h-[500px] overflow-x-auto overflow-y-auto">
       <div className="mb-4">
         <h2 className="text-xl sm:text-2xl font-bold text-gray-900 mb-2">{definition.name}</h2>
-        <div className="text-sm text-gray-600 font-mono">
-          {definition.file_path}:{definition.start_line ?? definition.line_number}
-          {definition.line_end && <span>-{definition.line_end}</span>}
-        </div>
       </div>
       <NestedObject data={definition} />
     </div>

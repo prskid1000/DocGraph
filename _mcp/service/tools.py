@@ -4,7 +4,10 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional
 from pydantic import BaseModel
+import json
+from _mcp.logger import app_logger as logger
 import sys
+import re
 sys.path.insert(0, str(__import__('pathlib').Path(__file__).parent.parent.parent))
 
 from _mcp.service import models
@@ -13,6 +16,43 @@ from _mcp.service.task import submit_task, get_task_results, cancel_task
 
 # Shared instances dictionary (populated by application.py at startup)
 shared_instances = {}
+
+
+def parse_bracket_params(s: str) -> Dict[str, Any]:
+    """Parse a simple bracketed param format into a dict.
+
+    Supported line forms:
+      [key] = value
+      [key] = "value with spaces or backslashes"
+      [key] = 'value'
+    Trailing commas are ignored. Blank lines and lines starting with # or // are skipped.
+    """
+    out: Dict[str, Any] = {}
+    if not isinstance(s, str):
+        return out
+
+    for raw in s.splitlines():
+        line = raw.strip()
+        if not line or line.startswith('#') or line.startswith('//'):
+            continue
+        # drop trailing commas
+        if line.endswith(','):
+            line = line[:-1].rstrip()
+
+        m = re.match(r'^\[?\s*(?P<key>[^\]\=]+?)\s*\]?\s*=\s*(?P<val>.*)$', line)
+        if not m:
+            continue
+
+        key = m.group('key').strip()
+        val = m.group('val').strip()
+
+        # strip surrounding quotes if present
+        if (val.startswith('"') and val.endswith('"')) or (val.startswith("'") and val.endswith("'")):
+            val = val[1:-1]
+
+        out[key] = val
+
+    return out
 
 
 @dataclass(frozen=True)
@@ -28,6 +68,11 @@ class ToolDefinition:
 
     def execute(self, arguments: Dict[str, Any]) -> Dict[str, Any]:
         """Execute the tool with validated arguments."""
+        # If `params` is provided as a string, parse it using the bracket-format parser.
+        if isinstance(arguments, dict) and 'params' in arguments and isinstance(arguments['params'], str):
+            arguments = dict(arguments)  # shallow copy
+            arguments['params'] = parse_bracket_params(arguments['params'])
+
         # Validate input
         payload = self.input_model.model_validate(arguments)
         
@@ -239,21 +284,22 @@ def get_context_handler(codebase_id: str, file_path: str, line_number: int, cont
 
 def submit_task_handler(codebase_id: str, task_type: str, params: Dict[str, Any]) -> Dict[str, Any]:
     """Handle submit_task tool call - creates a background task."""
-    return submit_task(tenant=codebase_id, task_type=task_type, params=params)
+    # Use explicit codebase_id parameter (task_manager.submit_task expects codebase_id)
+    return submit_task(codebase_id=codebase_id, task_type=task_type, params=params)
 
 
 def get_task_results_handler(codebase_id: str) -> Dict[str, Any]:
     """Handle get_task_results tool call - returns all tasks for a codebase."""
     # Filter tasks by codebase_id (tenant)
-    all_tasks = get_task_results()
-    # Task manager uses tenant field which maps to codebase_id
+    # Use explicit codebase_id (don't rely on request context)
+    all_tasks = get_task_results(codebase_id)
     return all_tasks
 
 
 def cancel_task_handler(codebase_id: str, task_id: str) -> Dict[str, Any]:
     """Handle cancel_task tool call - cancels a running/pending task."""
-    # Note: cancel_task validates the task belongs to the current tenant
-    return cancel_task(task_id=task_id)
+    # Use explicit codebase_id so we don't rely on request context
+    return cancel_task(task_id=task_id, codebase_id=codebase_id)
 
 
 # Tool definitions registry

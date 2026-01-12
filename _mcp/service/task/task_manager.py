@@ -361,15 +361,25 @@ def submit_task(
     queue = get_task_queue()
     task_id = queue.submit_task(codebase_id, task_type, params, metadata)
     
-    result = get_task_results()
+    result = get_task_results(codebase_id)
     result["newly_created_task_id"] = task_id
     
     return result
 
 
-def get_task_status(task_id: str) -> Dict[str, Any]:
-    """Get task status."""
-    current_codebase_id = get_current_data('codebase_id')
+def get_task_status(task_id: str, codebase_id: str) -> Dict[str, Any]:
+    """Get task status for a specific codebase.
+
+    This function requires an explicit `codebase_id` and will not fall
+    back to request context.
+    """
+    current_codebase_id = codebase_id
+
+    if not current_codebase_id:
+        return {
+            "success": False,
+            "error": "No codebase_id provided"
+        }
     
     queue = get_task_queue()
     task = queue.get_task(task_id)
@@ -408,9 +418,18 @@ def get_task_status(task_id: str) -> Dict[str, Any]:
     return result
 
 
-def cancel_task(task_id: str) -> Dict[str, Any]:
-    """Cancel a task."""
-    current_codebase_id = get_current_data('codebase_id')
+def cancel_task(task_id: str, codebase_id: str) -> Dict[str, Any]:
+    """Cancel a task for a given `codebase_id`.
+
+    `codebase_id` is required; there is no fallback to request context.
+    """
+    current_codebase_id = codebase_id
+
+    if not current_codebase_id:
+        return {
+            "success": False,
+            "error": "No codebase_id provided"
+        }
     
     queue = get_task_queue()
     task = queue.get_task(task_id)
@@ -430,7 +449,7 @@ def cancel_task(task_id: str) -> Dict[str, Any]:
     cancelled = queue.cancel_task(task_id)
     
     if cancelled:
-        return get_task_results()
+        return get_task_results(current_codebase_id)
     else:
         return {
             "success": False,
@@ -447,16 +466,19 @@ def get_queue_status() -> Dict[str, Any]:
     }
 
 
-def get_task_results() -> Dict[str, Any]:
-    """Get all tasks for the current codebase, grouped by status."""
-    current_codebase_id = get_current_data('codebase_id')
-    
+def get_task_results(codebase_id: str) -> Dict[str, Any]:
+    """Get all tasks for the given codebase, grouped by status.
+
+    `codebase_id` is required; there is no fallback to request context.
+    """
+    current_codebase_id = codebase_id
+
     if not current_codebase_id:
         return {
             "success": False,
-            "error": "No codebase_id context available"
+            "error": "No codebase_id provided"
         }
-    
+
     queue = get_task_queue()
     codebase_tasks = queue.get_tasks_by_codebase(current_codebase_id)
     

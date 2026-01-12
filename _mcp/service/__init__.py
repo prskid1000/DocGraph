@@ -6,7 +6,7 @@ from _mcp.service.handlers import *
 from _mcp.service.prompts import *
 from _mcp.service.cloudwatch_logger import *
 from _mcp.service.widgets import *
-from _mcp.service.request import *
+from _mcp.service.task.task_manager import get_task_status, cancel_task as cancel_task_request
 
 # Export all functions from all modules
 from _mcp.service.tools import (
@@ -19,7 +19,7 @@ from _mcp.service.tools import (
 from _mcp.service.handlers import (
     get_widget_actual_filename, get_widget_base_url, get_widget_src_url, get_tool_meta,
     get_embedded_widget_resource, list_tools, list_resources, list_resource_templates,
-    handle_read_resource, generate_tools_documentation, handle_call_tool, list_prompts,
+    handle_read_resource, handle_call_tool, list_prompts,
     handle_get_prompt
 )
 from _mcp.service.prompts import (
@@ -28,7 +28,8 @@ from _mcp.service.prompts import (
 )
 from _mcp.service.cloudwatch_logger import log_to_cloudwatch
 from _mcp.service.widgets import Widget, widgets
-from _mcp.service.request import get_task_status, cancel_task_request
+# task manager exports (require explicit codebase_id)
+from _mcp.service.task.task_manager import get_task_status, cancel_task as cancel_task_request
 
 __all__ = [
     # tools.py
@@ -40,7 +41,7 @@ __all__ = [
     # handlers.py
     "get_widget_actual_filename", "get_widget_base_url", "get_widget_src_url", "get_tool_meta",
     "get_embedded_widget_resource", "list_tools", "list_resources", "list_resource_templates",
-    "handle_read_resource", "generate_tools_documentation", "handle_call_tool", "list_prompts",
+    "handle_read_resource", "handle_call_tool", "list_prompts",
     "handle_get_prompt",
     # prompts.py
     "PromptArgument", "PromptDefinition", "PROMPT_DEFINITIONS", "get_prompt_definition",

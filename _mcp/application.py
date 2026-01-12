@@ -255,6 +255,18 @@ async def info_endpoint(request: Request) -> JSONResponse:
 
 async def mcp_manifest(request: Request) -> JSONResponse:
     """MCP manifest endpoint."""
+    # Try to load a manifest file from _mcp/.well-known/mcp.json
+    manifest_path = pathlib.Path(__file__).parent / ".well-known" / "mcp.json"
+
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+                return JSONResponse(data)
+        except Exception as e:
+            logger.warning(f"Could not read manifest file {manifest_path}: {e}")
+
+    # Fallback to generated manifest if file is missing or invalid
     manifest = {
         "mcpServers": {
             "docgraph": {

@@ -100,14 +100,22 @@ function TaskResultWidget() {
 
     try {
       if (window.openai?.callTool) {
-        const response: any = await window.openai.callTool("docgraph-task-result", {});
+        const codebaseId = (data && (data.codebase_id || (data.codebaseId as any))) || (window.openai && window.openai.toolOutput && window.openai.toolOutput.codebase_id);
+        if (!codebaseId) {
+          console.warn("No codebase_id available for task-result refresh");
+          if (!silent) alert("Unable to refresh tasks: missing codebase_id");
+          return;
+        }
+        const response: any = await window.openai.callTool("task-result", { codebase_id: codebaseId });
         
         let result;
-        if (typeof response.result === 'string') {
+        // Prefer structuredContent when provided by the server
+        if (response.structuredContent) {
+          result = response.structuredContent;
+        } else if (typeof response.result === 'string') {
           try {
             result = JSON.parse(response.result);
           } catch (e) {
-            console.error("Failed to parse tool response:", e, response);
             result = response.result;
           }
         } else {
@@ -161,8 +169,14 @@ function TaskResultWidget() {
 
     try {
       if (window.openai?.callTool) {
-        const response: any = await window.openai.callTool("docgraph-cancel-task", {
-          taskId: taskId
+        const codebaseId = (data && (data.codebase_id || (data.codebaseId as any))) || (window.openai && window.openai.toolOutput && window.openai.toolOutput.codebase_id);
+        if (!codebaseId) {
+          alert("Unable to cancel task: missing codebase_id");
+          return;
+        }
+        const response: any = await window.openai.callTool("cancel-task", {
+          codebase_id: codebaseId,
+          task_id: taskId
         });
         
         let result;

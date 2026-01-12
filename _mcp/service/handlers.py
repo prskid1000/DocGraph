@@ -161,24 +161,44 @@ async def list_tools() -> list[types.Tool]:
 
 
 async def list_resources() -> list[types.Resource]:
-    """List available resources (codebase documentation)."""
-    codebase_id = get_current_data('codebase_id')
-    
-    resources = [
-        types.Resource(
-            uri=f"docgraph://codebase/{codebase_id}",
-            name=f"Codebase: {codebase_id}",
-            description="Knowledge graph for the indexed codebase",
-            mimeType="text/plain"
-        ),
-        types.Resource(
-            uri="docgraph://tools/documentation",
-            name="Tools Documentation",
-            description="Documentation for all available MCP tools",
-            mimeType="text/markdown"
-        ),
-    ]
-    
+    """List all available resources under the package `resources` folder.
+
+    This enumerates every file under `_mcp/resources` (recursively) and
+    returns a `docgraph://resource/...` URI for each entry. It does not
+    depend on any codebase context.
+    """
+
+    resources: List[types.Resource] = []
+
+    # Base resources directory inside the _mcp package
+    resources_dir = pathlib.Path(__file__).parent.parent / "resources"
+
+    def _mime_for_path(p: pathlib.Path) -> str:
+        s = p.suffix.lower()
+        if s in (".md", ".markdown"):
+            return "text/markdown"
+        if s in (".html", ".htm"):
+            return "text/html"
+        if s in (".txt",):
+            return "text/plain"
+        return "text/plain"
+
+    # Enumerate every file under the resources directory
+    if resources_dir.exists() and resources_dir.is_dir():
+        for file in sorted(resources_dir.rglob("*")):
+            if not file.is_file():
+                continue
+            rel = file.relative_to(resources_dir)
+            uri = f"docgraph://resource/{rel.as_posix()}"
+            resources.append(
+                types.Resource(
+                    uri=uri,
+                    name=file.name,
+                    description=f"Resource: {rel.as_posix()}",
+                    mimeType=_mime_for_path(file),
+                )
+            )
+
     return resources
 
 
@@ -215,19 +235,61 @@ async def handle_read_resource(req: types.ReadResourceRequest) -> types.ServerRe
         return types.ServerResult(types.ReadResourceResult(contents=contents))
     
     # Handle documentation resources
-    if uri == "docgraph://tools/documentation":
-        content = generate_tools_documentation()
-    elif uri.startswith("docgraph://codebase/"):
-        codebase_id = uri.replace("docgraph://codebase/", "")
-        content = f"Knowledge graph documentation for codebase: {codebase_id}\n\nUse the available tools to query this codebase."
-    else:
-        return types.ServerResult(
-            types.ReadResourceResult(
-                contents=[],
-                _meta={"error": f"Unknown resource: {uri}"},
+    if "docgraph://resource" in uri:
+        # Map URIs like `docgraph://resource/path/to/file.md` to files
+        # under the `_mcp/resources` directory.
+        resources_dir = pathlib.Path(__file__).parent.parent / "resources"
+
+        # Extract the resource path part after the prefix
+        prefix = "docgraph://resource/"
+        resource_path = uri[len(prefix):] if uri.startswith(prefix) else uri.replace("docgraph://resource", "").lstrip("/")
+
+        # Resolve target file path and guard against path traversal
+        target = (resources_dir / resource_path).resolve()
+        try:
+            if not resources_dir.exists():
+                raise FileNotFoundError(f"Resources directory not found: {resources_dir}")
+
+            # Ensure the resolved target is inside the resources directory
+            if not str(target).startswith(str(resources_dir.resolve())):
+                raise PermissionError("Invalid resource path")
+
+            if not target.exists() or not target.is_file():
+                raise FileNotFoundError(f"Resource not found: {resource_path}")
+
+            text = target.read_text(encoding="utf-8")
+
+            # Basic MIME detection by extension
+            suffix = target.suffix.lower()
+            if suffix in (".md", ".markdown"):
+                mime = "text/markdown"
+            elif suffix in (".html", ".htm"):
+                mime = "text/html"
+            elif suffix in (".txt",):
+                mime = "text/plain"
+            else:
+                mime = "text/plain"
+
+            content = text
+            return types.ServerResult(
+                types.ReadResourceResult(
+                    contents=[
+                        types.TextResourceContents(
+                            uri=uri,
+                            mimeType=mime,
+                            text=content,
+                        )
+                    ]
+                )
             )
-        )
-    
+        except Exception as e:
+            return types.ServerResult(
+                types.ReadResourceResult(
+                    contents=[],
+                    _meta={"error": str(e)},
+                )
+            )
+
     return types.ServerResult(
         types.ReadResourceResult(
             contents=[
@@ -239,27 +301,6 @@ async def handle_read_resource(req: types.ReadResourceRequest) -> types.ServerRe
             ]
         )
     )
-
-
-def generate_tools_documentation() -> str:
-    """Generate documentation for all available tools."""
-    doc = "# DocGraph MCP Tools Documentation\n\n"
-    
-    for tool_id, tool_def in TOOL_DEFINITIONS.items():
-        doc += f"## {tool_def.title}\n\n"
-        doc += f"**ID:** `{tool_def.identifier}`\n\n"
-        doc += f"**Description:** {tool_def.description}\n\n"
-        doc += "**Parameters:**\n\n"
-        
-        if "properties" in tool_def.input_schema:
-            for prop_name, prop_schema in tool_def.input_schema["properties"].items():
-                required = prop_name in tool_def.input_schema.get("required", [])
-                req_str = "required" if required else "optional"
-                doc += f"- `{prop_name}` ({prop_schema.get('type', 'unknown')}, {req_str}): {prop_schema.get('description', '')}\n"
-        
-        doc += "\n"
-    
-    return doc
 
 
 async def handle_call_tool(req: types.CallToolRequest) -> types.ServerResult:
