@@ -1,0 +1,78 @@
+languages:
+  python:
+    enabled: true
+    parser: tree-sitter-python
+    extensions:
+      - .py
+    features:
+      - classes
+      - functions
+      - variables
+      - imports
+      - type_hints
+      - decorators
+  
+  javascript:
+    enabled: true
+    parser: tree-sitter-javascript
+    extensions:
+      - .js
+      - .jsx
+    features:
+      - classes
+      - functions
+      - variables
+      - imports
+      - jsx
+  
+  typescript:
+    enabled: true
+    parser: tree-sitter-typescript
+    extensions:
+      - .ts
+      - .tsx
+    features:
+      - classes
+      - functions
+      - variables
+      - imports
+      - type_annotations
+      - interfaces
+  
+  java:
+    enabled: true
+    parser: tree-sitter-java
+    extensions:
+      - .java
+    features:
+      - classes
+      - methods
+      - variables
+      - imports
+      - annotations
+  
+  go:
+    enabled: true
+    parser: tree-sitter-go
+    extensions:
+      - .go
+    features:
+      - functions
+      - structs
+      - variables
+      - imports
+      - interfaces
+  
+  rust:
+    enabled: true
+    parser: tree-sitter-rust
+    extensions:
+      - .rs
+    features:
+      - functions
+      - structs
+      - enums
+      - variables
+      - imports
+      - traits
+
