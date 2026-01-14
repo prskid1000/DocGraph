@@ -51,6 +51,17 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
         total_resolved = sum(len(v) for v in resolved.values())
         logger.info(f"JavaScript: Resolved {total_resolved}/{len(references)} references ({total_resolved/len(references)*100:.1f}%)" if references else "JavaScript: No references")
         
+        # Log unresolved references
+        if self.unresolved_references:
+            unresolved_details = []
+            for ref in self.unresolved_references:
+                detail = f"  - {ref.to_entity} (type: {ref.reference_type}, file: {ref.file_path}, line: {ref.line_number}"
+                if ref.scope:
+                    detail += f", scope: {ref.scope}"
+                detail += ")"
+                unresolved_details.append(detail)
+            logger.info(f"JavaScript: Unresolved references ({len(self.unresolved_references)}):\n" + "\n".join(unresolved_details))
+        
         self.resolved_references = resolved
         return resolved
     
