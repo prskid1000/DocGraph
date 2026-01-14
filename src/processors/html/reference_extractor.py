@@ -88,24 +88,35 @@ class HTMLReferenceExtractor(BaseReferenceExtractor):
                     for match in re.finditer(call_pattern, script_code):
                         func_name = match.group(1)
                         if func_name not in ['if', 'for', 'while', 'switch', 'return', 'new', 'typeof', 'instanceof']:
+                            # Robust line number calculation
+                            rel_line = match.string[:match.start()].count('\n')
+                            try:
+                                line_offset = script_lines.index(script_lines[rel_line])
+                            except (ValueError, IndexError):
+                                line_offset = rel_line if rel_line < len(script_lines) else 0
                             references.append(ScopedReference(
                                 from_entity=file_path_str,
                                 to_entity=func_name,
                                 reference_type='calls',
                                 file_path=file_path_str,
-                                line_number=script_start_line + script_lines.index(match.string[:match.start()].count('\n'))
+                                line_number=script_start_line + line_offset
                             ))
                     # Extract variable references (REFERENCES)
                     var_ref_pattern = r'\b([a-zA-Z_$][\w$]*)\b'
                     for match in re.finditer(var_ref_pattern, script_code):
                         var_name = match.group(1)
                         if var_name not in ['const', 'let', 'var', 'function', 'class', 'if', 'for', 'while', 'return', 'this', 'true', 'false', 'null', 'undefined']:
+                            rel_line = match.string[:match.start()].count('\n')
+                            try:
+                                line_offset = script_lines.index(script_lines[rel_line])
+                            except (ValueError, IndexError):
+                                line_offset = rel_line if rel_line < len(script_lines) else 0
                             references.append(ScopedReference(
                                 from_entity=file_path_str,
                                 to_entity=var_name,
                                 reference_type='references',
                                 file_path=file_path_str,
-                                line_number=script_start_line + script_lines.index(match.string[:match.start()].count('\n'))
+                                line_number=script_start_line + line_offset
                             ))
                 in_script = False
                 script_lines = []
