@@ -162,6 +162,11 @@ def index_codebase(codebase_path: str, languages: List[str] = None,
     for language, lang_references in references_by_lang.items():
         processor = processors_by_lang.get(language)
         if processor:
+            # Verify processor language matches
+            if processor.language != language:
+                logger.warning(f"Processor language mismatch: processor.language={processor.language}, expected={language}")
+                continue
+            
             # Create entity container for this language's entities
             from src.processors.entity_container import EntityContainer
             lang_entity_container = EntityContainer()
@@ -179,10 +184,17 @@ def index_codebase(codebase_path: str, languages: List[str] = None,
             lang_exts = lang_extensions.get(language, [])
             lang_entities = [e for e in all_entities if Path(e.file_path).suffix in lang_exts]
             
+            # Verify all references are for this language
+            ref_file_exts = {Path(ref.file_path).suffix for ref in lang_references}
+            invalid_refs = [ref for ref in lang_references if Path(ref.file_path).suffix not in lang_exts]
+            if invalid_refs:
+                logger.warning(f"Language {language} has {len(invalid_refs)} references from wrong language files: {ref_file_exts}")
+            
             lang_entity_container.add_entities(lang_entities)
             
             # Create resolver and resolve
             resolver = processor.create_reference_resolver(lang_entity_container)
+            logger.debug(f"Resolving {len(lang_references)} references for {language} using {resolver.__class__.__name__}")
             resolved = resolver.resolve_references(lang_references)
             
             # Merge resolved references

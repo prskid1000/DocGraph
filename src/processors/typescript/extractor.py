@@ -125,8 +125,8 @@ class TypeScriptEntityExtractor(BaseEntityExtractor):
                         }
                     ))
             
-            # Extract variables
-            elif node.type == 'variable_declaration' and parent is None:
+            # Extract variables - both module-level and class-level
+            elif node.type == 'variable_declaration':
                 for child in node.children:
                     if child.type == 'variable_declarator':
                         name_node = child.child_by_field_name('name')
@@ -134,6 +134,28 @@ class TypeScriptEntityExtractor(BaseEntityExtractor):
                             name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                             entities.append(CodeEntity(
                                 name=name,
+                                entity_type='variable',
+                                file_path=file_path_str,
+                                start_line=node.start_point[0] + 1,
+                                end_line=node.end_point[0] + 1,
+                                start_column=node.start_point[1],
+                                end_column=node.end_point[1],
+                                parent=parent
+                            ))
+            
+            # Extract class properties from assignments (this.name = ...)
+            elif node.type == 'assignment_expression' and parent:
+                left = node.child_by_field_name('left')
+                if left and left.type == 'member_expression':
+                    obj = left.child_by_field_name('object')
+                    property_node = left.child_by_field_name('property')
+                    if obj and obj.type == 'this' and property_node:
+                        prop_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
+                        # Check if we already extracted this property
+                        existing = [e for e in entities if e.name == prop_name and e.parent == parent and e.entity_type == 'variable']
+                        if not existing:
+                            entities.append(CodeEntity(
+                                name=prop_name,
                                 entity_type='variable',
                                 file_path=file_path_str,
                                 start_line=node.start_point[0] + 1,

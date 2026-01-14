@@ -105,14 +105,17 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
         """Get the language name for logging."""
         class_name = self.__class__.__name__
         # Extract language from class name (e.g., "TypeScriptReferenceResolver" -> "TypeScript")
-        if 'TypeScript' in class_name:
+        # Check JavaScript first to avoid matching "Java" in "JavaScript"
+        if 'JavaScript' in class_name or ('Java' in class_name and 'Script' in class_name):
+            return 'JavaScript'
+        elif 'TypeScript' in class_name:
             return 'TypeScript'
-        elif 'Java' in class_name and 'Kotlin' not in class_name:
-            return 'Java'
         elif 'Kotlin' in class_name:
             return 'Kotlin'
+        elif 'Java' in class_name:
+            return 'Java'
         else:
-            return 'JavaScript'
+            return 'JavaScript'  # Default fallback
     
     def _should_resolve_reference(self, ref: ScopedReference) -> bool:
         """Check if a reference should be resolved."""
@@ -163,6 +166,16 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
             candidates = [e for e in scope_entities if e.name == target_name and e.entity_type in ['variable', 'parameter']]
             if candidates:
                 return candidates[0]
+            
+            # Also check if the scope is a class and look for properties in that class
+            # (properties might be defined via this.prop = value)
+            class_entities = [e for e in self.by_name.get(ref.scope, []) if e.entity_type == 'class']
+            if class_entities:
+                class_entity = class_entities[0]
+                # Look for variables with this class as parent
+                class_properties = [e for e in scope_entities if e.parent == ref.scope and e.name == target_name]
+                if class_properties:
+                    return class_properties[0]
         
         # Original resolution logic continues...
         

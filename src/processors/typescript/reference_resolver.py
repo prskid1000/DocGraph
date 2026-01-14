@@ -137,6 +137,19 @@ class TypeScriptReferenceResolver(BaseReferenceResolver):
                 if candidates:
                     return candidates[0]
         
+        # Handle property references - try to find the property in the class/scope
+        if ref.context and ref.context.get('is_property') and ref.scope:
+            scope_entities = self.by_scope.get(ref.scope, [])
+            candidates = [e for e in scope_entities if e.name == target_name and e.entity_type in ['variable', 'parameter']]
+            if candidates:
+                return candidates[0]
+            # Also check if the scope is a class and look for properties in that class
+            class_entities = [e for e in self.by_name.get(ref.scope, []) if e.entity_type == 'class']
+            if class_entities:
+                class_properties = [e for e in scope_entities if e.parent == ref.scope and e.name == target_name]
+                if class_properties:
+                    return class_properties[0]
+        
         # Strategy 2: Scoped lookup (within class/function scope)
         if ref.scope:
             scoped_name = f"{ref.scope}.{target_name}"

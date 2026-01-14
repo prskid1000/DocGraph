@@ -20,11 +20,42 @@ class JavaReferenceExtractor(BaseReferenceExtractor):
         """Extract Java references including package imports."""
         references = []
         file_path_str = str(file_path)
+        current_scope = []
         
         if ast is None or not ast.root_node:
             return references
         
         def extract_java_refs(node: tree_sitter.Node):
+            # Track scope
+            if node.type == 'class_declaration':
+                name_node = node.child_by_field_name('name')
+                if name_node:
+                    class_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
+                    current_scope.append(class_name)
+                    
+                    # Extract INHERITS relationships
+                    superclass_node = node.child_by_field_name('superclass')
+                    if superclass_node:
+                        superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                        superclass_name = superclass_name.replace('extends', '').strip()
+                        base_name = superclass_name.split('.')[-1].strip()
+                        if base_name:
+                            references.append(ScopedReference(
+                                from_entity=class_name,
+                                to_entity=base_name,
+                                reference_type='inherits',
+                                file_path=file_path_str,
+                                line_number=node.start_point[0] + 1,
+                                qualified_name=superclass_name,
+                                context={'base_class': superclass_name}
+                            ))
+            
+            elif node.type == 'method_declaration':
+                name_node = node.child_by_field_name('name')
+                if name_node:
+                    method_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
+                    current_scope.append(method_name)
+            
             # Extract import statements
             if node.type == 'import_declaration':
                 source = node.child_by_field_name('source')
@@ -35,32 +66,9 @@ class JavaReferenceExtractor(BaseReferenceExtractor):
                         to_entity=package_name,
                         reference_type='imports',
                         file_path=file_path_str,
-                        line_number=node.start_point[0] + 1
+                        line_number=node.start_point[0] + 1,
+                        scope=current_scope[-1] if current_scope else None
                     ))
-            
-            # Extract INHERITS relationships from class declarations
-            elif node.type == 'class_declaration':
-                name_node = node.child_by_field_name('name')
-                superclass_node = node.child_by_field_name('superclass')
-                if name_node and superclass_node:
-                    class_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
-                    superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
-                    # Clean up superclass name - remove "extends" keyword if present
-                    superclass_name = superclass_name.replace('extends', '').strip()
-                    # Extract class name from superclass (handle qualified names)
-                    base_name = superclass_name.split('.')[-1].strip()
-                    # Remove any remaining whitespace or invalid characters
-                    base_name = base_name.strip()
-                    if base_name:
-                        references.append(ScopedReference(
-                            from_entity=class_name,
-                            to_entity=base_name,
-                            reference_type='inherits',
-                            file_path=file_path_str,
-                            line_number=node.start_point[0] + 1,
-                            qualified_name=superclass_name,
-                            context={'base_class': superclass_name}
-                        ))
             
             # Extract method calls
             elif node.type == 'method_invocation':
@@ -68,17 +76,27 @@ class JavaReferenceExtractor(BaseReferenceExtractor):
                 if name_node:
                     method_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                    scope = current_scope[-1] if current_scope else None
                     references.append(ScopedReference(
                         from_entity=enclosing.name if enclosing else file_path_str,
                         to_entity=method_name,
                         reference_type='calls',
                         file_path=file_path_str,
                         line_number=node.start_point[0] + 1,
+                        scope=scope,
                         context={'expected_type': 'function'}
                     ))
             
             for child in node.children:
                 extract_java_refs(child)
+            
+            # Pop scope
+            if node.type == 'class_declaration':
+                if current_scope:
+                    current_scope.pop()
+            elif node.type == 'method_declaration':
+                if current_scope:
+                    current_scope.pop()
         
         extract_java_refs(ast.root_node)
         return references

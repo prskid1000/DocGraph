@@ -163,6 +163,25 @@ class JavaReferenceResolver(BaseReferenceResolver):
         
         # Strategy 2: Scoped lookup (within class scope)
         if ref.scope:
+            # First, determine if scope is a class or method
+            scope_entity = None
+            for entity in self.entity_container.get_all_entities():
+                if entity.name == ref.scope and entity.file_path == ref.file_path:
+                    scope_entity = entity
+                    break
+            
+            # If scope is a method, also look in its parent class
+            if scope_entity and scope_entity.entity_type == 'function' and scope_entity.parent:
+                # Look in parent class scope
+                parent_scope_entities = self.by_scope.get(scope_entity.parent, [])
+                candidates = [e for e in parent_scope_entities if e.name == target_name]
+                if candidates:
+                    if ref.reference_type == 'calls':
+                        method_candidates = [e for e in candidates if e.entity_type == 'function']
+                        if method_candidates:
+                            return method_candidates[0]
+                    return candidates[0]
+            
             # Look for entities within the scope (methods, fields)
             scope_entities = self.by_scope.get(ref.scope, [])
             candidates = [e for e in scope_entities if e.name == target_name]
