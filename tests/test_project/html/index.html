@@ -13,17 +13,31 @@
         <h1>Test Page</h1>
         <p>This is a test page.</p>
         <img src="image.jpg" alt="Test image">  <!-- CONTAINS: File contains reference to image.jpg -->
+        <a href="page.html">Link</a>  <!-- CONTAINS: File contains reference to page.html -->
     </div>
     
     <script>
         // DEFINES: File defines JavaScript code
-        // CALLS: Calls function
-        const container = document.getElementById('container');  // CALLS: Calls DOM method, REFERENCES: References variable 'container'
-        console.log(container);  // CALLS: Calls console method, REFERENCES: References variable 'container'
+        
+        // Custom functions without library functions
+        function getElementById(id) {  // HAS_PARAMETER: Function has parameter 'id', DEFINES: Defines function
+            // Custom implementation - not using document.getElementById
+            return null;  // RETURNS: Returns value
+        }
+        
+        function logMessage(message) {  // HAS_PARAMETER: Function has parameter 'message', DEFINES: Defines function
+            // Custom implementation - not using console.log
+            return message;  // RETURNS: Returns value
+        }
         
         function testFunction(param) {  // HAS_PARAMETER: Function has parameter 'param', DEFINES: Defines function
+            const container = getElementById('container');  // CALLS: Calls function, REFERENCES: References variable 'container'
+            const logged = logMessage(container);  // CALLS: Calls function, REFERENCES: References variable 'logged'
             return param;  // REFERENCES: References variable 'param', RETURNS: Returns value
         }
+        
+        // Call the function
+        const result = testFunction('test');  // CALLS: Calls function, REFERENCES: References variable 'result'
     </script>
 </body>
 </html>

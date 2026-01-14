@@ -1,53 +1,39 @@
+// Base module for testing - no library functions used
 
 // DEFINES: File defines entities
 
 class BaseClass {
     protected name: string;  // DEFINES: Defines property
+    protected value: number;  // DEFINES: Defines property
     
     constructor(name: string) {  // HAS_PARAMETER: Function has parameter 'name', RETURNS: Returns void (implicit)
-        this.name = name;  // REFERENCES: References property
+        this.name = name;  // REFERENCES: References property 'name'
+        this.value = 0;  // REFERENCES: References property 'value'
     }
     
     getName(): string {  // HAS_PARAMETER: Function has parameter 'this' (implicit), RETURNS: Returns type 'string'
-        return this.name;  // REFERENCES: References property
+        return this.name;  // REFERENCES: References property 'this.name'
+    }
+    
+    setValue(value: number): void {  // HAS_PARAMETER: Function has parameters 'this' (implicit) and 'value', RETURNS: Returns type 'void'
+        this.value = value;  // REFERENCES: References variables 'this.value' and 'value'
     }
 }
 
 // Module-level variable
 const GLOBAL_VAR: string = "test";  // DEFINES: Defines variable
 
-// Module-level function
+// Module-level function - custom implementation without library functions
 function helperFunction(data: string[]): string {  // HAS_PARAMETER: Function has parameter 'data', RETURNS: Returns type 'string'
-    return data.length > 0 ? data[0] : "";  // REFERENCES: References variable 'data'
+    if (data.length === 0) {  // REFERENCES: References variable 'data'
+        return "";  // RETURNS: Returns type 'string'
+    }
+    return data[0];  // REFERENCES: References variable 'data', RETURNS: Returns type 'string'
 }
 
-export { BaseClass, helperFunction };  // IMPORTS: Module exports
-
-// Base module for testing
-
-// DEFINES: File defines entities
-
-class BaseClass {
-    protected name: string;  // DEFINES: Defines property
-    
-    constructor(name: string) {  // HAS_PARAMETER: Function has parameter 'name', RETURNS: Returns void (implicit)
-        this.name = name;  // REFERENCES: References property
-    }
-    
-    getName(): string {  // HAS_PARAMETER: Function has parameter 'this' (implicit), RETURNS: Returns type 'string'
-        return this.name;  // REFERENCES: References property
-    }
-}
-
-// Module-level variable
-const GLOBAL_VAR: string = "test";  // DEFINES: Defines variable
-
-// Module-level function
-function helperFunction(data: string[]): string {  // HAS_PARAMETER: Function has parameter 'data', RETURNS: Returns type 'string'
-    if (data && data.length > 0) {
-        return data[0];  // REFERENCES: References variable 'data'
-    }
-    return "";
+function calculateSum(a: number, b: number): number {  // HAS_PARAMETER: Function has parameters 'a' and 'b', RETURNS: Returns type 'number'
+    const result = a + b;  // REFERENCES: References variables 'a' and 'b'
+    return result;  // RETURNS: Returns type 'number'
 }
 
 // Add a function that calls another function (to ensure CALLS relationship)
@@ -62,4 +48,4 @@ class SubClass extends BaseClass {
     }
 }
 
-export { BaseClass, helperFunction, callHelper, SubClass };
+export { BaseClass, helperFunction, calculateSum, callHelper, SubClass };

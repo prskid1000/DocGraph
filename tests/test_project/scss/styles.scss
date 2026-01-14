@@ -1,25 +1,29 @@
-// SCSS file demonstrating relationships
+// SCSS file demonstrating relationships - no library functions used
 
-// DEFINES: File defines variables and mixins
+// IMPORTS: File imports variables
+@import 'variables';  // IMPORTS: File imports module
+// IMPORTS: File imports mixins
+@import 'mixins';  // IMPORTS: File imports module
 
-$primary-color: #3498db;  // Variable definition
-$secondary-color: #2ecc71;
-
-@mixin button-style {  // Mixin definition
-    padding: 10px;
-    background-color: $primary-color;  // REFERENCES: References variable
-    border: none;
-}
+// DEFINES: File defines entities
 
 .button {
-    @include button-style;  // REFERENCES: References mixin
+    @include button-style;  // CALLS: Calls mixin (treated as CALLS), REFERENCES: References mixin
     color: white;
+    border-radius: 4px;
 }
 
 .container {
+    @include container-style;  // CALLS: Calls mixin, REFERENCES: References mixin
     background: $secondary-color;  // REFERENCES: References variable
     
     .nested {
         @extend .button;  // REFERENCES: References class
+        background: $primary-color;  // REFERENCES: References variable
     }
+}
+
+.wrapper {
+    @include button-style;  // CALLS: Calls mixin, REFERENCES: References mixin
+    @include container-style;  // CALLS: Calls mixin, REFERENCES: References mixin
 }

@@ -1,49 +1,36 @@
+// Base module for testing - no library functions used
 
 // DEFINES: File defines entities
 
 class BaseClass {
     constructor(name) {  // HAS_PARAMETER: Function has parameter 'name'
-        this.name = name;  // REFERENCES: References variable
+        this.name = name;  // REFERENCES: References variable 'name'
+        this.value = 0;  // REFERENCES: References variable 'value'
     }
     
     getName() {  // HAS_PARAMETER: Function has parameter 'this' (implicit)
-        return this.name;  // REFERENCES: References property
+        return this.name;  // REFERENCES: References property 'this.name'
+    }
+    
+    setValue(value) {  // HAS_PARAMETER: Function has parameters 'this' (implicit) and 'value'
+        this.value = value;  // REFERENCES: References variables 'this.value' and 'value'
     }
 }
 
 // Module-level variable
 const GLOBAL_VAR = "test";  // DEFINES: Defines variable
 
-// Module-level function
+// Module-level function - custom implementation without library functions
 function helperFunction(data) {  // HAS_PARAMETER: Function has parameter 'data'
-    return data.length > 0 ? data[0] : "";  // REFERENCES: References variable 'data'
+    if (data.length === 0) {  // REFERENCES: References variable 'data'
+        return "";  // RETURNS: Returns value
+    }
+    return data[0];  // REFERENCES: References variable 'data', RETURNS: Returns value
 }
 
-module.exports = { BaseClass, helperFunction };  // IMPORTS: Module exports
-
-// Base module for testing
-
-// DEFINES: File defines entities
-
-class BaseClass {
-    constructor(name) {  // HAS_PARAMETER: Function has parameter 'name'
-        this.name = name;  // REFERENCES: References variable
-    }
-    
-    getName() {  // HAS_PARAMETER: Function has parameter 'this' (implicit)
-        return this.name;  // REFERENCES: References property
-    }
-}
-
-// Module-level variable
-const GLOBAL_VAR = "test";  // DEFINES: Defines variable
-
-// Module-level function
-function helperFunction(data) {  // HAS_PARAMETER: Function has parameter 'data'
-    if (data && data.length > 0) {
-        return data[0];  // REFERENCES: References variable 'data'
-    }
-    return "";
+function calculateSum(a, b) {  // HAS_PARAMETER: Function has parameters 'a' and 'b'
+    const result = a + b;  // REFERENCES: References variables 'a' and 'b'
+    return result;  // RETURNS: Returns value
 }
 
 // Add a function that calls another function (to ensure CALLS relationship)
@@ -58,4 +45,4 @@ class SubClass extends BaseClass {
     }
 }
 
-module.exports = { BaseClass, helperFunction, callHelper, SubClass };
+module.exports = { BaseClass, helperFunction, calculateSum, callHelper, SubClass };
