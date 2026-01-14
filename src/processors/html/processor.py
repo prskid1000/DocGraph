@@ -19,9 +19,13 @@ class HTMLProcessor(LanguageProcessor):
     
     def parse_file(self, file_path: Path) -> Tuple[Any, str]:
         """Parse HTML file - just return source code."""
-        with open(file_path, 'r', encoding='utf-8') as f:
-            source_code = f.read()
-        return source_code, source_code  # AST is just the source for HTML
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                source_code = f.read()
+            return source_code, source_code  # AST is just the source for HTML
+        except (PermissionError, IOError, OSError) as e:
+            # Handle permission errors and other file access issues gracefully
+            raise IOError(f"Cannot read file {file_path}: {e}") from e
     
     def create_entity_extractor(self):
         """Create HTML entity extractor."""

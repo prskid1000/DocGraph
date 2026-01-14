@@ -56,12 +56,21 @@ def get_code_files(directory: Path, languages: List[str] = None) -> List[Path]:
     for ext in extensions:
         code_files.extend(directory.rglob(f"*{ext}"))
     
-    # Filter out common ignore patterns
+    # Filter out common ignore patterns and ensure we only have actual files
     ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', 'build', 'dist', '.idea', '.vscode'}
     filtered_files = []
     for file_path in code_files:
-        if not any(ignore in file_path.parts for ignore in ignore_dirs):
-            filtered_files.append(file_path)
+        # Skip if in ignored directory
+        if any(ignore in file_path.parts for ignore in ignore_dirs):
+            continue
+        
+        # CRITICAL: Only process actual files, not directories
+        # Some systems may have directories with file extensions in their names
+        if not file_path.is_file():
+            logger.debug(f"Skipping non-file path: {file_path} (is_dir={file_path.is_dir()})")
+            continue
+        
+        filtered_files.append(file_path)
     
     return filtered_files
 
@@ -127,6 +136,9 @@ def index_codebase(codebase_path: str, languages: List[str] = None,
             if len(entities) > 0:
                 logger.debug(f"Extracted {len(entities)} entities, {len(references)} references from {file_path}")
         
+        except (IOError, PermissionError, OSError) as e:
+            # File access errors - log but don't show full traceback
+            logger.warning(f"Skipping file due to access error: {file_path} - {e}")
         except Exception as e:
             logger.error(f"Error processing {file_path}: {e}", exc_info=True)
     

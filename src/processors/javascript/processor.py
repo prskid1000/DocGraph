@@ -42,13 +42,17 @@ class JavaScriptProcessor(LanguageProcessor):
     
     def parse_file(self, file_path: Path) -> Tuple[Any, str]:
         """Parse a JavaScript file."""
-        with open(file_path, 'rb') as f:
-            source_code = f.read()
-        if self.parser:
-            ast = self.parser.parse(source_code)
-        else:
-            ast = None
-        return ast, source_code.decode('utf-8')
+        try:
+            with open(file_path, 'rb') as f:
+                source_code = f.read()
+            if self.parser:
+                ast = self.parser.parse(source_code)
+            else:
+                ast = None
+            return ast, source_code.decode('utf-8')
+        except (PermissionError, IOError, OSError) as e:
+            # Handle permission errors and other file access issues gracefully
+            raise IOError(f"Cannot read file {file_path}: {e}") from e
     
     def create_entity_extractor(self) -> BaseEntityExtractor:
         """Create JavaScript entity extractor."""
