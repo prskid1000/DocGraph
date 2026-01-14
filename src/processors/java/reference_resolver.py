@@ -138,6 +138,13 @@ class JavaReferenceResolver(BaseReferenceResolver):
         if ref.reference_type == 'inherits' and target_name.startswith('extends '):
             return False
         
+        # Skip standard library methods that are expected to be unresolved
+        standard_library_methods = {'isEmpty', 'isNotEmpty', 'size', 'get', 'set', 'add', 'remove', 'contains', 
+                                     'indexOf', 'lastIndexOf', 'subList', 'clear', 'toString', 'equals', 'hashCode',
+                                     'println', 'print', 'printf', 'readLine', 'read', 'write', 'close', 'flush'}
+        if ref.reference_type == 'calls' and target_name in standard_library_methods:
+            return False
+        
         return True
     
     def _resolve_reference(self, ref: ScopedReference) -> Optional[CodeEntity]:

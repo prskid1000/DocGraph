@@ -139,10 +139,31 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                     'property_definition', 'property_signature', 'method_definition',
                     'arrow_function', 'function_expression', 'class_expression'
                 ]:
+                    # Skip if it's part of a member expression (obj.property) - we handle those separately
+                    if parent.type == 'member_expression':
+                        # Only extract if it's the object part, not the property part
+                        property_node = parent.child_by_field_name('property')
+                        if property_node and node == property_node:
+                            # This is a property access, skip it (properties like 'length' are not entities)
+                            pass
+                        else:
+                            # This is the object part, extract it
+                            identifier_name = node.text.decode('utf-8') if hasattr(node.text, 'decode') else str(node.text)
+                            scope = current_scope[-1] if current_scope else None
+                            enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                            
+                            references.append(ScopedReference(
+                                from_entity=enclosing.name if enclosing else file_path_str,
+                                to_entity=identifier_name,
+                                reference_type='references',
+                                file_path=file_path_str,
+                                line_number=node.start_point[0] + 1,
+                                scope=scope
+                            ))
                     # Only extract if it's a usage (assignment target, expression, etc.)
-                    if parent.type in ['assignment_expression', 'binary_expression', 'unary_expression', 
+                    elif parent.type in ['assignment_expression', 'binary_expression', 'unary_expression', 
                                       'return_statement', 'if_statement', 'while_statement', 'for_statement',
-                                      'expression_statement', 'member_expression']:
+                                      'expression_statement']:
                         identifier_name = node.text.decode('utf-8') if hasattr(node.text, 'decode') else str(node.text)
                         scope = current_scope[-1] if current_scope else None
                         enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
@@ -156,26 +177,32 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                             scope=scope
                         ))
             
-            # Extract member expressions (obj.property) - but not if it's part of a call (already handled)
+            # Extract member expressions (only for class properties, not object properties)
             elif node.type == 'member_expression':
                 # Only extract if it's not a call expression
                 parent = node.parent
                 if parent and parent.type != 'call_expression':
                     property_node = node.child_by_field_name('property')
+                    object_node = node.child_by_field_name('object')
                     if property_node and property_node.type == 'property_identifier':
                         property_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
-                        scope = current_scope[-1] if current_scope else None
-                        enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
-                        
-                        references.append(ScopedReference(
-                            from_entity=enclosing.name if enclosing else file_path_str,
-                            to_entity=property_name,
-                            reference_type='references',
-                            file_path=file_path_str,
-                            line_number=node.start_point[0] + 1,
-                            scope=scope,
-                            context={'is_property': True}
-                        ))
+                        # Skip common object properties that are not entities
+                        common_object_properties = {'length', 'toString', 'valueOf', 'hasOwnProperty', 'constructor', 'prototype'}
+                        if property_name not in common_object_properties:
+                            # Only extract if it's a class property (this.property)
+                            if object_node and object_node.type == 'this':
+                                scope = current_scope[-1] if current_scope else None
+                                enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                                
+                                references.append(ScopedReference(
+                                    from_entity=enclosing.name if enclosing else file_path_str,
+                                    to_entity=property_name,
+                                    reference_type='references',
+                                    file_path=file_path_str,
+                                    line_number=node.start_point[0] + 1,
+                                    scope=scope,
+                                    context={'is_property': True}
+                                ))
             
             # Recurse
             for child in node.children:

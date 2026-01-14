@@ -138,6 +138,12 @@ class KotlinReferenceResolver(BaseReferenceResolver):
         if ref.reference_type == 'inherits' and target_name.startswith('extends '):
             return False
         
+        # Skip standard library methods that are expected to be unresolved
+        standard_library_methods = {'isEmpty', 'isNotEmpty', 'size', 'get', 'set', 'add', 'remove', 'contains', 
+                                     'indexOf', 'lastIndexOf', 'subList', 'clear', 'toString', 'equals', 'hashCode'}
+        if ref.reference_type == 'calls' and target_name in standard_library_methods:
+            return False
+        
         return True
     
     def _resolve_reference(self, ref: ScopedReference) -> Optional[CodeEntity]:
@@ -182,6 +188,17 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                             return func_candidates[0]
                     return candidates[0]
             
+            # If scope is a top-level function (no parent), check all classes for the method
+            # This handles cases like getName() called on a parameter in a top-level function
+            if scope_entity and scope_entity.entity_type == 'function' and not scope_entity.parent:
+                # Check all classes in the file for this method
+                same_file = self.by_file.get(ref.file_path, [])
+                all_classes = [e for e in same_file if e.entity_type == 'class']
+                for cls in all_classes:
+                    class_methods = [e for e in same_file if e.parent == cls.name and e.name == target_name and e.entity_type == 'function']
+                    if class_methods:
+                        return class_methods[0]
+            
             # Look for entities within the scope
             scope_entities = self.by_scope.get(ref.scope, [])
             candidates = [e for e in scope_entities if e.name == target_name]
@@ -203,7 +220,7 @@ class KotlinReferenceResolver(BaseReferenceResolver):
             if candidates:
                 return candidates[0]
         
-        # Strategy 3: Same file lookup
+        # Strategy 3: Same file lookup (most common for local references)
         same_file = self.by_file.get(ref.file_path, [])
         candidates = [e for e in same_file if e.name == target_name]
         if candidates:
@@ -211,6 +228,51 @@ class KotlinReferenceResolver(BaseReferenceResolver):
             if ref.reference_type == 'calls':
                 func_candidates = [e for e in candidates if e.entity_type == 'function']
                 if func_candidates:
+                    # Try to find the enclosing function and its class
+                    # This handles cases where scope wasn't set correctly
+                    enclosing_function = None
+                    for entity in same_file:
+                        if entity.entity_type == 'function' and entity.start_line <= ref.line_number <= entity.end_line:
+                            enclosing_function = entity
+                            break
+                    
+                    # If we have an enclosing function with a parent class, look there first
+                    if enclosing_function and enclosing_function.parent:
+                        # Look for methods in the same class
+                        class_methods = [e for e in same_file if e.parent == enclosing_function.parent and e.name == target_name and e.entity_type == 'function']
+                        if class_methods:
+                            return class_methods[0]
+                    
+                    # Also check if scope was set but is a method - look in its parent class
+                    # This handles cases where scope is set but resolution didn't work in Strategy 2
+                    if ref.scope:
+                        scope_entity = None
+                        for entity in same_file:
+                            if entity.name == ref.scope and entity.entity_type == 'function':
+                                scope_entity = entity
+                                break
+                        if scope_entity and scope_entity.parent:
+                            parent_class_methods = [e for e in same_file if e.parent == scope_entity.parent and e.name == target_name and e.entity_type == 'function']
+                            if parent_class_methods:
+                                return parent_class_methods[0]
+                    
+                    # Check all classes in the file for this method
+                    # This handles cases like:
+                    # 1. Methods on parameters (getName on base: BaseClass) - when scope is a top-level function
+                    # 2. Methods in the same class when scope wasn't set correctly
+                    # 3. Methods in other classes that might be called
+                    all_classes = [e for e in same_file if e.entity_type == 'class']
+                    for cls in all_classes:
+                        class_methods = [e for e in same_file if e.parent == cls.name and e.name == target_name and e.entity_type == 'function']
+                        if class_methods:
+                            # Prefer methods in the same class as the enclosing function
+                            if enclosing_function and enclosing_function.parent == cls.name:
+                                return class_methods[0]
+                            # For methods on parameters or when scope wasn't set, return any matching method
+                            # (e.g., getName called on base: BaseClass parameter, or helperFunction in same class)
+                            return class_methods[0]
+                    
+                    # If no scope or couldn't find in class, return first function candidate
                     return func_candidates[0]
             elif ref.reference_type == 'references':
                 prop_candidates = [e for e in candidates if e.entity_type == 'variable']

@@ -110,6 +110,52 @@ class TypeScriptReferenceResolver(BaseReferenceResolver):
         if ref.reference_type == 'inherits' and target_name.startswith('extends '):
             return False
         
+        # Skip external module imports (relative paths, node modules, etc.)
+        if ref.reference_type == 'imports':
+            # Skip relative imports (./base, ../module, etc.)
+            if target_name.startswith('./') or target_name.startswith('../'):
+                return False
+            # Skip common node modules that aren't in the codebase
+            common_node_modules = {'fs', 'path', 'os', 'util', 'http', 'https', 'crypto', 'stream', 'events', 'buffer'}
+            if target_name in common_node_modules:
+                return False
+        
+        # Skip common object property names that are not entities
+        common_object_properties = {'length', 'toString', 'valueOf', 'hasOwnProperty', 'constructor', 'prototype'}
+        if target_name in common_object_properties and ref.reference_type == 'references':
+            return False
+        
+        # For local variable references, check if they're parameters or class properties
+        if ref.reference_type == 'references' and ref.scope:
+            # Check if the scope is a function and if target is a parameter
+            same_file = self.by_file.get(ref.file_path, [])
+            scope_function = None
+            for entity in same_file:
+                if entity.name == ref.scope and entity.entity_type == 'function':
+                    scope_function = entity
+                    break
+            
+            # If scope is a function, check if target is a parameter
+            if scope_function and scope_function.metadata:
+                params = scope_function.metadata.get('parameters', [])
+                if any(p.get('name') == target_name for p in params):
+                    # It's a parameter reference - parameters are not entities, so skip
+                    return False
+            
+            # Check if it's a class property
+            scope_entities = self.by_scope.get(ref.scope, [])
+            is_class_property = False
+            for entity in scope_entities:
+                if entity.name == target_name and entity.entity_type == 'variable' and entity.parent:
+                    is_class_property = True
+                    break
+            
+            # If it's not a parameter or property, check if it exists as an entity
+            if not is_class_property:
+                if not any(e.name == target_name for e in same_file):
+                    # It's likely a local variable that doesn't need resolution
+                    return False
+        
         return True
     
     def _resolve_reference(self, ref: ScopedReference) -> Optional[CodeEntity]:
@@ -126,6 +172,12 @@ class TypeScriptReferenceResolver(BaseReferenceResolver):
             candidates = [e for e in scope_entities if e.name == target_name and e.entity_type in ['variable', 'parameter']]
             if candidates:
                 return candidates[0]
+            # Also check if the scope is a class and look for properties in that class
+            class_entities = [e for e in self.by_name.get(ref.scope, []) if e.entity_type == 'class']
+            if class_entities:
+                class_properties = [e for e in scope_entities if e.parent == ref.scope and e.name == target_name]
+                if class_properties:
+                    return class_properties[0]
         
         # Strategy 1: Qualified name lookup (Class.method, module.function)
         if '.' in target_name:
@@ -137,21 +189,36 @@ class TypeScriptReferenceResolver(BaseReferenceResolver):
                 if candidates:
                     return candidates[0]
         
-        # Handle property references - try to find the property in the class/scope
-        if ref.context and ref.context.get('is_property') and ref.scope:
-            scope_entities = self.by_scope.get(ref.scope, [])
-            candidates = [e for e in scope_entities if e.name == target_name and e.entity_type in ['variable', 'parameter']]
-            if candidates:
-                return candidates[0]
-            # Also check if the scope is a class and look for properties in that class
-            class_entities = [e for e in self.by_name.get(ref.scope, []) if e.entity_type == 'class']
-            if class_entities:
-                class_properties = [e for e in scope_entities if e.parent == ref.scope and e.name == target_name]
-                if class_properties:
-                    return class_properties[0]
-        
         # Strategy 2: Scoped lookup (within class/function scope)
         if ref.scope:
+            # First, determine if scope is a class or method
+            scope_entity = None
+            for entity in self.entity_container.get_all_entities():
+                if entity.name == ref.scope and entity.file_path == ref.file_path:
+                    scope_entity = entity
+                    break
+            
+            # If scope is a method, also look in its parent class and check for parameters
+            if scope_entity and scope_entity.entity_type == 'function':
+                # Check if target is a parameter of this function
+                if scope_entity.metadata and scope_entity.metadata.get('parameters'):
+                    params = scope_entity.metadata.get('parameters', [])
+                    for param in params:
+                        if param.get('name') == target_name:
+                            # It's a parameter reference, try to resolve it as a variable in the scope
+                            pass
+                
+                # Look in parent class scope if method has a parent
+                if scope_entity.parent:
+                    parent_scope_entities = self.by_scope.get(scope_entity.parent, [])
+                    candidates = [e for e in parent_scope_entities if e.name == target_name]
+                    if candidates:
+                        if ref.reference_type == 'calls':
+                            func_candidates = [e for e in candidates if e.entity_type == 'function']
+                            if func_candidates:
+                                return func_candidates[0]
+                        return candidates[0]
+            
             scoped_name = f"{ref.scope}.{target_name}"
             candidates = self.by_qualified_name.get(scoped_name, [])
             if candidates:

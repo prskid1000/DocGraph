@@ -81,7 +81,13 @@ class PythonReferenceResolver(BaseReferenceResolver):
         """Resolve Python references."""
         resolved = defaultdict(list)
         
+        # Filter out invalid references before resolving
+        valid_references = []
         for ref in references:
+            if self._should_resolve_reference(ref):
+                valid_references.append(ref)
+        
+        for ref in valid_references:
             target = self._resolve_reference(ref)
             if target:
                 resolved[ref.reference_type].append((ref, target))
@@ -89,10 +95,73 @@ class PythonReferenceResolver(BaseReferenceResolver):
                 self.unresolved_references.append(ref)
         
         total_resolved = sum(len(v) for v in resolved.values())
-        logger.info(f"Python: Resolved {total_resolved}/{len(references)} references ({total_resolved/len(references)*100:.1f}%)")
+        total_valid = len(valid_references)
+        logger.info(f"Python: Resolved {total_resolved}/{total_valid} references ({total_resolved/total_valid*100:.1f}%)" if total_valid else "Python: No references")
+        
+        # Log unresolved references
+        if self.unresolved_references:
+            unresolved_details = []
+            for ref in self.unresolved_references:
+                detail = f"  - {ref.to_entity} (type: {ref.reference_type}, file: {ref.file_path}, line: {ref.line_number}"
+                if ref.scope:
+                    detail += f", scope: {ref.scope}"
+                detail += ")"
+                unresolved_details.append(detail)
+            logger.info(f"Python: Unresolved references ({len(self.unresolved_references)}):\n" + "\n".join(unresolved_details))
         
         self.resolved_references = resolved
         return resolved
+    
+    def _should_resolve_reference(self, ref: ScopedReference) -> bool:
+        """Check if a reference should be resolved."""
+        target_name = ref.to_entity.strip()
+        
+        # Skip empty or invalid names
+        if not target_name:
+            return False
+        
+        # Skip Python keywords
+        python_keywords = {
+            'and', 'as', 'assert', 'break', 'class', 'continue', 'def', 'del', 'elif', 'else',
+            'except', 'exec', 'finally', 'for', 'from', 'global', 'if', 'import', 'in', 'is',
+            'lambda', 'not', 'or', 'pass', 'print', 'raise', 'return', 'try', 'while', 'with',
+            'yield', 'True', 'False', 'None', 'self', 'super'
+        }
+        if target_name in python_keywords:
+            return False
+        
+        # Skip standard library modules and built-ins
+        standard_library_modules = {
+            'os', 'sys', 'json', 'math', 'random', 'datetime', 'time', 'collections',
+            'itertools', 'functools', 'operator', 're', 'string', 'io', 'pathlib',
+            'urllib', 'http', 'socket', 'threading', 'multiprocessing', 'asyncio',
+            'typing', 'dataclasses', 'enum', 'abc', 'collections.abc'
+        }
+        if ref.reference_type == 'imports':
+            if target_name in standard_library_modules:
+                return False
+            # Also filter typing imports (List, Dict, Optional, etc.)
+            typing_types = {'List', 'Dict', 'Optional', 'Union', 'Tuple', 'Set', 'FrozenSet',
+                          'Callable', 'Iterable', 'Iterator', 'Generator', 'Any', 'TypeVar',
+                          'Generic', 'Protocol', 'TypedDict', 'Literal', 'Final', 'ClassVar'}
+            if target_name in typing_types:
+                return False
+        
+        # Skip standard library methods that are expected to be unresolved
+        standard_library_methods = {
+            'append', 'extend', 'insert', 'remove', 'pop', 'clear', 'index', 'count',
+            'sort', 'reverse', 'copy', 'get', 'set', 'keys', 'values', 'items',
+            'update', 'popitem', 'setdefault', 'fromkeys', 'split', 'join', 'strip',
+            'replace', 'find', 'index', 'count', 'startswith', 'endswith', 'lower',
+            'upper', 'format', 'read', 'write', 'close', 'flush', 'seek', 'tell',
+            'readline', 'readlines', 'writelines', 'open', 'print', 'input', 'len',
+            'str', 'int', 'float', 'bool', 'list', 'dict', 'tuple', 'set', 'frozenset',
+            'dumps', 'loads', 'dump', 'load', 'encode', 'decode'  # JSON methods
+        }
+        if ref.reference_type == 'calls' and target_name in standard_library_methods:
+            return False
+        
+        return True
     
     def _resolve_reference(self, ref: ScopedReference) -> Optional[CodeEntity]:
         """Resolve a Python reference."""
