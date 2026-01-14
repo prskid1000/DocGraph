@@ -60,10 +60,15 @@ class Neo4jClient:
                 for record in result:
                     records.append(dict(record))
                 return records
+        except KeyboardInterrupt:
+            # Re-raise KeyboardInterrupt to allow graceful shutdown
+            logger.warning("Query interrupted by user")
+            raise
         except Exception as e:
             logger.error(f"Error executing query: {e}")
-            logger.error(f"Query: {query}")
-            logger.error(f"Parameters: {parameters}")
+            logger.error(f"Query: {query[:200]}...")  # Truncate long queries
+            if parameters and len(str(parameters)) < 500:
+                logger.error(f"Parameters: {parameters}")
             raise
     
     def execute_write(self, query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:
@@ -85,8 +90,15 @@ class Neo4jClient:
                     lambda tx: list(tx.run(query, parameters))
                 )
                 return [dict(record) for record in result]
+        except KeyboardInterrupt:
+            # Re-raise KeyboardInterrupt to allow graceful shutdown
+            logger.warning("Write query interrupted by user")
+            raise
         except Exception as e:
             logger.error(f"Error executing write query: {e}")
+            logger.error(f"Query: {query[:200]}...")  # Truncate long queries
+            if parameters and len(str(parameters)) < 500:
+                logger.error(f"Parameters: {parameters}")
             raise
     
     def create_node(self, label: str, properties: Dict[str, Any]) -> str:

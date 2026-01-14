@@ -222,8 +222,14 @@ class GraphBuilder:
         """Build the graph by inserting nodes and relationships.
         
         Args:
-            batch_size: Number of nodes/relationships to insert per batch.
+            batch_size: Number of nodes/relationships to insert per batch (default: 1000).
             clear_existing: If True, delete existing nodes for this codebase first.
+        
+        Note:
+            - Indexes are created once (the INFO logs you see are just notifications)
+            - Nodes are inserted in batches of `batch_size` using UNWIND
+            - Relationships are inserted in batches of `batch_size` using UNWIND
+            - This prevents memory issues and improves performance vs. single inserts
         """
         if not self.neo4j_client:
             from ..storage.neo4j_client import Neo4jClient
@@ -233,7 +239,8 @@ class GraphBuilder:
         if clear_existing:
             self._clear_codebase_data()
         
-        # Create indexes
+        # Create indexes (only once - these are the INFO logs you're seeing)
+        # They're just notifications that indexes already exist, not actual data creation
         self._create_indexes()
         
         # Group entities by file
@@ -241,7 +248,8 @@ class GraphBuilder:
         for entity in self.entities:
             entities_by_file[entity.file_path].append(entity)
         
-        # Create file nodes and entity nodes
+        # Create file nodes and entity nodes (collected in memory first)
+        logger.info(f"Preparing {len(self.entities)} entities for batch insertion...")
         for file_path, file_entities in entities_by_file.items():
             # Determine language from file extension
             language = Path(file_path).suffix[1:] if Path(file_path).suffix else 'unknown'
@@ -263,7 +271,8 @@ class GraphBuilder:
                     'properties': {}
                 })
         
-        # Batch insert nodes
+        # Batch insert nodes (processes in chunks of batch_size)
+        logger.info(f"Inserting {len(self.pending_nodes)} nodes in batches of {batch_size}...")
         self._batch_insert_nodes(batch_size)
         
         # Create relationships from resolved references
@@ -279,7 +288,8 @@ class GraphBuilder:
         else:
             logger.warning("No resolved references provided. Relationships will not be created.")
         
-        # Batch insert relationships
+        # Batch insert relationships (processes in chunks of batch_size)
+        logger.info(f"Inserting {len(self.pending_relationships)} relationships in batches of {batch_size}...")
         self._batch_insert_relationships(batch_size)
     
     def _create_indexes(self):
@@ -298,9 +308,19 @@ class GraphBuilder:
         Args:
             batch_size: Number of nodes per batch.
         """
-        for i in range(0, len(self.pending_nodes), batch_size):
-            batch = self.pending_nodes[i:i + batch_size]
-            self._insert_node_batch(batch)
+        total_nodes = len(self.pending_nodes)
+        if total_nodes == 0:
+            return
+        
+        try:
+            for i in range(0, total_nodes, batch_size):
+                batch = self.pending_nodes[i:i + batch_size]
+                self._insert_node_batch(batch)
+                if (i + batch_size) % (batch_size * 10) == 0:
+                    logger.info(f"Inserted {min(i + batch_size, total_nodes)}/{total_nodes} nodes...")
+        except KeyboardInterrupt:
+            logger.warning(f"Node insertion interrupted. Processed {i}/{total_nodes} nodes.")
+            raise
     
     def _insert_node_batch(self, nodes: List[Dict[str, Any]]):
         """Insert a batch of nodes.
@@ -308,6 +328,9 @@ class GraphBuilder:
         Args:
             nodes: List of node dictionaries.
         """
+        if not nodes:
+            return
+        
         query = """
         UNWIND $nodes AS node
         MERGE (n {id: node.id})
@@ -322,10 +345,18 @@ class GraphBuilder:
         
         for label, label_nodes in nodes_by_label.items():
             formatted_query = query % label
-            self.neo4j_client.execute_query(
-                formatted_query,
-                parameters={'nodes': [n['properties'] for n in label_nodes]}
-            )
+            try:
+                # Use write transaction for better performance and error handling
+                self.neo4j_client.execute_write(
+                    formatted_query,
+                    parameters={'nodes': [n['properties'] for n in label_nodes]}
+                )
+            except KeyboardInterrupt:
+                logger.warning(f"Node batch insert interrupted. Processed {len(nodes) - len(label_nodes)} nodes so far.")
+                raise
+            except Exception as e:
+                logger.error(f"Error inserting {len(label_nodes)} nodes with label {label}: {e}")
+                raise
     
     def _batch_insert_relationships(self, batch_size: int):
         """Insert relationships in batches.
@@ -333,9 +364,19 @@ class GraphBuilder:
         Args:
             batch_size: Number of relationships per batch.
         """
-        for i in range(0, len(self.pending_relationships), batch_size):
-            batch = self.pending_relationships[i:i + batch_size]
-            self._insert_relationship_batch(batch)
+        total_rels = len(self.pending_relationships)
+        if total_rels == 0:
+            return
+        
+        try:
+            for i in range(0, total_rels, batch_size):
+                batch = self.pending_relationships[i:i + batch_size]
+                self._insert_relationship_batch(batch)
+                if (i + batch_size) % (batch_size * 10) == 0:
+                    logger.info(f"Inserted {min(i + batch_size, total_rels)}/{total_rels} relationships...")
+        except KeyboardInterrupt:
+            logger.warning(f"Relationship insertion interrupted. Processed {i}/{total_rels} relationships.")
+            raise
     
     def _insert_relationship_batch(self, relationships: List[Dict[str, Any]]):
         """Insert a batch of relationships.
@@ -343,6 +384,9 @@ class GraphBuilder:
         Args:
             relationships: List of relationship dictionaries.
         """
+        if not relationships:
+            return
+        
         query = """
         UNWIND $rels AS rel
         MATCH (from {id: rel.from_id})
@@ -358,17 +402,25 @@ class GraphBuilder:
         
         for rel_type, type_rels in rels_by_type.items():
             formatted_query = query % rel_type
-            self.neo4j_client.execute_query(
-                formatted_query,
-                parameters={'rels': [
-                    {
-                        'from_id': r['from_id'],
-                        'to_id': r['to_id'],
-                        'properties': r['properties']
-                    }
-                    for r in type_rels
-                ]}
-            )
+            try:
+                # Use write transaction for better performance and error handling
+                self.neo4j_client.execute_write(
+                    formatted_query,
+                    parameters={'rels': [
+                        {
+                            'from_id': r['from_id'],
+                            'to_id': r['to_id'],
+                            'properties': r['properties']
+                        }
+                        for r in type_rels
+                    ]}
+                )
+            except KeyboardInterrupt:
+                logger.warning(f"Relationship batch insert interrupted. Processed {len(relationships) - len(type_rels)} relationships so far.")
+                raise
+            except Exception as e:
+                logger.error(f"Error inserting {len(type_rels)} relationships of type {rel_type}: {e}")
+                raise
     
     def _clear_codebase_data(self):
         """Clear all data for the current codebase."""
