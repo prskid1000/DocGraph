@@ -49,22 +49,24 @@ class VectorDB:
     
     def add_embeddings(self, ids: List[str], embeddings: List[List[float]],
                       metadatas: List[Dict[str, Any]], documents: Optional[List[str]] = None):
-        """Add embeddings to the collection.
+        """Add embeddings to the collection (upserts if IDs already exist).
         
         Args:
-            ids: List of unique IDs.
+            ids: List of IDs (duplicates will be handled by upsert).
             embeddings: List of embedding vectors.
             metadatas: List of metadata dictionaries.
             documents: Optional list of document texts.
         """
         try:
-            self.collection.add(
+            # Use upsert to handle both new and existing IDs
+            # Upsert will add new IDs and update existing ones
+            self.collection.upsert(
                 ids=ids,
                 embeddings=embeddings,
                 metadatas=metadatas,
                 documents=documents
             )
-            logger.debug(f"Added {len(ids)} embeddings to collection")
+            logger.debug(f"Upserted {len(ids)} embeddings to collection")
         except Exception as e:
             logger.error(f"Error adding embeddings: {e}")
             raise

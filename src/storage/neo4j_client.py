@@ -84,11 +84,14 @@ class Neo4jClient:
         if parameters is None:
             parameters = {}
         
+        def work(tx):
+            result = tx.run(query, parameters)
+            return list(result)
+        
         try:
             with self.driver.session(database=self.database) as session:
-                result = session.write_transaction(
-                    lambda tx: list(tx.run(query, parameters))
-                )
+                # Use execute_write for Neo4j driver 5.x (replaces write_transaction)
+                result = session.execute_write(work)
                 return [dict(record) for record in result]
         except KeyboardInterrupt:
             # Re-raise KeyboardInterrupt to allow graceful shutdown

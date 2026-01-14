@@ -73,12 +73,24 @@ class EmbeddingGenerator:
         if not entities:
             return []
         
+        # Deduplicate entities by generating IDs first
+        seen_ids = set()
+        unique_entities = []
+        for entity in entities:
+            entity_id = f"{entity.entity_type}:{entity.name}:{entity.file_path}:{entity.start_line}:{entity.start_column}"
+            if entity_id not in seen_ids:
+                seen_ids.add(entity_id)
+                unique_entities.append(entity)
+        
+        if len(unique_entities) < len(entities):
+            logger.info(f"Deduplicated {len(entities)} entities to {len(unique_entities)} unique entities")
+        
         batch_size = batch_size or self.batch_size
         embedding_ids = []
         
         # Process in batches
-        for i in range(0, len(entities), batch_size):
-            batch = entities[i:i + batch_size]
+        for i in range(0, len(unique_entities), batch_size):
+            batch = unique_entities[i:i + batch_size]
             
             # Convert entities to text
             texts = [self._entity_to_text(entity) for entity in batch]
@@ -112,16 +124,32 @@ class EmbeddingGenerator:
                 metadatas.append(metadata)
                 documents.append(text)
             
-            # Store in vector database
-            self.vector_db.add_embeddings(
-                ids=ids,
-                embeddings=embeddings,
-                metadatas=metadatas,
-                documents=documents
-            )
+            # Check for duplicates within batch and deduplicate
+            batch_seen = set()
+            unique_indices = []
+            for idx, entity_id in enumerate(ids):
+                if entity_id not in batch_seen:
+                    batch_seen.add(entity_id)
+                    unique_indices.append(idx)
             
-            embedding_ids.extend(ids)
-            logger.info(f"Stored {len(ids)} embeddings")
+            if len(unique_indices) < len(ids):
+                logger.warning(f"Found {len(ids) - len(unique_indices)} duplicate IDs in batch, deduplicating")
+            
+            # Store in vector database (upsert handles both new and existing IDs)
+            if unique_indices:
+                unique_ids = [ids[i] for i in unique_indices]
+                unique_embeddings = [embeddings[i] for i in unique_indices]
+                unique_metadatas = [metadatas[i] for i in unique_indices]
+                unique_documents = [documents[i] for i in unique_indices]
+                
+                self.vector_db.add_embeddings(
+                    ids=unique_ids,
+                    embeddings=unique_embeddings,
+                    metadatas=unique_metadatas,
+                    documents=unique_documents
+                )
+                embedding_ids.extend(unique_ids)
+                logger.info(f"Stored {len(unique_ids)} embeddings")
         
         return embedding_ids
     
