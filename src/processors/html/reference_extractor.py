@@ -70,4 +70,46 @@ class HTMLReferenceExtractor(BaseReferenceExtractor):
                     line_number=i
                 ))
         
+        # Extract JavaScript code from <script> tags for CALLS and REFERENCES
+        in_script = False
+        script_lines = []
+        script_start_line = 0
+        for i, line in enumerate(lines, 1):
+            if re.search(r'<script[^>]*>', line):
+                in_script = True
+                script_start_line = i
+                script_lines = []
+            elif re.search(r'</script>', line):
+                if in_script and script_lines:
+                    # Process JavaScript code in script tag
+                    script_code = '\n'.join(script_lines)
+                    # Extract function calls (CALLS)
+                    call_pattern = r'(\w+)\s*\([^)]*\)'
+                    for match in re.finditer(call_pattern, script_code):
+                        func_name = match.group(1)
+                        if func_name not in ['if', 'for', 'while', 'switch', 'return', 'new', 'typeof', 'instanceof']:
+                            references.append(ScopedReference(
+                                from_entity=file_path_str,
+                                to_entity=func_name,
+                                reference_type='calls',
+                                file_path=file_path_str,
+                                line_number=script_start_line + script_lines.index(match.string[:match.start()].count('\n'))
+                            ))
+                    # Extract variable references (REFERENCES)
+                    var_ref_pattern = r'\b([a-zA-Z_$][\w$]*)\b'
+                    for match in re.finditer(var_ref_pattern, script_code):
+                        var_name = match.group(1)
+                        if var_name not in ['const', 'let', 'var', 'function', 'class', 'if', 'for', 'while', 'return', 'this', 'true', 'false', 'null', 'undefined']:
+                            references.append(ScopedReference(
+                                from_entity=file_path_str,
+                                to_entity=var_name,
+                                reference_type='references',
+                                file_path=file_path_str,
+                                line_number=script_start_line + script_lines.index(match.string[:match.start()].count('\n'))
+                            ))
+                in_script = False
+                script_lines = []
+            elif in_script:
+                script_lines.append(line)
+        
         return references

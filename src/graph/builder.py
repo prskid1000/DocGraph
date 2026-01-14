@@ -272,10 +272,18 @@ class GraphBuilder:
         # Handle CONTAINS relationships (File -> File)
         elif ref.reference_type == 'contains':
             # Source is the file containing the reference
-            source_key = f"file:{Path(ref.file_path).name}:{ref.file_path}"
-            source_id = self.node_ids.get(source_key)
+            # Try multiple key formats to find the file node
+            file_key_variants = [
+                f"file:{Path(ref.file_path).name}:{ref.file_path}",
+                f"file:::{ref.file_path}",
+            ]
+            source_id = None
+            for key in file_key_variants:
+                source_id = self.node_ids.get(key)
+                if source_id:
+                    break
             if not source_id:
-                # Fallback to hash
+                # Fallback to hash (file node should exist)
                 source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
             
             # Target is the referenced file (resolve relative path)
@@ -391,6 +399,9 @@ class GraphBuilder:
             # Create file node
             file_node = self._create_file_node(file_path, language)
             self.pending_nodes.append(file_node)
+            # Store file node ID in node_ids for CONTAINS relationships
+            file_key = f"file:{Path(file_path).name}:{file_path}"
+            self.node_ids[file_key] = file_node['id']
             
             # Create entity nodes
             for entity in file_entities:
@@ -673,7 +684,10 @@ class GraphBuilder:
         # Query all nodes for this codebase to rebuild the mapping
         query = """
         MATCH (n {codebase_id: $codebase_id})
-        RETURN n.id as id, labels(n)[0] as label, n.name as name, n.file_path as file_path
+        RETURN n.id as id, labels(n)[0] as label, 
+               COALESCE(n.name, '') as name, 
+               COALESCE(n.file_path, n.path, '') as file_path,
+               COALESCE(n.path, n.file_path, '') as path
         """
         results = self.neo4j_client.execute_query(query, {'codebase_id': self.codebase_id})
         
@@ -681,7 +695,8 @@ class GraphBuilder:
             node_id = record['id']
             label = record['label']
             name = record.get('name', '')
-            file_path = record.get('file_path', '')
+            file_path = record.get('file_path', '') or record.get('path', '')
+            path = record.get('path', '') or record.get('file_path', '')
             
             # Map entity type from label
             entity_type_map = {
@@ -690,11 +705,19 @@ class GraphBuilder:
                 'Variable': 'variable',
                 'File': 'file',
                 'Module': 'module',
+                'Parameter': 'parameter',
+                'Type': 'type',
             }
             entity_type = entity_type_map.get(label, label.lower())
             
-            # Rebuild the key
-            key = f"{entity_type}:{name}:{file_path}"
+            # Rebuild the key - File nodes use path, others use file_path
+            if label == 'File':
+                # File nodes: use path and name
+                key = f"file:{Path(path).name if path else name}:{path}"
+            else:
+                # Entity nodes: use entity_type, name, file_path
+                key = f"{entity_type}:{name}:{file_path}"
+            
             self.node_ids[key] = node_id
     
     def clear(self):

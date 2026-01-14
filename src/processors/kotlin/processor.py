@@ -1,4 +1,7 @@
 """Kotlin language processor - similar to Java."""
+import importlib
+from tree_sitter import Language, Parser
+
 from ..java.processor import JavaProcessor
 from .extractor import KotlinEntityExtractor
 from .reference_extractor import KotlinReferenceExtractor
@@ -21,9 +24,18 @@ class KotlinProcessor(JavaProcessor):
         self.embedding_generator = KotlinEmbeddingGenerator()
     
     def _load_java_parser(self):
-        """Try to load Kotlin parser (may need tree-sitter-kotlin if available)."""
-        # For now, we'll need to implement Kotlin parsing
-        # This is a placeholder - Kotlin tree-sitter may not be available
+        """Load Java parser for Kotlin (Kotlin syntax is similar enough to Java for tree-sitter)."""
+        # Use Java parser for Kotlin since tree-sitter-kotlin may not be available
+        # Kotlin syntax is similar enough to Java that the Java parser can handle basic structures
+        try:
+            module = importlib.import_module("tree_sitter_java")
+            lang_func = getattr(module, "language", None) or getattr(module, "language_java", None)
+            if lang_func:
+                lang_obj = lang_func()
+                from tree_sitter import Parser, Language
+                return Parser(Language(lang_obj))
+        except ImportError:
+            pass
         return None
     
     def create_reference_resolver(self, entity_container):

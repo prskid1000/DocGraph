@@ -40,6 +40,34 @@ class JavaEntityExtractor(JavaScriptEntityExtractor):
                 if name_node:
                     name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     signature = self._extract_java_method_signature(node)
+                    
+                    # Extract parameters for HAS_PARAMETER relationships
+                    parameters = []
+                    params_node = node.child_by_field_name('parameters')
+                    if params_node:
+                        param_idx = 0
+                        for child in params_node.children:
+                            if child.type == 'formal_parameter':
+                                param_name_node = child.child_by_field_name('name')
+                                param_type_node = child.child_by_field_name('type')
+                                if param_name_node:
+                                    param_name = param_name_node.text.decode('utf-8') if hasattr(param_name_node.text, 'decode') else str(param_name_node.text)
+                                    param_type = None
+                                    if param_type_node:
+                                        param_type = param_type_node.text.decode('utf-8') if hasattr(param_type_node.text, 'decode') else str(param_type_node.text)
+                                    parameters.append({
+                                        'name': param_name,
+                                        'type': param_type,
+                                        'position': param_idx
+                                    })
+                                    param_idx += 1
+                    
+                    # Extract return type for RETURNS relationship
+                    return_type = None
+                    return_type_node = node.child_by_field_name('type')
+                    if return_type_node:
+                        return_type = return_type_node.text.decode('utf-8') if hasattr(return_type_node.text, 'decode') else str(return_type_node.text)
+                    
                     entities.append(CodeEntity(
                         name=name,
                         entity_type='function',
@@ -49,7 +77,11 @@ class JavaEntityExtractor(JavaScriptEntityExtractor):
                         start_column=node.start_point[1],
                         end_column=node.end_point[1],
                         signature=signature,
-                        parent=parent
+                        parent=parent,
+                        metadata={
+                            'parameters': parameters,  # For HAS_PARAMETER relationships
+                            'return_type': return_type  # For RETURNS relationships
+                        }
                     ))
             
             elif node.type == 'field_declaration' and parent:

@@ -50,6 +50,35 @@ class JavaScriptEntityExtractor(BaseEntityExtractor):
                 
                 if name:
                     signature = self._extract_function_signature(node)
+                    
+                    # Extract parameters for HAS_PARAMETER relationships
+                    parameters = []
+                    params_node = node.child_by_field_name('parameters')
+                    if params_node:
+                        param_idx = 0
+                        for child in params_node.children:
+                            if child.type in ['identifier', 'required_parameter', 'optional_parameter']:
+                                param_name_node = child.child_by_field_name('name') or child
+                                if param_name_node:
+                                    param_name = param_name_node.text.decode('utf-8') if hasattr(param_name_node.text, 'decode') else str(param_name_node.text)
+                                    # Extract type annotation if present (TypeScript)
+                                    param_type = None
+                                    type_node = child.child_by_field_name('type')
+                                    if type_node:
+                                        param_type = type_node.text.decode('utf-8') if hasattr(type_node.text, 'decode') else str(type_node.text)
+                                    parameters.append({
+                                        'name': param_name,
+                                        'type': param_type,
+                                        'position': param_idx
+                                    })
+                                    param_idx += 1
+                    
+                    # Extract return type for RETURNS relationship (TypeScript)
+                    return_type = None
+                    return_type_node = node.child_by_field_name('return_type')
+                    if return_type_node:
+                        return_type = return_type_node.text.decode('utf-8') if hasattr(return_type_node.text, 'decode') else str(return_type_node.text)
+                    
                     entities.append(CodeEntity(
                         name=name,
                         entity_type='function',
@@ -59,7 +88,11 @@ class JavaScriptEntityExtractor(BaseEntityExtractor):
                         start_column=node.start_point[1],
                         end_column=node.end_point[1],
                         signature=signature,
-                        parent=parent
+                        parent=parent,
+                        metadata={
+                            'parameters': parameters,  # For HAS_PARAMETER relationships
+                            'return_type': return_type  # For RETURNS relationships
+                        }
                     ))
             
             elif node.type == 'variable_declaration' and parent is None:

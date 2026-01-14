@@ -39,6 +39,25 @@ class JavaReferenceExtractor(JavaScriptReferenceExtractor):
                         line_number=node.start_point[0] + 1
                     ))
             
+            # Extract INHERITS relationships from class declarations
+            elif node.type == 'class_declaration':
+                name_node = node.child_by_field_name('name')
+                superclass_node = node.child_by_field_name('superclass')
+                if name_node and superclass_node:
+                    class_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
+                    superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                    # Extract class name from superclass (handle qualified names)
+                    base_name = superclass_name.split('.')[-1].strip()
+                    references.append(ScopedReference(
+                        from_entity=class_name,
+                        to_entity=base_name,
+                        reference_type='inherits',
+                        file_path=file_path_str,
+                        line_number=node.start_point[0] + 1,
+                        qualified_name=superclass_name,
+                        context={'base_class': superclass_name}
+                    ))
+            
             # Extract method calls
             elif node.type == 'method_invocation':
                 name_node = node.child_by_field_name('name')

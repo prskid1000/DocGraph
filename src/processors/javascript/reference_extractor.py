@@ -56,7 +56,7 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                     name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     current_scope.append(name)
             
-            # Extract import statements
+            # Extract import statements (ES6)
             if node.type in ['import_statement', 'import_declaration']:
                 source = node.child_by_field_name('source')
                 if source:
@@ -70,6 +70,26 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                         line_number=node.start_point[0] + 1,
                         scope=scope
                     ))
+            
+            # Extract require() calls (CommonJS)
+            elif node.type == 'call_expression':
+                function_node = node.child_by_field_name('function')
+                if function_node and function_node.type == 'identifier':
+                    func_name = function_node.text.decode('utf-8') if hasattr(function_node.text, 'decode') else str(function_node.text)
+                    if func_name == 'require':
+                        # Extract module name from require() argument
+                        arguments_node = node.child_by_field_name('arguments')
+                        if arguments_node and arguments_node.child_count > 0:
+                            arg_node = arguments_node.children[0]
+                            if arg_node.type == 'string':
+                                module_name = arg_node.text.decode('utf-8').strip('"\'') if hasattr(arg_node.text, 'decode') else str(arg_node.text).strip('"\'')
+                                references.append(ScopedReference(
+                                    from_entity=file_path_str,
+                                    to_entity=module_name,
+                                    reference_type='imports',
+                                    file_path=file_path_str,
+                                    line_number=node.start_point[0] + 1
+                                ))
             
             # Extract function calls
             elif node.type == 'call_expression':
