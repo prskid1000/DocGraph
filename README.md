@@ -484,81 +484,6 @@ vector_db.clear()
 3. **Clear Before Re-indexing**: Use `--clear` flag when re-indexing to avoid duplicates
 4. **Backup**: Neo4j and ChromaDB data can be backed up by copying their data directories
 
-## Architecture
-
-- **Parsers**: Multi-language AST parsing using tree-sitter
-- **Extractors**: Entity and reference extraction from code
-- **Graph Builder**: Constructs Neo4j graph with codebase segregation
-- **Embeddings**: Generates semantic embeddings for code entities using sentence-transformers
-- **Query Engine**: Hybrid graph + vector search with codebase filtering
-- **MCP Server**: FastMCP-based HTTP server with SSE streaming
-  - Located in `mcp/` folder at root level
-  - Tool definitions, handlers, and models in `mcp/service/`
-  - React widgets for UI in `mcp/widgets/`
-  - Pydantic validation for all inputs
-  - Built on Starlette/Uvicorn for production-ready HTTP service
-
-## MCP Server Architecture
-
-The MCP server follows the FastMCP framework pattern with the following structure:
-
-```
-_mcp/
-├── application.py          # Main FastMCP application
-├── config.py              # Configuration management
-├── context.py             # Request context (thread-local)
-├── logger.py              # Logging configuration
-├── utils.py               # Utility functions
-├── service/
-│   ├── handlers.py        # MCP request handlers
-│   ├── models.py          # Pydantic models & JSON schemas
-│   ├── tools.py           # Tool definitions with ToolDefinition dataclass
-│   ├── prompts.py         # Prompt definitions
-│   ├── widgets.py         # Widget definitions and HTML templates
-│   ├── task/              # Background task management
-│   │   ├── task_manager.py    # Task queue with thread pool executor
-│   │   ├── task_registry.py   # Task handler registration
-│   │   └── task_utils.py      # Progress tracking utilities
-│   └── api/               # API integration layer
-└── widgets/               # React UI components
-    ├── src/
-    │   ├── widgets/       # Individual widget components
-    │   ├── styles/        # Tailwind CSS styles
-    │   └── main.tsx       # Widget registry
-    ├── package.json
-    ├── vite.config.ts
-    └── README.md
-```
-
-### Key Components
-
-1. **ToolDefinition**: Dataclass that defines tools with:
-   - Identifier, title, description
-   - JSON Schema for inputs
-   - Pydantic validation model
-   - Handler function for execution
-
-2. **Request Handlers**: Async handlers for MCP protocol:
-   - `list_tools()` - Available tools
-   - `list_resources()` - Available resources
-   - `handle_call_tool()` - Execute tools with validation
-   - `handle_read_resource()` - Read resource content
-   - `list_prompts()` - Available prompts
-   - `handle_get_prompt()` - Get prompt content
-
-3. **Configuration**: Environment-based config with defaults
-
-4. **Context**: Thread-local request context for codebase ID and metadata
-
-5. **React Widgets**: Interactive UI components
-   - SearchEntities - Semantic search interface
-   - GetDefinition - View entity definitions
-   - FindReferences - Find all usages
-   - CallGraph - Call hierarchy visualization
-   - CodeContext - View code with context
-   - Dependencies - Module dependencies viewer
-   - TaskResult - Background task management (pending, running, completed)
-
 ### Building and Deploying Widgets
 
 ```bash
@@ -572,57 +497,6 @@ npm run dev
 # Production build
 npm run build
 
-# Output: ../../widgets-assets/
-```
-
-## Module Organization and Namespace Isolation
-
-### DocGraph MCP Module Structure
-
-The local MCP module is named `_mcp` (not `mcp`) to **prevent namespace collision** with the official `mcp` package from PyPI.
-
-**Why This Matters:**
-- Python's import system prioritizes local modules over installed packages
-- A local `mcp/` folder would shadow the official `mcp` SDK package from Anthropic
-- This caused `ModuleNotFoundError: No module named 'mcp.types'` when importing from the official MCP SDK
-
-**Key Import Rules:**
-```python
-# ✅ CORRECT: Import from official mcp package (types, stubs, etc.)
-import mcp.types as types
-from mcp.server import Server
-
-# ✅ CORRECT: Import from local _mcp module
-from _mcp.config import Config
-from _mcp.service.handlers import list_tools
-from _mcp.context import get_current_data
-```
-
-**Dependency Versions:**
-- `mcp[cli]>=1.25.0` - Official MCP SDK with types module support
-- `fastmcp>=2.12.4` - High-level MCP server framework
-- Python 3.8+
-
-### Avoiding Module Name Collisions in Future Development
-
-When adding new modules to DocGraph:
-
-1. **Check PyPI**: Ensure your module name doesn't conflict with any installed packages
-   ```bash
-   pip search module-name  # or check pypi.org
-   ```
-
-2. **Use Project Prefix**: Prefix local modules with project name when possible
-   - Good: `docgraph_service`, `docgraph_graph`
-   - Avoid: `service`, `graph`, `utils` (too generic)
-
-3. **Document Module Purpose**: Clearly separate local vs. external dependencies
-   - Local modules: Handle DocGraph-specific functionality
-   - External packages: Used as-is for general utilities
-
-4. **Update Imports**: When refactoring, update all import statements consistently
-   - Search entire codebase: `grep -r "from module_name import"` 
-   - Use IDE refactoring tools for safe bulk updates
 
 ## License
 

@@ -42,6 +42,25 @@ class PythonReferenceExtractor(BaseReferenceExtractor):
             
             def visit_ClassDef(self, node: cst.ClassDef) -> None:
                 self.current_scope.append(node.name.value)
+                
+                # Extract INHERITS relationships from base classes
+                pos = self.extractor.parser.get_position(node)
+                for base in node.bases:
+                    base_code = self.extractor.parser.get_node_code(base)
+                    # Extract class name from base (handle qualified names like "module.Class")
+                    base_name = base_code.split('.')[-1].strip()
+                    
+                    self.references.append(ScopedReference(
+                        from_entity=node.name.value,
+                        to_entity=base_name,
+                        reference_type='inherits',
+                        file_path=self.file_path,
+                        line_number=pos.start.line,
+                        scope=None,
+                        qualified_name=base_code,
+                        context={'base_class': base_code}
+                    ))
+                
                 # Continue visiting children
                 return True
             
@@ -144,6 +163,90 @@ class PythonReferenceExtractor(BaseReferenceExtractor):
                         scope=scope,
                         context={'expected_type': 'function', 'is_method': True}
                     ))
+            
+            def visit_Assign(self, node: cst.Assign) -> None:
+                """Extract variable references in assignments."""
+                pos = self.extractor.parser.get_position(node)
+                scope = self.current_scope[-1] if self.current_scope else None
+                enclosing = self.extractor._find_enclosing_entity(pos.start.line, self.entities)
+                
+                # Extract references to variables on the right side
+                def extract_from_value(value_node):
+                    if isinstance(value_node, cst.Name):
+                        var_name = value_node.value
+                        # Check if it's a known variable
+                        is_variable = any(e.name == var_name and e.entity_type == 'variable' for e in self.entities)
+                        if is_variable:
+                            self.references.append(ScopedReference(
+                                from_entity=enclosing.name if enclosing else self.file_path,
+                                to_entity=var_name,
+                                reference_type='references',
+                                file_path=self.file_path,
+                                line_number=pos.start.line,
+                                scope=scope,
+                                context={'expected_type': 'variable'}
+                            ))
+                    elif isinstance(value_node, cst.Attribute):
+                        # Handle attribute access like self.name
+                        if isinstance(value_node.attr, cst.Name):
+                            attr_name = value_node.attr.value
+                            is_variable = any(e.name == attr_name and e.entity_type == 'variable' for e in self.entities)
+                            if is_variable:
+                                self.references.append(ScopedReference(
+                                    from_entity=enclosing.name if enclosing else self.file_path,
+                                    to_entity=attr_name,
+                                    reference_type='references',
+                                    file_path=self.file_path,
+                                    line_number=pos.start.line,
+                                    scope=scope,
+                                    context={'expected_type': 'variable', 'is_attribute': True}
+                                ))
+                
+                extract_from_value(node.value)
+            
+            def visit_Return(self, node: cst.Return) -> None:
+                """Extract variable references in return statements."""
+                if node.value:
+                    pos = self.extractor.parser.get_position(node)
+                    scope = self.current_scope[-1] if self.current_scope else None
+                    enclosing = self.extractor._find_enclosing_entity(pos.start.line, self.entities)
+                    
+                    # Extract from return value
+                    if isinstance(node.value, cst.Name):
+                        var_name = node.value.value
+                        is_variable = any(e.name == var_name and e.entity_type == 'variable' for e in self.entities)
+                        if is_variable:
+                            self.references.append(ScopedReference(
+                                from_entity=enclosing.name if enclosing else self.file_path,
+                                to_entity=var_name,
+                                reference_type='references',
+                                file_path=self.file_path,
+                                line_number=pos.start.line,
+                                scope=scope,
+                                context={'expected_type': 'variable'}
+                            ))
+                    elif isinstance(node.value, cst.Dict):
+                        # Extract from dict literals like {"name": self.name}
+                        for element in node.value.elements:
+                            if isinstance(element.value, (cst.Name, cst.Attribute)):
+                                if isinstance(element.value, cst.Name):
+                                    var_name = element.value.value
+                                elif isinstance(element.value, cst.Attribute) and isinstance(element.value.attr, cst.Name):
+                                    var_name = element.value.attr.value
+                                else:
+                                    continue
+                                
+                                is_variable = any(e.name == var_name and e.entity_type == 'variable' for e in self.entities)
+                                if is_variable:
+                                    self.references.append(ScopedReference(
+                                        from_entity=enclosing.name if enclosing else self.file_path,
+                                        to_entity=var_name,
+                                        reference_type='references',
+                                        file_path=self.file_path,
+                                        line_number=pos.start.line,
+                                        scope=scope,
+                                        context={'expected_type': 'variable'}
+                                    ))
         
         visitor = Visitor(self, file_path_str, entities)
         ast.visit(visitor)

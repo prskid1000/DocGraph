@@ -126,7 +126,19 @@ class GraphBuilder:
         if entity.parent:
             properties['parent'] = entity.parent
         if entity.metadata:
-            properties.update(entity.metadata)
+            # Flatten metadata, but exclude complex structures that can't be stored in Neo4j
+            for key, value in entity.metadata.items():
+                if key in ['parameters', 'return_type']:
+                    # Skip these - they're handled separately for relationships
+                    continue
+                elif isinstance(value, (str, int, float, bool, list)):
+                    # Only store primitive types and lists of primitives
+                    if isinstance(value, list) and value and not all(isinstance(item, (str, int, float, bool)) for item in value):
+                        continue  # Skip lists with complex objects
+                    properties[key] = value
+                elif value is None:
+                    continue
+                # Skip dicts and other complex types
         
         return {
             'id': node_id,
@@ -160,6 +172,28 @@ class GraphBuilder:
             }
         }
     
+    def _create_module_node(self, module_name: str) -> Dict[str, Any]:
+        """Create a module node from import statement.
+        
+        Args:
+            module_name: Module name/path.
+            
+        Returns:
+            Module node dictionary.
+        """
+        module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
+        
+        return {
+            'id': module_id,
+            'label': GraphSchema.NODE_MODULE,
+            'properties': {
+                'id': module_id,
+                'name': module_name.split('.')[-1],  # Last part of module path
+                'path': module_name,
+                'codebase_id': self.codebase_id,
+            }
+        }
+    
     def _reference_to_relationship(self, ref: Reference, 
                                     resolved_target: Optional[CodeEntity] = None) -> Optional[Dict[str, Any]]:
         """Convert reference to Neo4j relationship.
@@ -177,6 +211,9 @@ class GraphBuilder:
             'references': GraphSchema.REL_REFERENCES,
             'imports': GraphSchema.REL_IMPORTS,
             'inherits': GraphSchema.REL_INHERITS,
+            'has_parameter': GraphSchema.REL_HAS_PARAMETER,
+            'returns': GraphSchema.REL_RETURNS,
+            'contains': GraphSchema.REL_CONTAINS,
         }
         
         rel_type = rel_map.get(ref.reference_type)
@@ -187,19 +224,116 @@ class GraphBuilder:
         source_id = None
         target_id = None
         
-        # Source: find entity making the reference
-        if ref.from_entity:
-            # Try different entity types for source
-            for entity_type in ['function', 'class', 'variable']:
-                source_key = f"{entity_type}:{ref.from_entity}:{ref.file_path}"
-                source_id = self.node_ids.get(source_key)
+        # Handle IMPORTS relationships (File -> Module)
+        if ref.reference_type == 'imports':
+            # Source is the file - find file node ID
+            file_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+            # Try different key formats
+            file_key_variants = [
+                f"file:{Path(ref.file_path).name}:{ref.file_path}",
+                f"file:::{ref.file_path}",
+            ]
+            source_id = None
+            for key in file_key_variants:
+                source_id = self.node_ids.get(key)
                 if source_id:
                     break
+            if not source_id:
+                source_id = file_id  # Use hash as fallback
+            
+            # Target is a Module node
+            module_name = ref.to_entity
+            module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
+            module_key = f"module:{module_name.split('.')[-1]}::{module_name}"
+            target_id = self.node_ids.get(module_key, module_id)
         
-        # Target: use resolved entity
-        if resolved_target:
-            target_key = f"{resolved_target.entity_type}:{resolved_target.name}:{resolved_target.file_path}"
-            target_id = self.node_ids.get(target_key)
+        # Handle INHERITS relationships (Class -> Class)
+        elif ref.reference_type == 'inherits':
+            # Source is the class making the inheritance
+            source_key = f"class:{ref.from_entity}:{ref.file_path}"
+            source_id = self.node_ids.get(source_key)
+            
+            # Target is the base class (try resolved first, then lookup)
+            if resolved_target:
+                target_key = f"class:{resolved_target.name}:{resolved_target.file_path}"
+                target_id = self.node_ids.get(target_key)
+            else:
+                # Try to find base class by name
+                base_name = ref.to_entity
+                target_key = f"class:{base_name}:{ref.file_path}"
+                target_id = self.node_ids.get(target_key)
+                # Also try in same file
+                if not target_id:
+                    for key, node_id in self.node_ids.items():
+                        if key.startswith(f"class:{base_name}:") and key.endswith(f":{ref.file_path}"):
+                            target_id = node_id
+                            break
+        
+        # Handle CONTAINS relationships (File -> File)
+        elif ref.reference_type == 'contains':
+            # Source is the file containing the reference
+            source_key = f"file:{Path(ref.file_path).name}:{ref.file_path}"
+            source_id = self.node_ids.get(source_key)
+            if not source_id:
+                # Fallback to hash
+                source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+            
+            # Target is the referenced file (resolve relative path)
+            source_file = Path(ref.file_path)
+            target_file = (source_file.parent / ref.to_entity).resolve()
+            target_key = f"file:{target_file.name}:{str(target_file)}"
+            
+            # Check if target file node exists
+            if target_key in self.node_ids:
+                target_id = self.node_ids[target_key]
+            else:
+                # Check if it's in pending nodes
+                target_id = hashlib.md5(str(target_file).encode()).hexdigest()
+                target_exists = any(n.get('id') == target_id for n in self.pending_nodes)
+                if not target_exists:
+                    # Create a File node for the referenced file (even if it doesn't exist)
+                    # This allows CONTAINS relationships to work for external file references
+                    target_file_node = self._create_file_node(str(target_file), target_file.suffix.lstrip('.'))
+                    target_file_node['id'] = target_id  # Use the computed ID
+                    target_file_node['properties']['id'] = target_id
+                    # Make sure codebase_id is set
+                    target_file_node['properties']['codebase_id'] = self.codebase_id
+                    self.pending_nodes.append(target_file_node)
+                    self.node_ids[target_key] = target_id
+                else:
+                    # Find the existing pending node
+                    for node in self.pending_nodes:
+                        if node.get('id') == target_id:
+                            self.node_ids[target_key] = target_id
+                            break
+        
+        # Handle CALLS and REFERENCES relationships
+        else:
+            # Source: find entity making the reference
+            if ref.from_entity:
+                # For function calls/references, try to find the enclosing function/class
+                for entity_type in ['function', 'class', 'variable']:
+                    source_key = f"{entity_type}:{ref.from_entity}:{ref.file_path}"
+                    source_id = self.node_ids.get(source_key)
+                    if source_id:
+                        break
+                
+                # If source is a file path (for top-level references), use file as source
+                if not source_id and ref.from_entity == ref.file_path:
+                    source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+            
+            # Target: use resolved entity
+            if resolved_target:
+                target_key = f"{resolved_target.entity_type}:{resolved_target.name}:{resolved_target.file_path}"
+                target_id = self.node_ids.get(target_key)
+            elif ref.reference_type == 'references':
+                # For unresolved references, try to find by name in same file
+                target_name = ref.to_entity
+                for key, node_id in self.node_ids.items():
+                    if key.startswith(f"variable:{target_name}:") or key.startswith(f"class:{target_name}:"):
+                        if ref.file_path in key:
+                            target_id = node_id
+                            break
         
         if not source_id or not target_id:
             return None
@@ -263,28 +397,129 @@ class GraphBuilder:
                 node = self._entity_to_node(entity)
                 self.pending_nodes.append(node)
                 
-                # Create DEFINES relationship
+                # Create DEFINES relationship (File -> Entity)
                 self.pending_relationships.append({
                     'from_id': file_node['id'],
                     'to_id': node['id'],
                     'type': GraphSchema.REL_DEFINES,
                     'properties': {}
                 })
+                
+                # Create HAS_PARAMETER relationships (Function -> Parameter)
+                if entity.entity_type == 'function' and entity.metadata and 'parameters' in entity.metadata:
+                    for param_data in entity.metadata['parameters']:
+                        if isinstance(param_data, dict) and 'name' in param_data:
+                            param_entity = CodeEntity(
+                                name=param_data['name'],
+                                entity_type='parameter',
+                                file_path=entity.file_path,
+                                start_line=entity.start_line,
+                                end_line=entity.end_line,
+                                start_column=entity.start_column,
+                                end_column=entity.end_column,
+                                metadata={'type': param_data.get('type'), 'default_value': param_data.get('default')}
+                            )
+                            param_node = self._entity_to_node(param_entity)
+                            self.pending_nodes.append(param_node)
+                            self.pending_relationships.append({
+                                'from_id': node['id'],
+                                'to_id': param_node['id'],
+                                'type': GraphSchema.REL_HAS_PARAMETER,
+                                'properties': {'position': param_data.get('position', 0)}
+                            })
+                
+                # Create RETURNS relationship (Function -> Type)
+                if entity.entity_type == 'function' and entity.metadata and 'return_type' in entity.metadata:
+                    return_type = entity.metadata['return_type']
+                    if return_type:
+                        type_entity = CodeEntity(
+                            name=return_type.split('.')[-1] if '.' in return_type else return_type,
+                            entity_type='type',
+                            file_path=entity.file_path,
+                            start_line=entity.start_line,
+                            end_line=entity.end_line,
+                            start_column=entity.start_column,
+                            end_column=entity.end_column,
+                            metadata={'full_name': return_type}
+                        )
+                        type_node = self._entity_to_node(type_entity)
+                        self.pending_nodes.append(type_node)
+                        self.pending_relationships.append({
+                            'from_id': node['id'],
+                            'to_id': type_node['id'],
+                            'type': GraphSchema.REL_RETURNS,
+                            'properties': {}
+                        })
+        
+        # First, process references to create Module nodes for IMPORTS
+        # This must happen before node insertion so modules are included
+        if hasattr(self, 'resolved_references') and self.resolved_references:
+            # Collect all import references to create Module nodes
+            import_modules = set()
+            for ref, target in self.resolved_references:
+                if ref.reference_type == 'imports':
+                    import_modules.add(ref.to_entity)
+            
+            # Create Module nodes for imports
+            for module_name in import_modules:
+                module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
+                module_key = f"module:{module_name.split('.')[-1]}::{module_name}"
+                if module_key not in self.node_ids:
+                    module_node = self._create_module_node(module_name)
+                    self.pending_nodes.append(module_node)
+                    self.node_ids[module_key] = module_id
         
         # Batch insert nodes (processes in chunks of batch_size)
         logger.info(f"Inserting {len(self.pending_nodes)} nodes in batches of {batch_size}...")
         self._batch_insert_nodes(batch_size)
         
+        # IMPORTANT: After nodes are inserted, we need to rebuild node_ids mapping
+        # because node IDs are now in Neo4j and we need to query them
+        self._rebuild_node_ids_after_insert()
+        
         # Create relationships from resolved references
         if hasattr(self, 'resolved_references') and self.resolved_references:
             logger.info(f"Creating relationships from {len(self.resolved_references)} resolved references...")
             total_resolved = 0
+            imports_count = 0
+            inherits_count = 0
+            calls_count = 0
+            refs_count = 0
+            has_param_count = 0
+            returns_count = 0
+            contains_count = 0
+            
             for ref, target in self.resolved_references:
                 rel = self._reference_to_relationship(ref, target)
                 if rel:
                     self.pending_relationships.append(rel)
                     total_resolved += 1
-            logger.info(f"Created {total_resolved} relationships")
+                    # Count by type for logging
+                    if rel['type'] == GraphSchema.REL_IMPORTS:
+                        imports_count += 1
+                    elif rel['type'] == GraphSchema.REL_INHERITS:
+                        inherits_count += 1
+                    elif rel['type'] == GraphSchema.REL_CALLS:
+                        calls_count += 1
+                    elif rel['type'] == GraphSchema.REL_REFERENCES:
+                        refs_count += 1
+                    elif rel['type'] == GraphSchema.REL_HAS_PARAMETER:
+                        has_param_count += 1
+                    elif rel['type'] == GraphSchema.REL_RETURNS:
+                        returns_count += 1
+                    elif rel['type'] == GraphSchema.REL_CONTAINS:
+                        contains_count += 1
+            
+            # Count HAS_PARAMETER and RETURNS from pending_relationships (created during entity processing)
+            for rel in self.pending_relationships:
+                if rel['type'] == GraphSchema.REL_HAS_PARAMETER:
+                    has_param_count += 1
+                elif rel['type'] == GraphSchema.REL_RETURNS:
+                    returns_count += 1
+                elif rel['type'] == GraphSchema.REL_CONTAINS:
+                    contains_count += 1
+            
+            logger.info(f"Created {len(self.pending_relationships)} relationships: {calls_count} CALLS, {refs_count} REFERENCES, {imports_count} IMPORTS, {inherits_count} INHERITS, {has_param_count} HAS_PARAMETER, {returns_count} RETURNS, {contains_count} CONTAINS")
         else:
             logger.warning("No resolved references provided. Relationships will not be created.")
         
@@ -432,6 +667,35 @@ class GraphBuilder:
         result = self.neo4j_client.execute_query(query, {'codebase_id': self.codebase_id})
         if result:
             logger.info(f"Cleared {result[0]['deleted']} nodes for codebase: {self.codebase_id}")
+    
+    def _rebuild_node_ids_after_insert(self):
+        """Rebuild node_ids mapping after nodes are inserted into Neo4j."""
+        # Query all nodes for this codebase to rebuild the mapping
+        query = """
+        MATCH (n {codebase_id: $codebase_id})
+        RETURN n.id as id, labels(n)[0] as label, n.name as name, n.file_path as file_path
+        """
+        results = self.neo4j_client.execute_query(query, {'codebase_id': self.codebase_id})
+        
+        for record in results:
+            node_id = record['id']
+            label = record['label']
+            name = record.get('name', '')
+            file_path = record.get('file_path', '')
+            
+            # Map entity type from label
+            entity_type_map = {
+                'Class': 'class',
+                'Function': 'function',
+                'Variable': 'variable',
+                'File': 'file',
+                'Module': 'module',
+            }
+            entity_type = entity_type_map.get(label, label.lower())
+            
+            # Rebuild the key
+            key = f"{entity_type}:{name}:{file_path}"
+            self.node_ids[key] = node_id
     
     def clear(self):
         """Clear pending nodes and relationships."""

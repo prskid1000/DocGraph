@@ -63,6 +63,53 @@ class PythonEntityExtractor(BaseEntityExtractor):
                 if parent_node and isinstance(parent_node, cst.ClassDef):
                     parent = parent_node.name.value
                 
+                # Extract parameters for HAS_PARAMETER relationships
+                parameters = []
+                if node.params:
+                    for param_idx, param in enumerate(node.params.params):
+                        param_name = param.name.value
+                        param_type = None
+                        param_default = None
+                        
+                        # Extract type annotation (handle safely)
+                        if param.annotation:
+                            try:
+                                param_type = self.extractor.parser.get_node_code(param.annotation)
+                            except Exception:
+                                # If code generation fails, try to get the annotation name
+                                if hasattr(param.annotation, 'annotation'):
+                                    try:
+                                        param_type = self.extractor.parser.get_node_code(param.annotation.annotation)
+                                    except Exception:
+                                        pass
+                        
+                        # Extract default value (handle safely)
+                        if param.default:
+                            try:
+                                param_default = self.extractor.parser.get_node_code(param.default)
+                            except Exception:
+                                pass
+                        
+                        parameters.append({
+                            'name': param_name,
+                            'type': param_type,
+                            'default': param_default,
+                            'position': param_idx
+                        })
+                
+                # Extract return type for RETURNS relationship
+                return_type = None
+                if node.returns:
+                    try:
+                        return_type = self.extractor.parser.get_node_code(node.returns)
+                    except Exception:
+                        # If code generation fails, try to extract type name
+                        if hasattr(node.returns, 'annotation'):
+                            try:
+                                return_type = self.extractor.parser.get_node_code(node.returns.annotation)
+                            except Exception:
+                                pass
+                
                 self.entities.append(CodeEntity(
                     name=node.name.value,
                     entity_type='function',
@@ -76,26 +123,43 @@ class PythonEntityExtractor(BaseEntityExtractor):
                     parent=parent,
                     metadata={
                         'decorators': [self.extractor.parser.get_node_code(d) for d in node.decorators],
-                        'async': node.asynchronous is not None
+                        'async': node.asynchronous is not None,
+                        'parameters': parameters,  # For HAS_PARAMETER relationships
+                        'return_type': return_type  # For RETURNS relationships
                     }
                 ))
             
             def visit_Assign(self, node: cst.Assign) -> None:
-                # Only top-level assignments
+                # Extract all variable assignments (not just top-level)
+                pos = self.extractor.parser.get_position(node)
                 parent_node = self.extractor.parser.get_parent(node)
-                if parent_node and isinstance(parent_node, cst.Module):
-                    pos = self.extractor.parser.get_position(node)
-                    for target in node.targets:
-                        if isinstance(target.target, cst.Name):
-                            self.entities.append(CodeEntity(
-                                name=target.target.value,
-                                entity_type='variable',
-                                file_path=self.file_path,
-                                start_line=pos.start.line,
-                                end_line=pos.end.line,
-                                start_column=pos.start.column,
-                                end_column=pos.end.column
-                            ))
+                
+                # Get parent function/class for context
+                parent_entity = None
+                if parent_node:
+                    # Walk up to find enclosing function or class
+                    current = parent_node
+                    while current:
+                        if isinstance(current, cst.FunctionDef):
+                            parent_entity = current.name.value
+                            break
+                        elif isinstance(current, cst.ClassDef):
+                            parent_entity = current.name.value
+                            break
+                        current = self.extractor.parser.get_parent(current)
+                
+                for target in node.targets:
+                    if isinstance(target.target, cst.Name):
+                        self.entities.append(CodeEntity(
+                            name=target.target.value,
+                            entity_type='variable',
+                            file_path=self.file_path,
+                            start_line=pos.start.line,
+                            end_line=pos.end.line,
+                            start_column=pos.start.column,
+                            end_column=pos.end.column,
+                            parent=parent_entity
+                        ))
         
         visitor = Visitor(self, file_path_str)
         ast.visit(visitor)

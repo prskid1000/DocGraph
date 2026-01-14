@@ -1,0 +1,25 @@
+// SCSS file demonstrating relationships
+
+// DEFINES: File defines variables and mixins
+
+$primary-color: #3498db;  // Variable definition
+$secondary-color: #2ecc71;
+
+@mixin button-style {  // Mixin definition
+    padding: 10px;
+    background-color: $primary-color;  // REFERENCES: References variable
+    border: none;
+}
+
+.button {
+    @include button-style;  // REFERENCES: References mixin
+    color: white;
+}
+
+.container {
+    background: $secondary-color;  // REFERENCES: References variable
+    
+    .nested {
+        @extend .button;  // REFERENCES: References class
+    }
+}

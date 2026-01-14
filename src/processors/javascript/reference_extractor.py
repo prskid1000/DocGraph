@@ -32,6 +32,23 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                 if name_node:
                     name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     current_scope.append(name)
+                    
+                    # Extract INHERITS relationships from extends clause
+                    superclass = node.child_by_field_name('superclass')
+                    if superclass:
+                        superclass_name = superclass.text.decode('utf-8') if hasattr(superclass.text, 'decode') else str(superclass.text)
+                        # Extract class name from superclass (handle qualified names)
+                        base_name = superclass_name.split('.')[-1].strip()
+                        references.append(ScopedReference(
+                            from_entity=name,
+                            to_entity=base_name,
+                            reference_type='inherits',
+                            file_path=file_path_str,
+                            line_number=node.start_point[0] + 1,
+                            scope=None,
+                            qualified_name=superclass_name,
+                            context={'base_class': superclass_name}
+                        ))
             
             elif node.type in ['function_declaration', 'function_expression', 'method_definition']:
                 name_node = node.child_by_field_name('name')

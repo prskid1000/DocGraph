@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <!-- IMPORTS: File imports stylesheet -->
+    <link rel="stylesheet" href="styles.css">  <!-- CONTAINS: File contains reference to styles.css -->
+    <!-- IMPORTS: File imports script -->
+    <script src="script.js"></script>  <!-- CONTAINS: File contains reference to script.js -->
+    <title>Test Page</title>
+</head>
+<body>
+    <!-- DEFINES: File defines HTML elements -->
+    <div id="container" class="main-container">
+        <h1>Test Page</h1>
+        <p>This is a test page.</p>
+        <img src="image.jpg" alt="Test image">  <!-- CONTAINS: File contains reference to image.jpg -->
+    </div>
+    
+    <script>
+        // DEFINES: File defines JavaScript code
+        // CALLS: Calls function
+        const container = document.getElementById('container');  // CALLS: Calls DOM method, REFERENCES: References variable 'container'
+        console.log(container);  // CALLS: Calls console method, REFERENCES: References variable 'container'
+        
+        function testFunction(param) {  // HAS_PARAMETER: Function has parameter 'param', DEFINES: Defines function
+            return param;  // REFERENCES: References variable 'param', RETURNS: Returns value
+        }
+    </script>
+</body>
+</html>
