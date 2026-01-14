@@ -71,16 +71,20 @@ class SCSSReferenceExtractor(BaseReferenceExtractor):
         for i, line in enumerate(lines, 1):
             for match in re.finditer(variable_ref_pattern, line):
                 var_name = match.group(1)
-                # Skip if it's a variable definition (has : after it)
-                if ':' not in line[:match.start()] or line[:match.start()].count(':') == 0:
-                    enclosing = self._find_enclosing_entity(i, entities)
-                    references.append(ScopedReference(
-                        from_entity=enclosing.name if enclosing else file_path_str,
-                        to_entity=var_name,
-                        reference_type='references',
-                        file_path=file_path_str,
-                        line_number=i
-                    ))
+                # Skip if it's a variable definition (has : after the variable name)
+                # Check if there's a colon after the match position (definition) vs before (usage)
+                text_after_match = line[match.end():].strip()
+                if text_after_match.startswith(':'):
+                    # This is a variable definition, skip it
+                    continue
+                enclosing = self._find_enclosing_entity(i, entities)
+                references.append(ScopedReference(
+                    from_entity=enclosing.name if enclosing else file_path_str,
+                    to_entity=var_name,
+                    reference_type='references',
+                    file_path=file_path_str,
+                    line_number=i
+                ))
         
         # Extract @extend (class extension) - REFERENCES relationship
         extend_pattern = r'@extend\s+\.([a-zA-Z_-][\w-]*)'

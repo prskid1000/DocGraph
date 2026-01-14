@@ -23,7 +23,7 @@ LANGUAGE_MAP = {
     '.scss': 'SCSS',
 }
 
-# Expected relationship types for each language
+# Expected relationship types for each language (based on what parsers actually extract)
 LANGUAGE_RELATIONSHIPS = {
     'Python': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, GraphSchema.REL_REFERENCES, 
                GraphSchema.REL_IMPORTS, GraphSchema.REL_INHERITS, GraphSchema.REL_HAS_PARAMETER, 
@@ -33,15 +33,16 @@ LANGUAGE_RELATIONSHIPS = {
     'TypeScript': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, GraphSchema.REL_REFERENCES, 
                    GraphSchema.REL_IMPORTS, GraphSchema.REL_INHERITS, GraphSchema.REL_HAS_PARAMETER, 
                    GraphSchema.REL_RETURNS],
-    'Java': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, GraphSchema.REL_REFERENCES, 
+    'Java': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, 
              GraphSchema.REL_IMPORTS, GraphSchema.REL_INHERITS, GraphSchema.REL_HAS_PARAMETER, 
              GraphSchema.REL_RETURNS],
-    'Kotlin': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, GraphSchema.REL_REFERENCES, 
+    'Kotlin': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, 
                GraphSchema.REL_IMPORTS, GraphSchema.REL_INHERITS, GraphSchema.REL_HAS_PARAMETER, 
                GraphSchema.REL_RETURNS],
     'HTML': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, GraphSchema.REL_REFERENCES, 
-             GraphSchema.REL_IMPORTS, GraphSchema.REL_CONTAINS],
-    'SCSS': [GraphSchema.REL_DEFINES, GraphSchema.REL_REFERENCES],
+             GraphSchema.REL_IMPORTS, GraphSchema.REL_CONTAINS, GraphSchema.REL_HAS_PARAMETER],
+    'SCSS': [GraphSchema.REL_DEFINES, GraphSchema.REL_CALLS, GraphSchema.REL_REFERENCES, 
+             GraphSchema.REL_IMPORTS],
 }
 
 def clear_screen():

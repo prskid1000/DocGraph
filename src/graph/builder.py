@@ -245,7 +245,10 @@ class GraphBuilder:
             module_name = ref.to_entity
             module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
             module_key = f"module:{module_name.split('.')[-1]}::{module_name}"
-            target_id = self.node_ids.get(module_key, module_id)
+            target_id = self.node_ids.get(module_key)
+            # If not found, use the module_id (module node should be created)
+            if not target_id:
+                target_id = module_id
         
         # Handle INHERITS relationships (Class -> Class)
         elif ref.reference_type == 'inherits':
@@ -258,14 +261,15 @@ class GraphBuilder:
                 target_key = f"class:{resolved_target.name}:{resolved_target.file_path}"
                 target_id = self.node_ids.get(target_key)
             else:
-                # Try to find base class by name
+                # Try to find base class by name (search across all files)
                 base_name = ref.to_entity
+                # First try in same file
                 target_key = f"class:{base_name}:{ref.file_path}"
                 target_id = self.node_ids.get(target_key)
-                # Also try in same file
+                # If not found, search across all files
                 if not target_id:
                     for key, node_id in self.node_ids.items():
-                        if key.startswith(f"class:{base_name}:") and key.endswith(f":{ref.file_path}"):
+                        if key.startswith(f"class:{base_name}:"):
                             target_id = node_id
                             break
         
@@ -289,30 +293,52 @@ class GraphBuilder:
             # Target is the referenced file (resolve relative path)
             source_file = Path(ref.file_path)
             target_file = (source_file.parent / ref.to_entity).resolve()
-            target_key = f"file:{target_file.name}:{str(target_file)}"
+            target_file_str = str(target_file)
+            target_id = hashlib.md5(target_file_str.encode()).hexdigest()
             
-            # Check if target file node exists
-            if target_key in self.node_ids:
-                target_id = self.node_ids[target_key]
-            else:
-                # Check if it's in pending nodes
-                target_id = hashlib.md5(str(target_file).encode()).hexdigest()
+            # Try multiple key formats to find existing file node
+            target_key_variants = [
+                f"file:{target_file.name}:{target_file_str}",
+                f"file:{target_file.name}:{ref.to_entity}",  # Try relative path
+            ]
+            
+            # Check if target file node exists in node_ids
+            found_target = False
+            for key in target_key_variants:
+                if key in self.node_ids:
+                    target_id = self.node_ids[key]
+                    found_target = True
+                    break
+            
+            # Also search by file name in case path format differs
+            if not found_target:
+                for key, node_id in self.node_ids.items():
+                    if key.startswith(f"file:{target_file.name}:") and target_file_str in key:
+                        target_id = node_id
+                        found_target = True
+                        break
+            
+            # Check if it's in pending nodes
+            if not found_target:
                 target_exists = any(n.get('id') == target_id for n in self.pending_nodes)
                 if not target_exists:
                     # Create a File node for the referenced file (even if it doesn't exist)
                     # This allows CONTAINS relationships to work for external file references
-                    target_file_node = self._create_file_node(str(target_file), target_file.suffix.lstrip('.'))
+                    target_file_node = self._create_file_node(target_file_str, target_file.suffix.lstrip('.'))
                     target_file_node['id'] = target_id  # Use the computed ID
                     target_file_node['properties']['id'] = target_id
                     # Make sure codebase_id is set
                     target_file_node['properties']['codebase_id'] = self.codebase_id
                     self.pending_nodes.append(target_file_node)
-                    self.node_ids[target_key] = target_id
+                    # Add to node_ids with all key variants
+                    for key in target_key_variants:
+                        self.node_ids[key] = target_id
                 else:
-                    # Find the existing pending node
+                    # Find the existing pending node and add to node_ids
                     for node in self.pending_nodes:
                         if node.get('id') == target_id:
-                            self.node_ids[target_key] = target_id
+                            for key in target_key_variants:
+                                self.node_ids[key] = target_id
                             break
         
         # Handle CALLS and REFERENCES relationships
@@ -326,22 +352,46 @@ class GraphBuilder:
                     if source_id:
                         break
                 
+                # If not found by exact match, try partial match (in case of name variations)
+                if not source_id:
+                    for key, node_id in self.node_ids.items():
+                        if (key.startswith(f"function:{ref.from_entity}:") or 
+                            key.startswith(f"class:{ref.from_entity}:")):
+                            if ref.file_path in key:
+                                source_id = node_id
+                                break
+                
                 # If source is a file path (for top-level references), use file as source
                 if not source_id and ref.from_entity == ref.file_path:
                     source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
             
             # Target: use resolved entity
+            target_id = None
             if resolved_target:
                 target_key = f"{resolved_target.entity_type}:{resolved_target.name}:{resolved_target.file_path}"
                 target_id = self.node_ids.get(target_key)
-            elif ref.reference_type == 'references':
-                # For unresolved references, try to find by name in same file
+            else:
+                # For unresolved references, try to find by name
                 target_name = ref.to_entity
-                for key, node_id in self.node_ids.items():
-                    if key.startswith(f"variable:{target_name}:") or key.startswith(f"class:{target_name}:"):
-                        if ref.file_path in key:
+                
+                if ref.reference_type == 'calls':
+                    # For CALLS, search for functions across all files
+                    for key, node_id in self.node_ids.items():
+                        if key.startswith(f"function:{target_name}:"):
                             target_id = node_id
                             break
+                elif ref.reference_type == 'references':
+                    # For REFERENCES, try to find variables or classes in same file first, then across files
+                    for key, node_id in self.node_ids.items():
+                        if (key.startswith(f"variable:{target_name}:") or 
+                            key.startswith(f"class:{target_name}:")):
+                            # Prefer same file
+                            if ref.file_path in key:
+                                target_id = node_id
+                                break
+                            # But also accept from other files if not found
+                            elif not target_id:
+                                target_id = node_id
         
         if not source_id or not target_id:
             return None
@@ -475,6 +525,7 @@ class GraphBuilder:
             for module_name in import_modules:
                 module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
                 module_key = f"module:{module_name.split('.')[-1]}::{module_name}"
+                # Check if module node already exists
                 if module_key not in self.node_ids:
                     module_node = self._create_module_node(module_name)
                     self.pending_nodes.append(module_node)
