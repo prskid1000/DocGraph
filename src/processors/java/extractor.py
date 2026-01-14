@@ -1,12 +1,13 @@
 """Java entity extractor."""
-from ..javascript.extractor import JavaScriptEntityExtractor
 from ...parsers.base import CodeEntity
 from pathlib import Path
 from typing import List
 import tree_sitter
 
+from ..base import BaseEntityExtractor
 
-class JavaEntityExtractor(JavaScriptEntityExtractor):
+
+class JavaEntityExtractor(BaseEntityExtractor):
     """Extracts entities from Java code."""
     
     def extract_entities(self, ast, file_path: Path, source_code: str) -> List[CodeEntity]:
@@ -79,8 +80,8 @@ class JavaEntityExtractor(JavaScriptEntityExtractor):
                         signature=signature,
                         parent=parent,
                         metadata={
-                            'parameters': parameters,  # For HAS_PARAMETER relationships
-                            'return_type': return_type  # For RETURNS relationships
+                            'parameters': parameters,
+                            'return_type': return_type
                         }
                     ))
             

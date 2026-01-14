@@ -1,14 +1,13 @@
 """Java reference extractor."""
-from ..javascript.reference_extractor import JavaScriptReferenceExtractor
 from pathlib import Path
 from typing import List
 import tree_sitter
 
-from ..base import ScopedReference
+from ..base import BaseReferenceExtractor, ScopedReference
 from ...parsers.base import CodeEntity
 
 
-class JavaReferenceExtractor(JavaScriptReferenceExtractor):
+class JavaReferenceExtractor(BaseReferenceExtractor):
     """Extracts references from Java code."""
     
     def extract_references(
@@ -46,17 +45,22 @@ class JavaReferenceExtractor(JavaScriptReferenceExtractor):
                 if name_node and superclass_node:
                     class_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                    # Clean up superclass name - remove "extends" keyword if present
+                    superclass_name = superclass_name.replace('extends', '').strip()
                     # Extract class name from superclass (handle qualified names)
                     base_name = superclass_name.split('.')[-1].strip()
-                    references.append(ScopedReference(
-                        from_entity=class_name,
-                        to_entity=base_name,
-                        reference_type='inherits',
-                        file_path=file_path_str,
-                        line_number=node.start_point[0] + 1,
-                        qualified_name=superclass_name,
-                        context={'base_class': superclass_name}
-                    ))
+                    # Remove any remaining whitespace or invalid characters
+                    base_name = base_name.strip()
+                    if base_name:
+                        references.append(ScopedReference(
+                            from_entity=class_name,
+                            to_entity=base_name,
+                            reference_type='inherits',
+                            file_path=file_path_str,
+                            line_number=node.start_point[0] + 1,
+                            qualified_name=superclass_name,
+                            context={'base_class': superclass_name}
+                        ))
             
             # Extract method calls
             elif node.type == 'method_invocation':

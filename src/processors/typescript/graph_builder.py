@@ -1,7 +1,60 @@
 """TypeScript graph builder."""
-from ..javascript.graph_builder import JavaScriptGraphBuilder
+from typing import List, Dict, Any
+import hashlib
+
+from ..base import BaseGraphBuilder
+from ...parsers.base import CodeEntity
+from ...graph.schema import GraphSchema
+from ..base import ScopedReference
 
 
-class TypeScriptGraphBuilder(JavaScriptGraphBuilder):
-    """TypeScript graph builder - same as JavaScript."""
-    pass
+class TypeScriptGraphBuilder(BaseGraphBuilder):
+    """Builds graph relationships for TypeScript code."""
+    
+    def build_relationships(
+        self,
+        entities: List[CodeEntity],
+        references: List[ScopedReference],
+        file_path: str
+    ) -> List[Dict[str, Any]]:
+        """Build relationships for TypeScript."""
+        relationships = []
+        node_ids = {}
+        
+        for entity in entities:
+            node_id = self._generate_node_id(entity)
+            node_ids[f"{entity.entity_type}:{entity.name}:{entity.file_path}"] = node_id
+        
+        for ref in references:
+            source_key = f"function:{ref.from_entity}:{ref.file_path}"
+            if source_key not in node_ids:
+                source_key = f"class:{ref.from_entity}:{ref.file_path}"
+            if source_key not in node_ids:
+                continue
+            
+            relationships.append({
+                'from_id': node_ids[source_key],
+                'to_entity': ref.to_entity,
+                'type': self._map_reference_type(ref.reference_type),
+                'properties': {
+                    'line_number': ref.line_number,
+                    'scope': ref.scope
+                }
+            })
+        
+        return relationships
+    
+    def _generate_node_id(self, entity: CodeEntity) -> str:
+        """Generate unique node ID."""
+        key = f"{entity.entity_type}:{entity.file_path}:{entity.name}:{entity.start_line}:{entity.start_column}"
+        return hashlib.md5(key.encode()).hexdigest()
+    
+    def _map_reference_type(self, ref_type: str) -> str:
+        """Map reference type to graph relationship type."""
+        mapping = {
+            'calls': GraphSchema.REL_CALLS,
+            'references': GraphSchema.REL_REFERENCES,
+            'imports': GraphSchema.REL_IMPORTS,
+            'inherits': GraphSchema.REL_INHERITS,
+        }
+        return mapping.get(ref_type, GraphSchema.REL_REFERENCES)

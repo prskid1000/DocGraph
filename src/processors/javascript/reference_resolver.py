@@ -8,6 +8,28 @@ from ...parsers.base import CodeEntity
 
 logger = logging.getLogger(__name__)
 
+# JavaScript/Java/Kotlin keywords that should not be resolved
+JS_KEYWORDS = {
+    # JavaScript/TypeScript keywords
+    'if', 'else', 'for', 'while', 'do', 'switch', 'case', 'break', 'continue',
+    'return', 'try', 'catch', 'finally', 'throw', 'new', 'this', 'super',
+    'typeof', 'instanceof', 'in', 'of', 'var', 'let', 'const', 'function',
+    'class', 'extends', 'import', 'export', 'default', 'async', 'await',
+    'yield', 'static', 'public', 'private', 'protected', 'abstract', 'interface',
+    # Java/Kotlin keywords
+    'package', 'synchronized', 'volatile', 'transient', 'native', 'strictfp',
+    'enum', 'assert', 'goto', 'implements', 'instanceof', 'synchronized',
+    'transient', 'volatile', 'null', 'true', 'false'
+}
+
+# Built-in globals that are expected to be unresolved
+JS_BUILTINS = {
+    'JSON', 'Math', 'Date', 'Array', 'Object', 'String', 'Number', 'Boolean',
+    'Promise', 'Set', 'Map', 'WeakMap', 'WeakSet', 'Symbol', 'RegExp', 'Error',
+    'console', 'window', 'document', 'global', 'process', 'Buffer', 'exports',
+    'module', 'require', 'fs', 'path', 'os', 'http', 'https', 'url', 'util'
+}
+
 
 class JavaScriptReferenceResolver(BaseReferenceResolver):
     """JavaScript-specific reference resolver."""
@@ -40,8 +62,21 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
     ) -> Dict[str, List[Tuple[ScopedReference, Optional[CodeEntity]]]]:
         """Resolve JavaScript references."""
         resolved = defaultdict(list)
+        language_name = self._get_language_name()
         
+        # Use logger from the actual class's module, not the parent
+        actual_logger = logging.getLogger(self.__class__.__module__)
+        
+        # Filter out invalid references before resolving
+        valid_references = []
         for ref in references:
+            if self._should_resolve_reference(ref):
+                valid_references.append(ref)
+            else:
+                # Skip keywords, built-ins, and invalid references
+                pass
+        
+        for ref in valid_references:
             target = self._resolve_reference(ref)
             if target:
                 resolved[ref.reference_type].append((ref, target))
@@ -49,9 +84,10 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
                 self.unresolved_references.append(ref)
         
         total_resolved = sum(len(v) for v in resolved.values())
-        logger.info(f"JavaScript: Resolved {total_resolved}/{len(references)} references ({total_resolved/len(references)*100:.1f}%)" if references else "JavaScript: No references")
+        total_valid = len(valid_references)
+        actual_logger.info(f"{language_name}: Resolved {total_resolved}/{total_valid} references ({total_resolved/total_valid*100:.1f}%)" if total_valid else f"{language_name}: No references")
         
-        # Log unresolved references
+        # Log unresolved references (only valid ones that failed to resolve)
         if self.unresolved_references:
             unresolved_details = []
             for ref in self.unresolved_references:
@@ -60,14 +96,75 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
                     detail += f", scope: {ref.scope}"
                 detail += ")"
                 unresolved_details.append(detail)
-            logger.info(f"JavaScript: Unresolved references ({len(self.unresolved_references)}):\n" + "\n".join(unresolved_details))
+            actual_logger.info(f"{language_name}: Unresolved references ({len(self.unresolved_references)}):\n" + "\n".join(unresolved_details))
         
         self.resolved_references = resolved
         return resolved
     
+    def _get_language_name(self) -> str:
+        """Get the language name for logging."""
+        class_name = self.__class__.__name__
+        # Extract language from class name (e.g., "TypeScriptReferenceResolver" -> "TypeScript")
+        if 'TypeScript' in class_name:
+            return 'TypeScript'
+        elif 'Java' in class_name and 'Kotlin' not in class_name:
+            return 'Java'
+        elif 'Kotlin' in class_name:
+            return 'Kotlin'
+        else:
+            return 'JavaScript'
+    
+    def _should_resolve_reference(self, ref: ScopedReference) -> bool:
+        """Check if a reference should be resolved."""
+        target_name = ref.to_entity.strip()
+        
+        # Skip empty or invalid names
+        if not target_name:
+            return False
+        
+        # Skip keywords
+        if target_name.lower() in JS_KEYWORDS:
+            return False
+        
+        # Skip built-in globals (unless it's an import)
+        if target_name in JS_BUILTINS and ref.reference_type != 'imports':
+            return False
+        
+        # Skip invalid inherits references (like "extends BaseClass")
+        if ref.reference_type == 'inherits' and target_name.startswith('extends '):
+            return False
+        
+        # Skip property references that are clearly just property accesses
+        # (these are usually not entities but properties of entities)
+        if ref.context and ref.context.get('is_property'):
+            # Only skip if it's a simple property name (not a qualified name)
+            if '.' not in target_name and target_name[0].islower():
+                # Check if it's likely a class property by looking in scope
+                if ref.scope:
+                    # If we can find the class, we might be able to resolve the property
+                    # For now, let's try to resolve it
+                    pass
+        
+        return True
+    
     def _resolve_reference(self, ref: ScopedReference) -> Optional[CodeEntity]:
         """Resolve a JavaScript reference with improved strategies."""
-        target_name = ref.to_entity
+        target_name = ref.to_entity.strip()
+        
+        # Clean up invalid inherits references
+        if ref.reference_type == 'inherits' and target_name.startswith('extends '):
+            target_name = target_name.replace('extends ', '').strip()
+        
+        # Handle property references - try to find the property in the class/scope
+        if ref.context and ref.context.get('is_property') and ref.scope:
+            # Look for the property as a variable/parameter in the scope
+            scope_entities = self.by_scope.get(ref.scope, [])
+            # Check if it's a class property (variable in class scope)
+            candidates = [e for e in scope_entities if e.name == target_name and e.entity_type in ['variable', 'parameter']]
+            if candidates:
+                return candidates[0]
+        
+        # Original resolution logic continues...
         
         # Strategy 1: Qualified name lookup (Class.method, module.function)
         if '.' in target_name:
