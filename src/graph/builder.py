@@ -6,8 +6,6 @@ import hashlib
 import logging
 
 from ..parsers.base import CodeEntity, Reference
-from ..extractors.entity_extractor import EntityExtractor
-from ..extractors.reference_resolver import ReferenceResolver
 from .schema import GraphSchema
 from .queries import GraphQueries
 
@@ -64,6 +62,14 @@ class GraphBuilder:
             references: List of references.
         """
         self.references.extend(references)
+    
+    def add_references_from_resolved(self, resolved_references: List[tuple]):
+        """Add resolved references (reference, target_entity tuples).
+        
+        Args:
+            resolved_references: List of (Reference, CodeEntity) tuples.
+        """
+        self.resolved_references = resolved_references
     
     def _generate_node_id(self, entity: CodeEntity) -> str:
         """Generate unique node ID for an entity.
@@ -260,31 +266,18 @@ class GraphBuilder:
         # Batch insert nodes
         self._batch_insert_nodes(batch_size)
         
-        # Resolve references and create relationships
-        logger.info(f"Resolving {len(self.references)} references...")
-        from ..extractors.reference_resolver import ReferenceResolver
-        from ..extractors.entity_extractor import EntityExtractor
-        
-        # Create entity extractor with our entities
-        entity_extractor = EntityExtractor()
-        entity_extractor.entities = self.entities
-        entity_extractor.references = self.references
-        
-        # Resolve references
-        resolver = ReferenceResolver(entity_extractor)
-        resolved_refs = resolver.resolve_references()
-        
         # Create relationships from resolved references
-        total_resolved = 0
-        for ref_type, ref_target_pairs in resolved_refs.items():
-            for ref, target in ref_target_pairs:
+        if hasattr(self, 'resolved_references') and self.resolved_references:
+            logger.info(f"Creating relationships from {len(self.resolved_references)} resolved references...")
+            total_resolved = 0
+            for ref, target in self.resolved_references:
                 rel = self._reference_to_relationship(ref, target)
                 if rel:
                     self.pending_relationships.append(rel)
                     total_resolved += 1
-        
-        logger.info(f"Created {total_resolved} relationships from {len(self.references)} references")
-        logger.info(f"Unresolved references: {len(resolver.unresolved_references)}")
+            logger.info(f"Created {total_resolved} relationships")
+        else:
+            logger.warning("No resolved references provided. Relationships will not be created.")
         
         # Batch insert relationships
         self._batch_insert_relationships(batch_size)

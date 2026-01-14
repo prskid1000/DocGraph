@@ -1,12 +1,12 @@
-"""Main script for indexing a codebase."""
+"""Main script for indexing a codebase using the new processor system."""
 import argparse
 import logging
 from pathlib import Path
 from typing import List, Optional
+from collections import defaultdict
 
-from src.parsers import ParserFactory
-from src.extractors.entity_extractor import EntityExtractor
-from src.extractors.reference_resolver import ReferenceResolver
+from src.processors import LanguageProcessorFactory
+from src.processors.base import ScopedReference
 from src.graph.builder import GraphBuilder
 from src.embeddings.generator import EmbeddingGenerator
 from src.utils.config import config
@@ -15,31 +15,49 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 
-def get_code_files(directory: Path, languages: List[str]) -> List[Path]:
+def get_code_files(directory: Path, languages: List[str] = None) -> List[Path]:
     """Get all code files in directory.
     
     Args:
         directory: Root directory to search.
-        languages: List of language names to include.
+        languages: List of language names to include. If None, uses all supported.
         
     Returns:
         List of file paths.
     """
     code_files = []
-    language_configs = config.get_enabled_languages()
     
+    if languages is None:
+        languages = LanguageProcessorFactory.get_supported_languages()
+    
+    # Get extensions from language config or use factory mapping
+    language_configs = config.get_enabled_languages()
     extensions = set()
+    
     for lang in languages:
         if lang in language_configs:
             lang_config = language_configs[lang]
             for ext in lang_config.get('extensions', []):
                 extensions.add(ext)
+        else:
+            # Fallback: use factory's extension mapping
+            ext_to_lang = {
+                'python': ['.py'],
+                'javascript': ['.js', '.jsx'],
+                'typescript': ['.ts', '.tsx'],
+                'java': ['.java'],
+                'kotlin': ['.kt', '.kts'],
+                'html': ['.html', '.htm'],
+                'scss': ['.scss', '.sass', '.css'],
+            }
+            if lang in ext_to_lang:
+                extensions.update(ext_to_lang[lang])
     
     for ext in extensions:
         code_files.extend(directory.rglob(f"*{ext}"))
     
     # Filter out common ignore patterns
-    ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', 'build', 'dist'}
+    ignore_dirs = {'.git', '__pycache__', 'node_modules', '.venv', 'venv', 'build', 'dist', '.idea', '.vscode'}
     filtered_files = []
     for file_path in code_files:
         if not any(ignore in file_path.parts for ignore in ignore_dirs):
@@ -50,7 +68,7 @@ def get_code_files(directory: Path, languages: List[str]) -> List[Path]:
 
 def index_codebase(codebase_path: str, languages: List[str] = None,
                   codebase_id: Optional[str] = None, clear_existing: bool = False):
-    """Index a codebase into the knowledge graph.
+    """Index a codebase into the knowledge graph using the new processor system.
     
     Args:
         codebase_path: Path to the codebase root.
@@ -78,54 +96,110 @@ def index_codebase(codebase_path: str, languages: List[str] = None,
     code_files = get_code_files(codebase_dir, languages)
     logger.info(f"Found {len(code_files)} code files")
     
-    # Initialize components with codebase_id
-    entity_extractor = EntityExtractor()
+    # Initialize graph builder and embedding generator
     graph_builder = GraphBuilder(codebase_id=codebase_id)
     embedding_generator = EmbeddingGenerator(codebase_id=codebase_id)
     
-    # Process files
-    entities_by_language = {}
-    references_by_language = {}
+    # Collect all entities and references by language
+    all_entities = []
+    all_references: List[ScopedReference] = []
+    processors_by_lang = {}
     
+    # Process files using language-specific processors
+    logger.info("Processing files...")
     for file_path in code_files:
-        # Determine language from extension
-        ext = file_path.suffix
-        language = None
-        for lang, lang_config in config.get_enabled_languages().items():
-            if ext in lang_config.get('extensions', []):
-                language = lang
-                break
-        
-        if not language:
+        # Get processor for this file
+        processor = LanguageProcessorFactory.get_processor_for_file(file_path)
+        if not processor:
             continue
         
+        language = processor.language
+        if language not in processors_by_lang:
+            processors_by_lang[language] = processor
+        
         try:
-            # Create parser
-            parser = ParserFactory.create_parser(language)
+            # Process file
+            entities, references = processor.process_file(file_path)
             
-            # Extract entities and references
-            entities, references = entity_extractor.extract_from_file(parser, file_path)
-            
-            if language not in entities_by_language:
-                entities_by_language[language] = []
-                references_by_language[language] = []
-            
-            entities_by_language[language].extend(entities)
-            references_by_language[language].extend(references)
+            all_entities.extend(entities)
+            all_references.extend(references)
             
             if len(entities) > 0:
-                logger.debug(f"Extracted {len(entities)} entities from {file_path}")
+                logger.debug(f"Extracted {len(entities)} entities, {len(references)} references from {file_path}")
         
         except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
+            logger.error(f"Error processing {file_path}: {e}", exc_info=True)
     
-    # Build graph (this will also resolve references)
+    logger.info(f"Total entities extracted: {len(all_entities)}")
+    logger.info(f"Total references extracted: {len(all_references)}")
+    
+    # Resolve references using language-specific resolvers
+    logger.info("Resolving references...")
+    resolved_references_by_type = defaultdict(list)
+    
+    # Group references by language and resolve
+    references_by_lang = defaultdict(list)
+    for ref in all_references:
+        # Determine language from file path
+        file_path = Path(ref.file_path)
+        processor = LanguageProcessorFactory.get_processor_for_file(file_path)
+        if processor:
+            references_by_lang[processor.language].append(ref)
+    
+    # Resolve references for each language
+    for language, lang_references in references_by_lang.items():
+        processor = processors_by_lang.get(language)
+        if processor:
+            # Create entity container for this language's entities
+            from src.processors.entity_container import EntityContainer
+            lang_entity_container = EntityContainer()
+            
+            # Filter entities by language based on file extension
+            lang_extensions = {
+                'python': ['.py'],
+                'javascript': ['.js', '.jsx'],
+                'typescript': ['.ts', '.tsx'],
+                'java': ['.java'],
+                'kotlin': ['.kt', '.kts'],
+                'html': ['.html', '.htm'],
+                'scss': ['.scss', '.sass', '.css'],
+            }
+            lang_exts = lang_extensions.get(language, [])
+            lang_entities = [e for e in all_entities if Path(e.file_path).suffix in lang_exts]
+            
+            lang_entity_container.add_entities(lang_entities)
+            
+            # Create resolver and resolve
+            resolver = processor.create_reference_resolver(lang_entity_container)
+            resolved = resolver.resolve_references(lang_references)
+            
+            # Merge resolved references
+            for ref_type, refs in resolved.items():
+                resolved_references_by_type[ref_type].extend(refs)
+    
+    logger.info(f"Resolved references: {sum(len(v) for v in resolved_references_by_type.values())}")
+    
+    # Build graph
     logger.info("Building knowledge graph...")
-    all_entities = entity_extractor.get_all_entities()
-    all_references = entity_extractor.get_all_references()
-    
     graph_builder.add_entities(all_entities)
-    graph_builder.add_references(all_references)
+    
+    # Convert ScopedReference to Reference format for graph builder
+    from src.parsers.base import Reference
+    resolved_references = []
+    for ref_type, refs in resolved_references_by_type.items():
+        for scoped_ref, target_entity in refs:
+            if target_entity:
+                ref = Reference(
+                    from_entity=scoped_ref.from_entity,
+                    to_entity=scoped_ref.to_entity,
+                    reference_type=scoped_ref.reference_type,
+                    file_path=scoped_ref.file_path,
+                    line_number=scoped_ref.line_number,
+                    metadata=scoped_ref.metadata
+                )
+                resolved_references.append((ref, target_entity))
+    
+    graph_builder.add_references_from_resolved(resolved_references)
     graph_builder.build(clear_existing=clear_existing)
     
     # Generate embeddings
@@ -135,6 +209,7 @@ def index_codebase(codebase_path: str, languages: List[str] = None,
     logger.info("Indexing complete!")
     logger.info(f"Total entities: {len(all_entities)}")
     logger.info(f"Total references: {len(all_references)}")
+    logger.info(f"Resolved references: {sum(len(v) for v in resolved_references_by_type.values())}")
 
 
 def main():
@@ -152,4 +227,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
