@@ -27,7 +27,7 @@ class CodeFileHandler(FileSystemEventHandler):
         self.on_file_created = on_file_created
         self.on_file_deleted = on_file_deleted
         self.on_file_moved = on_file_moved
-        self.extensions = extensions or {'.py', '.js', '.ts', '.java', '.go', '.rs'}
+        self.extensions = extensions or {'.py', '.js', '.jsx', '.ts', '.tsx', '.java', '.kt', '.kts', '.html', '.htm', '.scss', '.sass', '.css'}
     
     def _is_code_file(self, file_path: str) -> bool:
         """Check if file is a code file.

@@ -229,6 +229,12 @@ class LanguageProcessor(ABC):
         # Parse file
         ast, source_code = self.parse_file(file_path)
         
+        # Share parser instance with extractors (for Python's metadata_wrapper)
+        if hasattr(self, 'parser') and hasattr(self.entity_extractor, 'parser'):
+            self.entity_extractor.parser = self.parser
+        if hasattr(self, 'parser') and hasattr(self.reference_extractor, 'parser'):
+            self.reference_extractor.parser = self.parser
+        
         # Extract entities
         entities = self.entity_extractor.extract_entities(ast, file_path, source_code)
         

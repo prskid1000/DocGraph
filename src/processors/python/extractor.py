@@ -13,10 +13,16 @@ class PythonEntityExtractor(BaseEntityExtractor):
     
     def __init__(self):
         """Initialize extractor."""
-        self.parser = PythonParser()
+        self.parser = None  # Will be set by processor after parsing
     
     def extract_entities(self, ast: cst.Module, file_path: Path, source_code: str) -> List[CodeEntity]:
         """Extract entities from Python AST."""
+        # Parser will be set by base.py process_file() after parsing
+        if not hasattr(self, 'parser') or not self.parser:
+            return []  # Parser not set yet
+        if not hasattr(self.parser, 'metadata_wrapper'):
+            return []  # metadata_wrapper not created yet (should not happen if parser is shared correctly)
+        
         entities = []
         file_path_str = str(file_path)
         

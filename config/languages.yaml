@@ -51,28 +51,39 @@ languages:
       - imports
       - annotations
   
-  go:
+  kotlin:
     enabled: true
-    parser: tree-sitter-go
+    parser: tree-sitter-kotlin
     extensions:
-      - .go
+      - .kt
+      - .kts
     features:
+      - classes
       - functions
-      - structs
       - variables
       - imports
-      - interfaces
   
-  rust:
+  html:
     enabled: true
-    parser: tree-sitter-rust
+    parser: html
     extensions:
-      - .rs
+      - .html
+      - .htm
     features:
-      - functions
-      - structs
-      - enums
+      - elements
+      - ids
+      - classes
+      - links
+  
+  scss:
+    enabled: true
+    parser: scss
+    extensions:
+      - .scss
+      - .sass
+      - .css
+    features:
+      - selectors
       - variables
+      - mixins
       - imports
-      - traits
-

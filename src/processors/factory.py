@@ -71,8 +71,6 @@ class LanguageProcessorFactory:
             '.scss': 'scss',
             '.sass': 'scss',
             '.css': 'scss',  # Treat CSS as SCSS
-            '.go': 'go',
-            '.rs': 'rust',
         }
         
         language = ext_to_lang.get(ext)

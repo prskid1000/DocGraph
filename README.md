@@ -4,7 +4,7 @@ A fully local codebase knowledge graph system that extracts classes, functions, 
 
 ## Features
 
-- **Multi-language Support**: Python, JavaScript, TypeScript, Java, Go, Rust
+- **Multi-language Support**: Python, JavaScript, TypeScript, Java, Kotlin, HTML, SCSS
 - **Knowledge Graph**: Extracts classes, functions, variables, and relationships
 - **Hybrid Storage**: Neo4j for graph relationships, ChromaDB for semantic embeddings
 - **MCP Server**: Model Context Protocol server for LLM integration

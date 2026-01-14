@@ -13,7 +13,7 @@ class PythonReferenceExtractor(BaseReferenceExtractor):
     
     def __init__(self):
         """Initialize extractor."""
-        self.parser = PythonParser()
+        self.parser = None  # Will be set by processor
     
     def extract_references(
         self, 
@@ -23,6 +23,12 @@ class PythonReferenceExtractor(BaseReferenceExtractor):
         entities: List[CodeEntity]
     ) -> List[ScopedReference]:
         """Extract references from Python AST with scope information."""
+        # Parser will be set by base.py process_file() after parsing
+        if not hasattr(self, 'parser') or not self.parser:
+            return []  # Parser not set yet
+        if not hasattr(self.parser, 'metadata_wrapper'):
+            return []  # metadata_wrapper not created yet (should not happen if parser is shared correctly)
+        
         references = []
         file_path_str = str(file_path)
         
@@ -78,20 +84,36 @@ class PythonReferenceExtractor(BaseReferenceExtractor):
                     module_name = self.extractor.parser.get_node_code(node.module)
                     
                     # Handle imported names
-                    for alias in node.names:
-                        imported_name = alias.evaluated_name if alias.evaluated_name else alias.name.value
-                        qualified = f"{module_name}.{imported_name}"
-                        
+                    # Check if it's a wildcard import (import *)
+                    if isinstance(node.names, cst.ImportStar):
+                        # For wildcard imports, we can't enumerate specific names
+                        # Just record the module import
                         self.references.append(ScopedReference(
                             from_entity=self.file_path,
-                            to_entity=imported_name,
+                            to_entity=module_name,
                             reference_type='imports',
                             file_path=self.file_path,
                             line_number=pos.start.line,
                             scope=scope,
-                            qualified_name=qualified,
-                            context={'module': module_name, 'alias': alias.evaluated_name}
+                            qualified_name=module_name,
+                            context={'module': module_name, 'is_wildcard': True}
                         ))
+                    else:
+                        # Regular import with specific names
+                        for alias in node.names:
+                            imported_name = alias.evaluated_name if alias.evaluated_name else alias.name.value
+                            qualified = f"{module_name}.{imported_name}"
+                            
+                            self.references.append(ScopedReference(
+                                from_entity=self.file_path,
+                                to_entity=imported_name,
+                                reference_type='imports',
+                                file_path=self.file_path,
+                                line_number=pos.start.line,
+                                scope=scope,
+                                qualified_name=qualified,
+                                context={'module': module_name, 'alias': alias.evaluated_name}
+                            ))
             
             def visit_Call(self, node: cst.Call) -> None:
                 pos = self.extractor.parser.get_position(node)
