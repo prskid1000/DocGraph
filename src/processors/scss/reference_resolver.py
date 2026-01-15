@@ -83,9 +83,24 @@ class SCSSReferenceResolver(BaseReferenceResolver):
             return candidates[0]
         
         # Strategy 2: Global name lookup (try all name variations)
+        # This handles variables/mixins imported from other files via @import
         for search_name in search_names:
             candidates = self.by_name.get(search_name, [])
             if candidates:
+                # Prefer matching entity type
+                if ref.reference_type == 'calls':
+                    func_candidates = [e for e in candidates if e.entity_type == 'function']
+                    if func_candidates:
+                        return func_candidates[0]
+                elif ref.reference_type == 'references':
+                    # For variable references, prefer variables
+                    var_candidates = [e for e in candidates if e.entity_type == 'variable']
+                    if var_candidates:
+                        return var_candidates[0]
+                    # For @extend, look for classes
+                    class_candidates = [e for e in candidates if e.entity_type == 'class']
+                    if class_candidates:
+                        return class_candidates[0]
                 return candidates[0]
         
         return None

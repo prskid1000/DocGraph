@@ -25,6 +25,8 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
         if ast is None or not ast.root_node:
             return references
         
+        extracted_calls = set()  # Track (line_number, to_entity) to avoid duplicates
+        
         def extract_kotlin_refs(node: tree_sitter.Node):
             # Track scope
             # Handle both class_declaration and ERROR nodes that contain classes
@@ -178,56 +180,117 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                         scope=current_scope[-1] if current_scope else None
                     ))
             
-            # Extract constructor calls (ClassName() or ClassName(...))
+            # Extract constructor calls and function calls (ClassName() or func())
             # In Kotlin, constructors are called like regular function calls
             # We need to detect when it's a constructor call vs method call
-            # This is tricky - we'll look for patterns like ClassName() where ClassName is a class
-            elif node.type == 'call_expression':
-                # Check if this might be a constructor call
-                # In Kotlin, constructor calls look like: ClassName() or ClassName(args)
-                # The function part should be a type_identifier or user_type
-                function_node = node.child_by_field_name('function')
-                if function_node:
-                    # Check if it's a type identifier (likely a constructor call)
-                    if function_node.type in ['type_identifier', 'user_type', 'identifier']:
-                        # Try to determine if this is a constructor call
-                        # If the identifier matches a class name in scope, it's likely a constructor
-                        class_name = function_node.text.decode('utf-8') if hasattr(function_node.text, 'decode') else str(function_node.text)
-                        # For now, we'll treat capitalized identifiers as potential constructor calls
-                        # This is a heuristic - in Kotlin, class names are typically PascalCase
-                        if class_name and class_name[0].isupper() if class_name else False:
-                            enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
-                            scope = current_scope[-1] if current_scope else None
-                            references.append(ScopedReference(
-                                from_entity=enclosing.name if enclosing else file_path_str,
-                                to_entity=class_name,
-                                reference_type='calls',
-                                file_path=file_path_str,
-                                line_number=node.start_point[0] + 1,
-                                scope=scope,
-                                context={'expected_type': 'class', 'is_constructor': True}
-                            ))
-                        else:
-                            # Regular function call - handled below
-                            pass
+            # Also handle call_expression inside ERROR nodes
+            elif node.type == 'call_expression' or (node.type == 'ERROR' and any(child.type == 'call_expression' for child in node.children)):
+                # If it's an ERROR node, find the call_expression inside it
+                call_node = node if node.type == 'call_expression' else None
+                if not call_node:
+                    for child in node.children:
+                        if child.type == 'call_expression':
+                            call_node = child
+                            break
+                
+                if call_node:
+                    function_node = call_node.child_by_field_name('function')
+                    if function_node:
+                        # Handle member expressions (Utils.helperFunction(), instance.method())
+                        if function_node.type == 'member_expression':
+                            property_node = function_node.child_by_field_name('property')
+                            object_node = function_node.child_by_field_name('object')
+                            if property_node:
+                                method_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
+                                # Skip common object properties that are not function calls
+                                common_properties = {'length', 'toString', 'valueOf', 'hasOwnProperty', 'constructor', 'prototype'}
+                                if method_name not in common_properties:
+                                    line_num = call_node.start_point[0] + 1
+                                    call_key = (line_num, method_name)
+                                    if call_key not in extracted_calls:
+                                        extracted_calls.add(call_key)
+                                        enclosing = self._find_enclosing_entity(line_num, entities)
+                                        scope = current_scope[-1] if current_scope else None
+                                        
+                                        # Try to extract object name for qualified name (e.g., Utils.helperFunction)
+                                        qualified_name = None
+                                        if object_node:
+                                            object_name = object_node.text.decode('utf-8') if hasattr(object_node.text, 'decode') else str(object_node.text)
+                                            # If object is an identifier, use it for qualified lookup
+                                            if object_node.type == 'identifier':
+                                                qualified_name = f"{object_name}.{method_name}"
+                                        
+                                        references.append(ScopedReference(
+                                            from_entity=enclosing.name if enclosing else file_path_str,
+                                            to_entity=method_name,
+                                            reference_type='calls',
+                                            file_path=file_path_str,
+                                            line_number=line_num,
+                                            scope=scope,
+                                            qualified_name=qualified_name,
+                                            context={'expected_type': 'function', 'is_method': True, 'object_name': object_node.text.decode('utf-8') if object_node and hasattr(object_node.text, 'decode') else (str(object_node.text) if object_node else None)}
+                                        ))
+                        # Handle simple identifiers (could be constructor or function call)
+                        elif function_node.type in ['type_identifier', 'user_type', 'identifier']:
+                            class_or_func_name = function_node.text.decode('utf-8') if hasattr(function_node.text, 'decode') else str(function_node.text)
+                            # Skip keywords that are not function calls
+                            kotlin_keywords = {'if', 'for', 'while', 'when', 'try', 'catch', 'finally', 'return', 'throw', 'break', 'continue'}
+                            if class_or_func_name not in kotlin_keywords:
+                                # Treat capitalized identifiers as potential constructor calls
+                                # Otherwise treat as function calls
+                                is_constructor = class_or_func_name and class_or_func_name[0].isupper() if class_or_func_name else False
+                                line_num = call_node.start_point[0] + 1
+                                call_key = (line_num, class_or_func_name)
+                                if call_key not in extracted_calls:
+                                    extracted_calls.add(call_key)
+                                    enclosing = self._find_enclosing_entity(line_num, entities)
+                                    scope = current_scope[-1] if current_scope else None
+                                    references.append(ScopedReference(
+                                        from_entity=enclosing.name if enclosing else file_path_str,
+                                        to_entity=class_or_func_name,
+                                        reference_type='calls',
+                                        file_path=file_path_str,
+                                        line_number=line_num,
+                                        scope=scope,
+                                        context={'expected_type': 'class' if is_constructor else 'function', 'is_constructor': is_constructor}
+                                    ))
             
-            # Extract method calls
-            elif node.type == 'method_invocation':
-                name_node = node.child_by_field_name('name')
-                if name_node:
-                    method_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
-                    enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
-                    scope = current_scope[-1] if current_scope else None
-                    references.append(ScopedReference(
-                        from_entity=enclosing.name if enclosing else file_path_str,
-                        to_entity=method_name,
-                        reference_type='calls',
-                        file_path=file_path_str,
-                        line_number=node.start_point[0] + 1,
-                        scope=scope,
-                        context={'expected_type': 'function'}
-                    ))
+            # Extract method calls (method_invocation)
+            # Also handle method_invocation inside ERROR nodes
+            elif node.type == 'method_invocation' or (node.type == 'ERROR' and any(child.type == 'method_invocation' for child in node.children)):
+                # If it's an ERROR node, find the method_invocation inside it
+                method_node = node if node.type == 'method_invocation' else None
+                if not method_node:
+                    for child in node.children:
+                        if child.type == 'method_invocation':
+                            method_node = child
+                            break
+                
+                if method_node:
+                    name_node = method_node.child_by_field_name('name')
+                    if name_node:
+                        method_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
+                        # Skip keywords and common object methods that are not function calls
+                        kotlin_keywords = {'if', 'for', 'while', 'when', 'try', 'catch', 'finally', 'return', 'throw', 'break', 'continue'}
+                        common_methods = {'isEmpty', 'isNotEmpty', 'length', 'toString', 'equals', 'hashCode'}
+                        if method_name not in kotlin_keywords and method_name not in common_methods:
+                            line_num = method_node.start_point[0] + 1
+                            call_key = (line_num, method_name)
+                            if call_key not in extracted_calls:
+                                extracted_calls.add(call_key)
+                                enclosing = self._find_enclosing_entity(line_num, entities)
+                                scope = current_scope[-1] if current_scope else None
+                                references.append(ScopedReference(
+                                    from_entity=enclosing.name if enclosing else file_path_str,
+                                    to_entity=method_name,
+                                    reference_type='calls',
+                                    file_path=file_path_str,
+                                    line_number=line_num,
+                                    scope=scope,
+                                    context={'expected_type': 'function'}
+                                ))
             
+            # Recurse to children
             for child in node.children:
                 extract_kotlin_refs(child)
             

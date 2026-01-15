@@ -87,6 +87,12 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
                 target = self._resolve_reference(ref)
                 # Always add INHERITS, even if target is None (graph builder will search by name)
                 resolved[ref.reference_type].append((ref, target))
+            # For super() calls, allow them through even if target can't be resolved
+            # (super() calls the parent constructor, which is handled by the graph builder)
+            elif ref.reference_type == 'calls' and ref.to_entity == 'super' and ref.context.get('is_super'):
+                # super() calls don't resolve to a specific entity, but we still want the relationship
+                # The graph builder will handle creating the CALLS relationship to the parent class
+                resolved[ref.reference_type].append((ref, None))
             else:
                 target = self._resolve_reference(ref)
                 if target:
@@ -203,6 +209,13 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
     def _resolve_reference(self, ref: ScopedReference) -> Optional[CodeEntity]:
         """Resolve a JavaScript reference with improved strategies."""
         target_name = ref.to_entity.strip()
+        
+        # Handle super() calls - these don't resolve to a specific entity
+        # super() calls the parent constructor, which is handled by the graph builder
+        if target_name == 'super' and ref.reference_type == 'calls' and ref.context.get('is_super'):
+            # Return None - super() calls are handled by the graph builder
+            # The resolver will allow them through (see resolve_references method)
+            return None
         
         # Clean up invalid inherits references
         if ref.reference_type == 'inherits' and target_name.startswith('extends '):

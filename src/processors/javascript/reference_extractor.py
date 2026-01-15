@@ -84,8 +84,8 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                         scope=scope
                     ))
             
-            # Extract require() calls (CommonJS)
-            # Note: Check for require() before processing as regular call_expression
+            # Extract require() calls (CommonJS) - handle separately
+            require_handled = False
             if node.type == 'call_expression':
                 function_node = node.child_by_field_name('function')
                 if function_node and function_node.type == 'identifier':
@@ -105,15 +105,11 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                                         file_path=file_path_str,
                                         line_number=node.start_point[0] + 1
                                     ))
-                                    # Don't process this as a regular call_expression
-                                    # But still recurse to children (though call_expression usually has no meaningful children)
-                                    for child in node.children:
-                                        extract_from_node(child)
-                                    return
+                                    require_handled = True
                                     break
             
             # Extract new expressions (constructor calls)
-            elif node.type == 'new_expression':
+            if node.type == 'new_expression':
                 # Try to find constructor node (could be field 'constructor' or first child)
                 constructor_node = node.child_by_field_name('constructor')
                 if not constructor_node and node.child_count > 0:
@@ -155,43 +151,78 @@ class JavaScriptReferenceExtractor(BaseReferenceExtractor):
                                 context={'expected_type': 'class', 'is_constructor': True}
                             ))
             
-            # Extract function calls
-            elif node.type == 'call_expression':
+            # Extract function calls (skip if require() was already handled)
+            elif node.type == 'call_expression' and not require_handled:
                 function_node = node.child_by_field_name('function')
                 if function_node:
-                    # Handle different function call patterns
-                    if function_node.type == 'identifier':
-                        # Simple function call: func()
-                        func_name = function_node.text.decode('utf-8') if hasattr(function_node.text, 'decode') else str(function_node.text)
+                    # Handle super() calls
+                    if function_node.type == 'super':
+                        # super() calls the parent constructor
+                        # Find the parent class from current scope or entities
+                        parent_class = None
+                        if current_scope:
+                            # Look for parent class in entities
+                            for entity in entities:
+                                if entity.entity_type == 'class' and entity.name in current_scope:
+                                    # Try to find parent class from INHERITS relationship context
+                                    # For now, just create a reference to 'super' as a call
+                                    parent_class = 'super'
+                                    break
+                        
+                        if not parent_class:
+                            parent_class = 'super'
+                        
                         scope = current_scope[-1] if current_scope else None
                         enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
                         
                         references.append(ScopedReference(
                             from_entity=enclosing.name if enclosing else file_path_str,
-                            to_entity=func_name,
+                            to_entity=parent_class,
                             reference_type='calls',
                             file_path=file_path_str,
                             line_number=node.start_point[0] + 1,
                             scope=scope,
-                            context={'expected_type': 'function'}
+                            context={'expected_type': 'function', 'is_super': True}
                         ))
-                    elif function_node.type == 'member_expression':
-                        # Method call: obj.method()
-                        property_node = function_node.child_by_field_name('property')
-                        if property_node:
-                            method_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
+                    # Handle different function call patterns
+                    elif function_node.type == 'identifier':
+                        # Simple function call: func()
+                        func_name = function_node.text.decode('utf-8') if hasattr(function_node.text, 'decode') else str(function_node.text)
+                        # Skip keywords that are not function calls
+                        js_keywords = {'if', 'for', 'while', 'switch', 'return', 'new', 'typeof', 'instanceof', 'in', 'of'}
+                        if func_name not in js_keywords:
                             scope = current_scope[-1] if current_scope else None
                             enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
                             
                             references.append(ScopedReference(
                                 from_entity=enclosing.name if enclosing else file_path_str,
-                                to_entity=method_name,
+                                to_entity=func_name,
                                 reference_type='calls',
                                 file_path=file_path_str,
                                 line_number=node.start_point[0] + 1,
                                 scope=scope,
-                                context={'expected_type': 'function', 'is_method': True}
+                                context={'expected_type': 'function'}
                             ))
+                    elif function_node.type == 'member_expression':
+                        # Method call: obj.method()
+                        property_node = function_node.child_by_field_name('property')
+                        if property_node:
+                            method_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
+                            # Skip common object properties that are not function calls
+                            common_properties = {'length', 'toString', 'valueOf', 'hasOwnProperty', 'constructor', 'prototype'}
+                            if method_name not in common_properties:
+                                scope = current_scope[-1] if current_scope else None
+                                enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                                
+                                references.append(ScopedReference(
+                                    from_entity=enclosing.name if enclosing else file_path_str,
+                                    to_entity=method_name,
+                                    reference_type='calls',
+                                    file_path=file_path_str,
+                                    line_number=node.start_point[0] + 1,
+                                    scope=scope,
+                                    context={'expected_type': 'function', 'is_method': True}
+                                ))
             
             # Extract identifier references (variables, properties, etc.)
             # Only extract if it's a usage, not a declaration

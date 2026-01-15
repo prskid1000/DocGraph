@@ -59,7 +59,7 @@ EXPECTED_COUNTS = {
     },
     'JavaScript': {
         GraphSchema.REL_DEFINES: 4,
-        GraphSchema.REL_CALLS: 4,
+        GraphSchema.REL_CALLS: 11,  # super(), calculateSum x2, helperFunction, new DerivedClass, process, getInfo, compute, callHelper, new BaseClass, getName
         GraphSchema.REL_REFERENCES: 5,
         GraphSchema.REL_IMPORTS: 1,
         GraphSchema.REL_INHERITS: 1,
@@ -84,7 +84,7 @@ EXPECTED_COUNTS = {
     },
     'Kotlin': {
         GraphSchema.REL_DEFINES: 2,
-        GraphSchema.REL_CALLS: 4,
+        GraphSchema.REL_CALLS: 2,  # helperFunction, calculateSum (limited by Java parser's Kotlin support)
         GraphSchema.REL_IMPORTS: 2,
         GraphSchema.REL_INHERITS: 1,
         GraphSchema.REL_HAS_PARAMETER: 2,

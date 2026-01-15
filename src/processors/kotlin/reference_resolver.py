@@ -109,7 +109,14 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                 if target:
                     resolved[ref.reference_type].append((ref, target))
                 else:
-                    self.unresolved_references.append(ref)
+                    # For calls with qualified_name or object_name in context, allow through
+                    # The graph builder will try to find the target by qualified name
+                    if (ref.reference_type == 'calls' and 
+                        (ref.qualified_name or (ref.context and ref.context.get('object_name')))):
+                        # Allow through even if not resolved - graph builder will search by qualified name
+                        resolved[ref.reference_type].append((ref, None))
+                    else:
+                        self.unresolved_references.append(ref)
         
         total_resolved = sum(len(v) for v in resolved.values())
         total_valid = len(valid_references)
@@ -169,7 +176,22 @@ class KotlinReferenceResolver(BaseReferenceResolver):
         if ref.reference_type == 'inherits' and target_name.startswith('extends '):
             target_name = target_name.replace('extends ', '').strip()
         
-        # Strategy 1: Package-qualified name lookup
+        # Strategy 1: Qualified name lookup (object.method or package.class)
+        # Check if we have a qualified_name in the reference context
+        if ref.qualified_name:
+            candidates = self.by_qualified_name.get(ref.qualified_name, [])
+            if candidates:
+                return candidates[0]
+        
+        # Also check if context has object_name for member expressions
+        if ref.context and ref.context.get('object_name'):
+            object_name = ref.context.get('object_name')
+            qualified = f"{object_name}.{target_name}"
+            candidates = self.by_qualified_name.get(qualified, [])
+            if candidates:
+                return candidates[0]
+        
+        # Strategy 1b: Package-qualified name lookup
         if '.' in target_name:
             # Try as fully qualified name
             candidates = self.by_qualified_name.get(target_name, [])

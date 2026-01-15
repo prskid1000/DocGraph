@@ -403,9 +403,13 @@ class GraphBuilder:
             target_id = hashlib.md5(target_file_str.encode()).hexdigest()
             
             # Try multiple key formats to find existing file node
+            normalized_target_path = target_file_str.replace('\\', '/')
             target_key_variants = [
                 f"file:{target_file.name}:{target_file_str}",
                 f"file:{target_file.name}:{ref.to_entity}",  # Try relative path
+                f"file:{target_file.name}:{normalized_target_path}",
+                f"file:::{target_file_str}",
+                f"file:::{normalized_target_path}",
             ]
             
             # Check if target file node exists in node_ids
@@ -419,10 +423,14 @@ class GraphBuilder:
             # Also search by file name in case path format differs
             if not found_target:
                 for key, node_id in self.node_ids.items():
-                    if key.startswith(f"file:{target_file.name}:") and target_file_str in key:
-                        target_id = node_id
-                        found_target = True
-                        break
+                    if key.startswith('file:'):
+                        key_normalized = key.replace('\\', '/')
+                        if (target_file_str in key or 
+                            normalized_target_path in key_normalized or
+                            (target_file.name in key and (target_file_str in key or normalized_target_path in key_normalized))):
+                            target_id = node_id
+                            found_target = True
+                            break
             
             # Check if it's in pending nodes
             if not found_target:
@@ -446,6 +454,26 @@ class GraphBuilder:
                             for key in target_key_variants:
                                 self.node_ids[key] = target_id
                             break
+            
+            # Create CONTAINS relationship
+            if source_id and target_id:
+                properties = {
+                    'line_number': ref.line_number,
+                    'file_path': ref.file_path,
+                }
+                if ref.metadata:
+                    properties.update(ref.metadata)
+                
+                return {
+                    'from_id': source_id,
+                    'to_id': target_id,
+                    'type': GraphSchema.REL_CONTAINS,
+                    'properties': properties
+                }
+            else:
+                # Log why CONTAINS relationship couldn't be created
+                logger.debug(f"Failed to create CONTAINS relationship: source_id={source_id}, target_id={target_id}, from={ref.from_entity}, to={ref.to_entity}, file={ref.file_path}")
+                return None
         
         # Handle CALLS and REFERENCES relationships
         else:
@@ -477,7 +505,34 @@ class GraphBuilder:
                 
                 # If source is a file path (for top-level references), use file as source
                 if not source_id and ref.from_entity == ref.file_path:
-                    source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+                    # Try to find the file node ID
+                    normalized_path = ref.file_path.replace('\\', '/')
+                    file_key_variants = [
+                        f"file:{Path(ref.file_path).name}:{ref.file_path}",
+                        f"file:::{ref.file_path}",
+                        f"file:{Path(ref.file_path).name}:{normalized_path}",
+                        f"file:::{normalized_path}",
+                    ]
+                    for key in file_key_variants:
+                        source_id = self.node_ids.get(key)
+                        if source_id:
+                            break
+                    
+                    # If still not found, search by path
+                    if not source_id:
+                        file_name = Path(ref.file_path).name
+                        for key, node_id in self.node_ids.items():
+                            if key.startswith('file:'):
+                                key_normalized = key.replace('\\', '/')
+                                if (normalized_path in key_normalized or 
+                                    ref.file_path in key or
+                                    (file_name in key and (normalized_path in key_normalized or ref.file_path in key))):
+                                    source_id = node_id
+                                    break
+                    
+                    # Fallback to hash
+                    if not source_id:
+                        source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
             
             # Target: use resolved entity
             target_id = None
@@ -489,23 +544,37 @@ class GraphBuilder:
                 target_name = ref.to_entity
                 
                 if ref.reference_type == 'calls':
-                    # For CALLS, search for functions across all files
+                    # For CALLS, search for functions/mixins across all files
                     for key, node_id in self.node_ids.items():
-                        if key.startswith(f"function:{target_name}:"):
+                        if (key.startswith(f"function:{target_name}:") or 
+                            key.startswith(f"mixin:{target_name}:")):
                             target_id = node_id
                             break
                 elif ref.reference_type == 'references':
-                    # For REFERENCES, try to find variables or classes in same file first, then across files
+                    # For REFERENCES, try to find variables, classes, or mixins in same file first, then across files
                     for key, node_id in self.node_ids.items():
                         if (key.startswith(f"variable:{target_name}:") or 
-                            key.startswith(f"class:{target_name}:")):
+                            key.startswith(f"class:{target_name}:") or
+                            key.startswith(f"mixin:{target_name}:")):
                             # Prefer same file
-                            if ref.file_path in key:
+                            key_normalized = key.replace('\\', '/')
+                            file_path_normalized = ref.file_path.replace('\\', '/')
+                            if (ref.file_path in key or file_path_normalized in key_normalized):
                                 target_id = node_id
                                 break
                             # But also accept from other files if not found
                             elif not target_id:
                                 target_id = node_id
+                    
+                    # Also try without the dot prefix for class references (e.g., "button" instead of ".button")
+                    if not target_id and target_name.startswith('.'):
+                        target_name_no_dot = target_name[1:]
+                        for key, node_id in self.node_ids.items():
+                            if (key.startswith(f"variable:{target_name_no_dot}:") or 
+                                key.startswith(f"class:{target_name_no_dot}:") or
+                                key.startswith(f"mixin:{target_name_no_dot}:")):
+                                target_id = node_id
+                                break
         
         # Both source and target must be found to create a relationship
         if not source_id or not target_id:
@@ -667,6 +736,7 @@ class GraphBuilder:
             contains_count = 0
             failed_imports = 0
             failed_inherits = 0
+            failed_contains = 0
             
             for ref, target in self.resolved_references:
                 rel = self._reference_to_relationship(ref, target)
@@ -696,11 +766,16 @@ class GraphBuilder:
                     elif ref.reference_type == 'inherits':
                         failed_inherits += 1
                         logger.debug(f"Failed to create INHERITS relationship: {ref.from_entity} -> {ref.to_entity} (file: {ref.file_path})")
+                    elif ref.reference_type == 'contains':
+                        failed_contains += 1
+                        logger.debug(f"Failed to create CONTAINS relationship: {ref.from_entity} -> {ref.to_entity} (file: {ref.file_path})")
             
             if failed_imports > 0:
                 logger.warning(f"Failed to create {failed_imports} IMPORTS relationships")
             if failed_inherits > 0:
                 logger.warning(f"Failed to create {failed_inherits} INHERITS relationships")
+            if failed_contains > 0:
+                logger.warning(f"Failed to create {failed_contains} CONTAINS relationships")
             
             # Count HAS_PARAMETER and RETURNS from pending_relationships (created during entity processing)
             for rel in self.pending_relationships:
@@ -893,13 +968,32 @@ class GraphBuilder:
             
             # Rebuild the key - File nodes use path, others use file_path
             if label == 'File':
-                # File nodes: use path and name
-                key = f"file:{Path(path).name if path else name}:{path}"
+                # File nodes: use path and name - add multiple key variants for matching
+                if path:
+                    normalized_path = path.replace('\\', '/')
+                    file_name = Path(path).name
+                    keys = [
+                        f"file:{file_name}:{path}",
+                        f"file:{file_name}:{normalized_path}",
+                        f"file:::{path}",
+                        f"file:::{normalized_path}",
+                    ]
+                    for key in keys:
+                        self.node_ids[key] = node_id
+                else:
+                    # Fallback if no path
+                    key = f"file:{name}:{name}"
+                    self.node_ids[key] = node_id
             else:
                 # Entity nodes: use entity_type, name, file_path
                 key = f"{entity_type}:{name}:{file_path}"
-            
-            self.node_ids[key] = node_id
+                self.node_ids[key] = node_id
+                # Also add normalized path variant
+                if file_path:
+                    normalized_file_path = file_path.replace('\\', '/')
+                    key_normalized = f"{entity_type}:{name}:{normalized_file_path}"
+                    if key_normalized != key:
+                        self.node_ids[key_normalized] = node_id
     
     def clear(self):
         """Clear pending nodes and relationships."""

@@ -92,10 +92,12 @@ class SCSSReferenceExtractor(BaseReferenceExtractor):
             match = re.search(extend_pattern, line)
             if match:
                 class_name = match.group(1)
+                # Store with dot prefix to match entity names
+                class_name_with_dot = f".{class_name}"
                 enclosing = self._find_enclosing_entity(i, entities)
                 references.append(ScopedReference(
                     from_entity=enclosing.name if enclosing else file_path_str,
-                    to_entity=class_name,
+                    to_entity=class_name_with_dot,
                     reference_type='references',
                     file_path=file_path_str,
                     line_number=i

@@ -18,30 +18,83 @@ class KotlinEntityExtractor(BaseEntityExtractor):
         if ast is None or not ast.root_node:
             return entities
         
+        processed_node_ids = set()  # Track processed nodes to avoid duplicates
+        
         def extract_kotlin_entities(node: tree_sitter.Node, parent=None):
+            # Skip if already processed (to avoid duplicates from recursive calls)
+            node_id = id(node)
+            if node_id in processed_node_ids:
+                return
+            processed_node_ids.add(node_id)
+            
+            processed_children = False  # Track if children were already processed
             # Handle both class_declaration and ERROR nodes that contain classes
             is_class_node = node.type == 'class_declaration'
             is_error_with_class = node.type == 'ERROR' and any(child.type == 'class' for child in node.children)
+            # Also handle object declarations (object Utils { ... })
+            # In Java parser, objects might be parsed as class_declaration or ERROR nodes
+            is_object_node = node.type == 'object_declaration' or (node.type == 'ERROR' and any(child.type == 'object' for child in node.children))
+            # Check if it's an object by looking at the source code
+            is_object_by_code = False
+            if node.type in ['class_declaration', 'ERROR', 'local_variable_declaration']:
+                node_text = node.text.decode('utf-8') if hasattr(node.text, 'decode') else str(node.text)
+                # Check if this node contains "object" keyword followed by an identifier
+                import re
+                if re.search(r'\bobject\s+[A-Za-z_]', node_text):
+                    is_object_by_code = True
             
-            if is_class_node or is_error_with_class:
-                # For ERROR nodes, find the class identifier
+            if is_class_node or is_error_with_class or is_object_node or is_object_by_code:
+                # For ERROR nodes, find the class/object identifier
                 name_node = None
                 if is_class_node:
                     name_node = node.child_by_field_name('name')
+                elif is_object_node and node.type == 'object_declaration':
+                    name_node = node.child_by_field_name('name')
+                elif is_object_by_code:
+                    # For objects parsed as class_declaration, ERROR, or local_variable_declaration
+                    node_text = node.text.decode('utf-8') if hasattr(node.text, 'decode') else str(node.text)
+                    # Extract identifier after 'object' keyword from text using regex
+                    import re
+                    match = re.search(r'object\s+([A-Za-z_][A-Za-z0-9_]*)', node_text)
+                    if match:
+                        object_name = match.group(1)
+                        # Find the identifier node matching this name (search recursively)
+                        def find_identifier_recursive(n, target_name):
+                            for c in n.children:
+                                c_text = c.text.decode('utf-8') if hasattr(c.text, 'decode') else str(c.text)
+                                if c.type == 'identifier' and c_text == target_name:
+                                    return c
+                                result = find_identifier_recursive(c, target_name)
+                                if result:
+                                    return result
+                            return None
+                        name_node = find_identifier_recursive(node, object_name)
+                        # If still not found, we'll create the entity with the extracted name
+                        if not name_node:
+                            # Create a virtual name_node-like object
+                            class VirtualNameNode:
+                                def __init__(self, name):
+                                    self.text = name.encode() if isinstance(name, str) else name
+                            name_node = VirtualNameNode(object_name)
                 else:
-                    # In ERROR node, look for identifier after 'class' token
+                    # In ERROR node, look for identifier after 'class' or 'object' token
                     for i, child in enumerate(node.children):
-                        if child.type == 'class' and i + 1 < len(node.children):
+                        if (child.type == 'class' or child.type == 'object') and i + 1 < len(node.children):
                             next_child = node.children[i + 1]
                             if next_child.type == 'identifier':
                                 name_node = next_child
                                 break
                 
                 if name_node:
-                    name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
+                    # Handle both real tree_sitter nodes and virtual nodes
+                    if hasattr(name_node, 'text'):
+                        name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
+                    else:
+                        name = str(name_node)
+                    # Treat objects as classes for entity purposes
                     entities.append(CodeEntity(
                         name=name,
-                        entity_type='class',
+                        entity_type='class',  # Objects are treated as classes
                         file_path=file_path_str,
                         start_line=node.start_point[0] + 1,
                         end_line=node.end_point[0] + 1,
@@ -49,8 +102,12 @@ class KotlinEntityExtractor(BaseEntityExtractor):
                         end_column=node.end_point[1],
                         parent=parent
                     ))
+                    # Extract children with object/class name as parent
+                    # Skip the recursive call at the end for these children
                     for child in node.children:
                         extract_kotlin_entities(child, name)
+                    # Mark that we've processed children - don't process again at line 166
+                    processed_children = True
             
             elif node.type == 'method_declaration':
                 name_node = node.child_by_field_name('name')
@@ -119,8 +176,11 @@ class KotlinEntityExtractor(BaseEntityExtractor):
                                 parent=parent
                             ))
             
-            for child in node.children:
-                extract_kotlin_entities(child, parent)
+            # Only process children recursively if they weren't already processed
+            # (e.g., if this is a class/object, children were already processed with correct parent)
+            if not processed_children:
+                for child in node.children:
+                    extract_kotlin_entities(child, parent)
         
         extract_kotlin_entities(ast.root_node)
         return entities

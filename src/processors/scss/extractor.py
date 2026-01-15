@@ -17,20 +17,56 @@ class SCSSEntityExtractor(BaseEntityExtractor):
         lines = source_code.split('\n')
         
         # Extract selectors (classes, IDs, elements)
+        # Need to find the full block range, not just the selector line
+        # Also handle nested selectors (e.g., .container .nested)
         selector_pattern = r'^([.#]?[a-zA-Z_-][\w-]*)\s*[,\{]'
-        for i, line in enumerate(lines, 1):
-            match = re.match(selector_pattern, line.strip())
+        i = 0
+        while i < len(lines):
+            line = lines[i]
+            # Check for nested selector (indented selector inside a block)
+            stripped_line = line.strip()
+            # Skip if it's just whitespace or a comment
+            if not stripped_line or stripped_line.startswith('//'):
+                i += 1
+                continue
+            
+            match = re.match(selector_pattern, stripped_line)
             if match:
                 selector = match.group(1)
+                start_line = i + 1
+                # Find the end of the block (matching braces)
+                brace_count = 0
+                end_line = start_line
+                found_open_brace = False
+                for j in range(i, len(lines)):
+                    current_line = lines[j]
+                    for char in current_line:
+                        if char == '{':
+                            brace_count += 1
+                            found_open_brace = True
+                        elif char == '}':
+                            brace_count -= 1
+                            if brace_count == 0 and found_open_brace:
+                                end_line = j + 1
+                                break
+                    if brace_count == 0 and found_open_brace:
+                        break
+                
+                # If we didn't find a closing brace, use the start line
+                if not found_open_brace:
+                    end_line = start_line
+                
                 entities.append(CodeEntity(
                     name=selector,
                     entity_type='class',  # Treat selector as class-like
                     file_path=file_path_str,
-                    start_line=i,
-                    end_line=i,
+                    start_line=start_line,
+                    end_line=end_line,
                     start_column=0,
                     end_column=len(selector)
                 ))
+                # Don't skip - continue to find nested selectors
+            i += 1
         
         # Extract variables ($variable)
         variable_pattern = r'\$([a-zA-Z_-][\w-]*)\s*:'
