@@ -228,16 +228,37 @@ class GraphBuilder:
         if ref.reference_type == 'imports':
             # Source is the file - find file node ID
             file_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+            # Normalize path for comparison (handle Windows/Unix differences)
+            normalized_path = ref.file_path.replace('\\', '/')
             # Try different key formats
             file_key_variants = [
                 f"file:{Path(ref.file_path).name}:{ref.file_path}",
                 f"file:::{ref.file_path}",
+                f"file:{Path(ref.file_path).name}:{normalized_path}",
+                f"file:::{normalized_path}",
             ]
             source_id = None
             for key in file_key_variants:
                 source_id = self.node_ids.get(key)
                 if source_id:
                     break
+            if not source_id:
+                # Try to find by file path in any format (with normalization)
+                # Also try matching just the filename
+                file_name = Path(ref.file_path).name
+                for key, node_id in self.node_ids.items():
+                    if key.startswith('file:'):
+                        # Normalize both paths for comparison
+                        key_normalized = key.replace('\\', '/')
+                        key_lower = key_normalized.lower()
+                        search_path_lower = normalized_path.lower()
+                        # Try multiple matching strategies
+                        if (normalized_path in key_normalized or 
+                            ref.file_path in key or
+                            search_path_lower in key_lower or
+                            (file_name in key and (normalized_path in key_normalized or ref.file_path in key))):
+                            source_id = node_id
+                            break
             if not source_id:
                 source_id = file_id  # Use hash as fallback
             
@@ -253,16 +274,32 @@ class GraphBuilder:
                     target_file_str = str(target_file)
                     target_id = hashlib.md5(target_file_str.encode()).hexdigest()
                     
-                    # Try to find existing file node
+                    # Try to find existing file node (try multiple key formats and path normalizations)
                     target_file_key_variants = [
                         f"file:{target_file.name}:{target_file_str}",
                         f"file:::{target_file_str}",
+                        f"file:{target_file.name}:{target_file_str.replace('\\', '/')}",
+                        f"file:::{target_file_str.replace('\\', '/')}",
                     ]
+                    found_target = False
                     for key in target_file_key_variants:
                         existing_id = self.node_ids.get(key)
                         if existing_id:
                             target_id = existing_id
+                            found_target = True
                             break
+                    
+                    # If not found by exact match, try searching by path
+                    if not found_target:
+                        normalized_target = target_file_str.replace('\\', '/')
+                        for key, node_id in self.node_ids.items():
+                            if key.startswith('file:') and (normalized_target in key.replace('\\', '/') or target_file_str in key):
+                                target_id = node_id
+                                found_target = True
+                                break
+                    
+                    # If still not found, use the hash (will be used to create/link the file node)
+                    # The relationship will be created with this ID
                 except (ValueError, OSError):
                     # If path resolution fails, fall back to module node
                     target_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
@@ -278,15 +315,23 @@ class GraphBuilder:
         # Handle INHERITS relationships (Class -> Class)
         elif ref.reference_type == 'inherits':
             # Source is the class making the inheritance
+            normalized_file_path = ref.file_path.replace('\\', '/')
             source_key = f"class:{ref.from_entity}:{ref.file_path}"
             source_id = self.node_ids.get(source_key)
+            
+            # If not found by exact match, try with normalized path
+            if not source_id:
+                source_key_normalized = f"class:{ref.from_entity}:{normalized_file_path}"
+                source_id = self.node_ids.get(source_key_normalized)
             
             # If not found by exact match, try partial match
             if not source_id:
                 for key, node_id in self.node_ids.items():
-                    if key.startswith(f"class:{ref.from_entity}:") and ref.file_path in key:
-                        source_id = node_id
-                        break
+                    if key.startswith(f"class:{ref.from_entity}:"):
+                        key_normalized = key.replace('\\', '/')
+                        if normalized_file_path in key_normalized or ref.file_path in key:
+                            source_id = node_id
+                            break
             
             # Target is the base class (try resolved first, then lookup)
             if resolved_target:
@@ -304,7 +349,14 @@ class GraphBuilder:
                 # First try in same file
                 target_key = f"class:{base_name}:{ref.file_path}"
                 target_id = self.node_ids.get(target_key)
-                # If not found, search across all files
+                # If not found, try with normalized path
+                if not target_id:
+                    normalized_path = ref.file_path.replace('\\', '/')
+                    for key, node_id in self.node_ids.items():
+                        if key.startswith(f"class:{base_name}:") and normalized_path in key.replace('\\', '/'):
+                            target_id = node_id
+                            break
+                # If still not found, search across all files (any file)
                 if not target_id:
                     for key, node_id in self.node_ids.items():
                         if key.startswith(f"class:{base_name}:"):
@@ -431,6 +483,7 @@ class GraphBuilder:
                             elif not target_id:
                                 target_id = node_id
         
+        # Both source and target must be found to create a relationship
         if not source_id or not target_id:
             return None
         
@@ -588,6 +641,8 @@ class GraphBuilder:
             has_param_count = 0
             returns_count = 0
             contains_count = 0
+            failed_imports = 0
+            failed_inherits = 0
             
             for ref, target in self.resolved_references:
                 rel = self._reference_to_relationship(ref, target)
@@ -609,6 +664,19 @@ class GraphBuilder:
                         returns_count += 1
                     elif rel['type'] == GraphSchema.REL_CONTAINS:
                         contains_count += 1
+                else:
+                    # Log failed relationship creation for debugging
+                    if ref.reference_type == 'imports':
+                        failed_imports += 1
+                        logger.debug(f"Failed to create IMPORTS relationship: {ref.from_entity} -> {ref.to_entity} (file: {ref.file_path})")
+                    elif ref.reference_type == 'inherits':
+                        failed_inherits += 1
+                        logger.debug(f"Failed to create INHERITS relationship: {ref.from_entity} -> {ref.to_entity} (file: {ref.file_path})")
+            
+            if failed_imports > 0:
+                logger.warning(f"Failed to create {failed_imports} IMPORTS relationships")
+            if failed_inherits > 0:
+                logger.warning(f"Failed to create {failed_inherits} INHERITS relationships")
             
             # Count HAS_PARAMETER and RETURNS from pending_relationships (created during entity processing)
             for rel in self.pending_relationships:

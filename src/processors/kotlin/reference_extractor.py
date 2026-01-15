@@ -34,9 +34,45 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                     current_scope.append(class_name)
                     
                     # Extract INHERITS relationships
+                    # Kotlin uses colon syntax: class Derived : BaseClass
                     superclass_node = node.child_by_field_name('superclass')
+                    if not superclass_node:
+                        # Try to find supertype in children (Kotlin uses different structure)
+                        # Look for type_identifier after colon or in supertype_list
+                        for i, child in enumerate(node.children):
+                            if child.type == ':' or child.type == 'supertype_clause':
+                                # Next type_identifier or user_type should be the superclass
+                                for next_child in node.children[i+1:]:
+                                    if next_child.type in ['type_identifier', 'user_type', 'type_reference']:
+                                        superclass_node = next_child
+                                        break
+                                if superclass_node:
+                                    break
+                            # Also check for supertype_list
+                            elif child.type == 'supertype_list':
+                                for subtype in child.children:
+                                    if subtype.type in ['type_identifier', 'user_type', 'type_reference']:
+                                        superclass_node = subtype
+                                        break
+                                if superclass_node:
+                                    break
+                    
                     if superclass_node:
-                        superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                        # Extract the type identifier from superclass node
+                        if superclass_node.type in ['type_identifier', 'user_type', 'type_reference']:
+                            superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                        else:
+                            # If it's a container node, find the type_identifier inside it
+                            type_id = None
+                            for child in superclass_node.children:
+                                if child.type in ['type_identifier', 'user_type', 'type_reference']:
+                                    type_id = child
+                                    break
+                            if type_id:
+                                superclass_name = type_id.text.decode('utf-8') if hasattr(type_id.text, 'decode') else str(type_id.text)
+                            else:
+                                superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                        
                         superclass_name = superclass_name.replace('extends', '').replace(':', '').strip()
                         base_name = superclass_name.split('.')[-1].strip()
                         if base_name:

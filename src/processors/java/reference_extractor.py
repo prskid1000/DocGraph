@@ -35,8 +35,36 @@ class JavaReferenceExtractor(BaseReferenceExtractor):
                     
                     # Extract INHERITS relationships
                     superclass_node = node.child_by_field_name('superclass')
+                    if not superclass_node:
+                        # Try to find extends clause in children (some tree-sitter versions)
+                        for child in node.children:
+                            if child.type == 'superclass':
+                                superclass_node = child
+                                break
+                        # If still not found, look for extends keyword followed by type_identifier
+                        if not superclass_node:
+                            for i, child in enumerate(node.children):
+                                if child.type == 'extends':
+                                    # Next type_identifier should be the superclass
+                                    for next_child in node.children[i+1:]:
+                                        if next_child.type in ['type_identifier', 'scoped_type_identifier']:
+                                            superclass_node = next_child
+                                            break
+                                    break
+                    
                     if superclass_node:
-                        superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                        # Extract the type identifier from superclass node
+                        if superclass_node.type in ['type_identifier', 'scoped_type_identifier']:
+                            superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
+                        else:
+                            # If it's a superclass node, find the type_identifier inside it
+                            type_id = superclass_node.child_by_field_name('type') or superclass_node
+                            for child in superclass_node.children:
+                                if child.type in ['type_identifier', 'scoped_type_identifier']:
+                                    type_id = child
+                                    break
+                            superclass_name = type_id.text.decode('utf-8') if hasattr(type_id.text, 'decode') else str(type_id.text)
+                        
                         superclass_name = superclass_name.replace('extends', '').strip()
                         base_name = superclass_name.split('.')[-1].strip()
                         if base_name:

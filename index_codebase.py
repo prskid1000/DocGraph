@@ -211,43 +211,20 @@ def index_codebase(codebase_path: str, languages: List[str] = None,
     from src.parsers.base import Reference
     resolved_references = []
     
-    # Add resolved references (with target entities)
+    # Add resolved references (with target entities, or without for IMPORTS/INHERITS)
     for ref_type, refs in resolved_references_by_type.items():
         for scoped_ref, target_entity in refs:
-            if target_entity:
-                ref = Reference(
-                    from_entity=scoped_ref.from_entity,
-                    to_entity=scoped_ref.to_entity,
-                    reference_type=scoped_ref.reference_type,
-                    file_path=scoped_ref.file_path,
-                    line_number=scoped_ref.line_number,
-                    metadata=scoped_ref.metadata
-                )
-                resolved_references.append((ref, target_entity))
-    
-    # Add unresolved IMPORTS, INHERITS, and CONTAINS (they don't need resolution to entities)
-    # These are special - IMPORTS create Module nodes, INHERITS link classes, CONTAINS link files
-    for ref in all_references:
-        if ref.reference_type in ['imports', 'inherits', 'contains']:
-            # Check if already in resolved_references
-            already_added = any(
-                isinstance(r[0], Reference) and
-                r[0].file_path == ref.file_path and 
-                r[0].line_number == ref.line_number and
-                r[0].reference_type == ref.reference_type
-                for r in resolved_references
+            # Add all references, including those with None target_entity for IMPORTS/INHERITS
+            # (they're handled specially by the graph builder)
+            ref = Reference(
+                from_entity=scoped_ref.from_entity,
+                to_entity=scoped_ref.to_entity,
+                reference_type=scoped_ref.reference_type,
+                file_path=scoped_ref.file_path,
+                line_number=scoped_ref.line_number,
+                metadata=scoped_ref.metadata if hasattr(scoped_ref, 'metadata') else {}
             )
-            if not already_added:
-                ref_obj = Reference(
-                    from_entity=ref.from_entity,
-                    to_entity=ref.to_entity,
-                    reference_type=ref.reference_type,
-                    file_path=ref.file_path,
-                    line_number=ref.line_number,
-                    metadata=ref.metadata if hasattr(ref, 'metadata') else {}
-                )
-                # For imports/inherits, target_entity can be None (will be handled by graph builder)
-                resolved_references.append((ref_obj, None))
+            resolved_references.append((ref, target_entity))
     
     graph_builder.add_references_from_resolved(resolved_references)
     graph_builder.build(clear_existing=clear_existing)

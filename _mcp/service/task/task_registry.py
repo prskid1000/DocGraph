@@ -160,16 +160,17 @@ def index_codebase_handler(codebase_path: str, languages: list = None,
     resolved_references = []
     for ref_type, refs in resolved_references_by_type.items():
         for scoped_ref, target_entity in refs:
-            if target_entity:
-                ref = Reference(
-                    from_entity=scoped_ref.from_entity,
-                    to_entity=scoped_ref.to_entity,
-                    reference_type=scoped_ref.reference_type,
-                    file_path=scoped_ref.file_path,
-                    line_number=scoped_ref.line_number,
-                    metadata=scoped_ref.metadata
-                )
-                resolved_references.append((ref, target_entity))
+            # Add all references, including those with None target_entity for IMPORTS/INHERITS
+            # (they're handled specially by the graph builder)
+            ref = Reference(
+                from_entity=scoped_ref.from_entity,
+                to_entity=scoped_ref.to_entity,
+                reference_type=scoped_ref.reference_type,
+                file_path=scoped_ref.file_path,
+                line_number=scoped_ref.line_number,
+                metadata=scoped_ref.metadata if hasattr(scoped_ref, 'metadata') else {}
+            )
+            resolved_references.append((ref, target_entity))
     
     graph_builder.add_references_from_resolved(resolved_references)
     graph_builder.build(clear_existing=clear_existing)
