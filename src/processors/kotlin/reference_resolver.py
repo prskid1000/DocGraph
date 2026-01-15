@@ -181,7 +181,14 @@ class KotlinReferenceResolver(BaseReferenceResolver):
         if ref.qualified_name:
             candidates = self.by_qualified_name.get(ref.qualified_name, [])
             if candidates:
+                logger.debug(f"Resolved {target_name} via qualified_name '{ref.qualified_name}'")
                 return candidates[0]
+            else:
+                # Try case-insensitive match
+                for key in self.by_qualified_name.keys():
+                    if key.lower() == ref.qualified_name.lower():
+                        logger.debug(f"Resolved {target_name} via case-insensitive qualified_name match '{key}'")
+                        return self.by_qualified_name[key][0]
         
         # Also check if context has object_name for member expressions
         if ref.context and ref.context.get('object_name'):
@@ -189,7 +196,25 @@ class KotlinReferenceResolver(BaseReferenceResolver):
             qualified = f"{object_name}.{target_name}"
             candidates = self.by_qualified_name.get(qualified, [])
             if candidates:
+                logger.debug(f"Resolved {target_name} via context object_name '{object_name}' -> '{qualified}'")
                 return candidates[0]
+            else:
+                # Try case-insensitive match for object names
+                for key in self.by_qualified_name.keys():
+                    if key.lower() == qualified.lower():
+                        logger.debug(f"Resolved {target_name} via case-insensitive match '{key}'")
+                        return self.by_qualified_name[key][0]
+                
+                # Fallback: Look for the object as a class, then find the method in it
+                object_entities = self.by_name.get(object_name, [])
+                for obj_entity in object_entities:
+                    if obj_entity.entity_type == 'class':
+                        # Look for methods in this class/object
+                        methods_in_object = [e for e in self.by_scope.get(obj_entity.name, []) 
+                                           if e.name == target_name and e.entity_type == 'function']
+                        if methods_in_object:
+                            logger.debug(f"Resolved {target_name} via object '{object_name}' scope lookup")
+                            return methods_in_object[0]
         
         # Strategy 1b: Package-qualified name lookup
         if '.' in target_name:
@@ -265,6 +290,20 @@ class KotlinReferenceResolver(BaseReferenceResolver):
             if ref.reference_type == 'calls':
                 func_candidates = [e for e in candidates if e.entity_type == 'function']
                 if func_candidates:
+                    # IMPORTANT: Skip if the reference line matches a function definition line
+                    # This prevents extracting function definitions as calls
+                    for func in func_candidates:
+                        if func.start_line == ref.line_number:
+                            # This is likely a function definition, not a call - skip it
+                            logger.debug(f"Skipping {target_name} at line {ref.line_number} - appears to be a definition, not a call")
+                            continue
+                    
+                    # Filter out definitions that match the reference line
+                    func_candidates = [e for e in func_candidates if e.start_line != ref.line_number]
+                    if not func_candidates:
+                        # All candidates were definitions, skip this resolution
+                        return None
+                    
                     # Try to find the enclosing function and its class
                     # This handles cases where scope wasn't set correctly
                     enclosing_function = None
@@ -276,7 +315,7 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                     # If we have an enclosing function with a parent class, look there first
                     if enclosing_function and enclosing_function.parent:
                         # Look for methods in the same class
-                        class_methods = [e for e in same_file if e.parent == enclosing_function.parent and e.name == target_name and e.entity_type == 'function']
+                        class_methods = [e for e in same_file if e.parent == enclosing_function.parent and e.name == target_name and e.entity_type == 'function' and e.start_line != ref.line_number]
                         if class_methods:
                             return class_methods[0]
                     
@@ -289,7 +328,7 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                                 scope_entity = entity
                                 break
                         if scope_entity and scope_entity.parent:
-                            parent_class_methods = [e for e in same_file if e.parent == scope_entity.parent and e.name == target_name and e.entity_type == 'function']
+                            parent_class_methods = [e for e in same_file if e.parent == scope_entity.parent and e.name == target_name and e.entity_type == 'function' and e.start_line != ref.line_number]
                             if parent_class_methods:
                                 return parent_class_methods[0]
                     
@@ -300,7 +339,7 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                     # 3. Methods in other classes that might be called
                     all_classes = [e for e in same_file if e.entity_type == 'class']
                     for cls in all_classes:
-                        class_methods = [e for e in same_file if e.parent == cls.name and e.name == target_name and e.entity_type == 'function']
+                        class_methods = [e for e in same_file if e.parent == cls.name and e.name == target_name and e.entity_type == 'function' and e.start_line != ref.line_number]
                         if class_methods:
                             # Prefer methods in the same class as the enclosing function
                             if enclosing_function and enclosing_function.parent == cls.name:
@@ -310,7 +349,8 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                             return class_methods[0]
                     
                     # If no scope or couldn't find in class, return first function candidate
-                    return func_candidates[0]
+                    if func_candidates:
+                        return func_candidates[0]
             elif ref.reference_type == 'references':
                 prop_candidates = [e for e in candidates if e.entity_type == 'variable']
                 if prop_candidates:

@@ -197,9 +197,37 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                     function_node = call_node.child_by_field_name('function')
                     if function_node:
                         # Handle member expressions (Utils.helperFunction(), instance.method())
-                        if function_node.type == 'member_expression':
+                        # Kotlin uses various node types: member_expression, navigation_expression, scoped_identifier, etc.
+                        is_member_expr = function_node.type in ['member_expression', 'navigation_expression', 'scoped_identifier', 'user_type']
+                        if is_member_expr:
+                            # Try to extract property/method name and object name
                             property_node = function_node.child_by_field_name('property')
                             object_node = function_node.child_by_field_name('object')
+                            
+                            # If no property field, try to find the last identifier (method name)
+                            if not property_node:
+                                # Look for identifier children - last one is usually the method name
+                                identifiers = [c for c in function_node.children if c.type == 'identifier']
+                                if len(identifiers) >= 2:
+                                    object_node = identifiers[0]
+                                    property_node = identifiers[-1]
+                                elif len(identifiers) == 1:
+                                    # Might be a scoped call like Utils.helperFunction
+                                    # Check parent structure
+                                    property_node = identifiers[0]
+                            
+                            # Also try navigation_expression structure (object.method)
+                            if not property_node and function_node.type == 'navigation_expression':
+                                # Navigation expression: object DOT method
+                                children = list(function_node.children)
+                                for i, child in enumerate(children):
+                                    if child.type == '.' and i + 1 < len(children):
+                                        # Next child should be the method name
+                                        if i > 0:
+                                            object_node = children[i-1]
+                                        property_node = children[i+1]
+                                        break
+                            
                             if property_node:
                                 method_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
                                 # Skip common object properties that are not function calls
@@ -214,11 +242,12 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                                         
                                         # Try to extract object name for qualified name (e.g., Utils.helperFunction)
                                         qualified_name = None
+                                        object_name_str = None
                                         if object_node:
-                                            object_name = object_node.text.decode('utf-8') if hasattr(object_node.text, 'decode') else str(object_node.text)
-                                            # If object is an identifier, use it for qualified lookup
-                                            if object_node.type == 'identifier':
-                                                qualified_name = f"{object_name}.{method_name}"
+                                            object_name_str = object_node.text.decode('utf-8') if hasattr(object_node.text, 'decode') else str(object_node.text)
+                                            # If object is an identifier or type, use it for qualified lookup
+                                            if object_node.type in ['identifier', 'type_identifier', 'user_type']:
+                                                qualified_name = f"{object_name_str}.{method_name}"
                                         
                                         references.append(ScopedReference(
                                             from_entity=enclosing.name if enclosing else file_path_str,
@@ -228,7 +257,7 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                                             line_number=line_num,
                                             scope=scope,
                                             qualified_name=qualified_name,
-                                            context={'expected_type': 'function', 'is_method': True, 'object_name': object_node.text.decode('utf-8') if object_node and hasattr(object_node.text, 'decode') else (str(object_node.text) if object_node else None)}
+                                            context={'expected_type': 'function', 'is_method': True, 'object_name': object_name_str}
                                         ))
                         # Handle simple identifiers (could be constructor or function call)
                         elif function_node.type in ['type_identifier', 'user_type', 'identifier']:
