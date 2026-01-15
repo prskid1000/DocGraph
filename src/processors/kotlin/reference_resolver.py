@@ -189,6 +189,22 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                     if key.lower() == ref.qualified_name.lower():
                         logger.debug(f"Resolved {target_name} via case-insensitive qualified_name match '{key}'")
                         return self.by_qualified_name[key][0]
+                
+                # Also try to resolve by splitting the qualified name and looking up the object and method separately
+                if '.' in ref.qualified_name:
+                    parts = ref.qualified_name.split('.')
+                    if len(parts) == 2:
+                        obj_name, method_name = parts
+                        # Look for the object/class
+                        object_entities = self.by_name.get(obj_name, [])
+                        for obj_entity in object_entities:
+                            if obj_entity.entity_type == 'class':
+                                # Look for the method in this object/class
+                                methods = [e for e in self.by_scope.get(obj_entity.name, [])
+                                         if e.name == method_name and e.entity_type == 'function']
+                                if methods:
+                                    logger.debug(f"Resolved {ref.qualified_name} via split lookup '{obj_name}.{method_name}'")
+                                    return methods[0]
         
         # Also check if context has object_name for member expressions
         if ref.context and ref.context.get('object_name'):
@@ -215,6 +231,21 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                         if methods_in_object:
                             logger.debug(f"Resolved {target_name} via object '{object_name}' scope lookup")
                             return methods_in_object[0]
+                        
+                        # Also try looking in the same file for methods with this parent
+                        same_file = self.by_file.get(ref.file_path, [])
+                        methods_in_file = [e for e in same_file 
+                                         if e.parent == obj_entity.name and e.name == target_name and e.entity_type == 'function']
+                        if methods_in_file:
+                            logger.debug(f"Resolved {target_name} via object '{object_name}' same-file lookup")
+                            return methods_in_file[0]
+                        
+                        # Also check other files for methods in this object/class
+                        all_methods = [e for e in self.entity_container.get_all_entities()
+                                     if e.parent == obj_entity.name and e.name == target_name and e.entity_type == 'function']
+                        if all_methods:
+                            logger.debug(f"Resolved {target_name} via object '{object_name}' global lookup")
+                            return all_methods[0]
         
         # Strategy 1b: Package-qualified name lookup
         if '.' in target_name:
