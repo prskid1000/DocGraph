@@ -367,15 +367,31 @@ class GraphBuilder:
         elif ref.reference_type == 'contains':
             # Source is the file containing the reference
             # Try multiple key formats to find the file node
+            normalized_path = ref.file_path.replace('\\', '/')
             file_key_variants = [
                 f"file:{Path(ref.file_path).name}:{ref.file_path}",
                 f"file:::{ref.file_path}",
+                f"file:{Path(ref.file_path).name}:{normalized_path}",
+                f"file:::{normalized_path}",
             ]
             source_id = None
             for key in file_key_variants:
                 source_id = self.node_ids.get(key)
                 if source_id:
                     break
+            
+            # If not found by exact match, try searching by path
+            if not source_id:
+                file_name = Path(ref.file_path).name
+                for key, node_id in self.node_ids.items():
+                    if key.startswith('file:'):
+                        key_normalized = key.replace('\\', '/')
+                        if (normalized_path in key_normalized or 
+                            ref.file_path in key or
+                            (file_name in key and (normalized_path in key_normalized or ref.file_path in key))):
+                            source_id = node_id
+                            break
+            
             if not source_id:
                 # Fallback to hash (file node should exist)
                 source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
@@ -434,9 +450,11 @@ class GraphBuilder:
         # Handle CALLS and REFERENCES relationships
         else:
             # Source: find entity making the reference
+            source_id = None
             if ref.from_entity:
                 # For function calls/references, try to find the enclosing function/class
-                for entity_type in ['function', 'class', 'variable']:
+                # Try multiple entity types (including mixin for SCSS)
+                for entity_type in ['function', 'class', 'variable', 'mixin']:
                     source_key = f"{entity_type}:{ref.from_entity}:{ref.file_path}"
                     source_id = self.node_ids.get(source_key)
                     if source_id:
@@ -444,10 +462,16 @@ class GraphBuilder:
                 
                 # If not found by exact match, try partial match (in case of name variations)
                 if not source_id:
+                    normalized_file_path = ref.file_path.replace('\\', '/')
                     for key, node_id in self.node_ids.items():
                         if (key.startswith(f"function:{ref.from_entity}:") or 
-                            key.startswith(f"class:{ref.from_entity}:")):
-                            if ref.file_path in key:
+                            key.startswith(f"class:{ref.from_entity}:") or
+                            key.startswith(f"variable:{ref.from_entity}:") or
+                            key.startswith(f"mixin:{ref.from_entity}:")):
+                            key_normalized = key.replace('\\', '/')
+                            if (normalized_file_path in key_normalized or 
+                                ref.file_path in key or
+                                (ref.file_path in key_normalized)):
                                 source_id = node_id
                                 break
                 

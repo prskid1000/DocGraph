@@ -45,6 +45,67 @@ LANGUAGE_RELATIONSHIPS = {
              GraphSchema.REL_IMPORTS],
 }
 
+# Hardcoded expected minimum counts for each language and relationship type
+# Based on manual verification of test_project files
+EXPECTED_COUNTS = {
+    'Python': {
+        GraphSchema.REL_DEFINES: 4,
+        GraphSchema.REL_CALLS: 3,
+        GraphSchema.REL_REFERENCES: 5,
+        GraphSchema.REL_IMPORTS: 1,
+        GraphSchema.REL_INHERITS: 1,
+        GraphSchema.REL_HAS_PARAMETER: 4,
+        GraphSchema.REL_RETURNS: 4,
+    },
+    'JavaScript': {
+        GraphSchema.REL_DEFINES: 4,
+        GraphSchema.REL_CALLS: 4,
+        GraphSchema.REL_REFERENCES: 5,
+        GraphSchema.REL_IMPORTS: 1,
+        GraphSchema.REL_INHERITS: 1,
+        GraphSchema.REL_HAS_PARAMETER: 4,
+    },
+    'TypeScript': {
+        GraphSchema.REL_DEFINES: 4,
+        GraphSchema.REL_CALLS: 2,
+        GraphSchema.REL_REFERENCES: 10,
+        GraphSchema.REL_IMPORTS: 1,
+        GraphSchema.REL_INHERITS: 1,
+        GraphSchema.REL_HAS_PARAMETER: 11,
+        GraphSchema.REL_RETURNS: 10,
+    },
+    'Java': {
+        GraphSchema.REL_DEFINES: 19,
+        GraphSchema.REL_CALLS: 9,
+        GraphSchema.REL_IMPORTS: 2,
+        GraphSchema.REL_INHERITS: 2,
+        GraphSchema.REL_HAS_PARAMETER: 10,
+        GraphSchema.REL_RETURNS: 11,
+    },
+    'Kotlin': {
+        GraphSchema.REL_DEFINES: 2,
+        GraphSchema.REL_CALLS: 4,
+        GraphSchema.REL_IMPORTS: 2,
+        GraphSchema.REL_INHERITS: 1,
+        GraphSchema.REL_HAS_PARAMETER: 2,
+        GraphSchema.REL_RETURNS: 2,
+    },
+    'HTML': {
+        GraphSchema.REL_DEFINES: 12,
+        GraphSchema.REL_CALLS: 3,
+        GraphSchema.REL_REFERENCES: 10,
+        GraphSchema.REL_IMPORTS: 4,
+        GraphSchema.REL_CONTAINS: 4,  # styles.css, script.js, image.jpg, page.html
+        GraphSchema.REL_HAS_PARAMETER: 3,
+    },
+    'SCSS': {
+        GraphSchema.REL_DEFINES: 9,  # 4 selectors in styles.scss, 2 mixins in _mixins.scss, 3 variables in _variables.scss
+        GraphSchema.REL_CALLS: 4,  # 4 @include calls in styles.scss (button-style x2, container-style x2)
+        GraphSchema.REL_REFERENCES: 6,  # 3 in styles.scss (secondary-color, primary-color, button) + 3 in _mixins.scss (primary-color x2, border-width)
+        GraphSchema.REL_IMPORTS: 2,  # @import 'variables' and @import 'mixins' in styles.scss
+    },
+}
+
 def clear_screen():
     """Clear the terminal screen."""
     os.system('cls' if os.name == 'nt' else 'clear')
@@ -194,11 +255,13 @@ def verify_relationships_by_language():
                 result = client.execute_query(query)
                 count = result[0]['count'] if result else 0
             
-            # Require at least 1 relationship of each type
-            status = "OK" if count >= 1 else "MISSING"
-            print(f"  [{status:7s}] {rel_type:20s}: {count:4d} relationships")
+            # Check against expected count if available, otherwise require at least 1
+            expected_count = EXPECTED_COUNTS.get(language, {}).get(rel_type, 1)
+            status = "OK" if count >= expected_count else "MISSING"
+            expected_str = f" (expected: {expected_count})" if expected_count > 1 else ""
+            print(f"  [{status:7s}] {rel_type:20s}: {count:4d} relationships{expected_str}")
             
-            if count < 1:
+            if count < expected_count:
                 language_ok = False
                 all_languages_ok = False
                 missing_rels.append(rel_type)
