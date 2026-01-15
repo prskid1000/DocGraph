@@ -94,11 +94,22 @@ class KotlinReferenceResolver(BaseReferenceResolver):
                 valid_references.append(ref)
         
         for ref in valid_references:
-            target = self._resolve_reference(ref)
-            if target:
+            # For IMPORTS, allow them through even if they can't be resolved to entities
+            # (they're file-to-file/module relationships, not entity relationships)
+            if ref.reference_type == 'imports':
+                resolved[ref.reference_type].append((ref, None))
+            # For INHERITS, allow them through even if target can't be resolved
+            # (the graph builder will try to find the base class by name)
+            elif ref.reference_type == 'inherits':
+                target = self._resolve_reference(ref)
+                # Always add INHERITS, even if target is None (graph builder will search by name)
                 resolved[ref.reference_type].append((ref, target))
             else:
-                self.unresolved_references.append(ref)
+                target = self._resolve_reference(ref)
+                if target:
+                    resolved[ref.reference_type].append((ref, target))
+                else:
+                    self.unresolved_references.append(ref)
         
         total_resolved = sum(len(v) for v in resolved.values())
         total_valid = len(valid_references)
@@ -126,9 +137,13 @@ class KotlinReferenceResolver(BaseReferenceResolver):
         if not target_name:
             return False
         
-        # Skip keywords
+        # Skip keywords (except 'super' for CALLS, as it's a valid call target)
         if target_name.lower() in KOTLIN_KEYWORDS:
-            return False
+            if target_name.lower() == 'super' and ref.reference_type == 'calls':
+                # Allow 'super' for CALLS - it calls parent constructor/methods
+                pass
+            else:
+                return False
         
         # Skip built-in standard library classes (unless it's an import)
         if target_name in KOTLIN_BUILTINS and ref.reference_type != 'imports':

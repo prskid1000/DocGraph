@@ -70,6 +70,46 @@ class JavaReferenceExtractor(BaseReferenceExtractor):
                         scope=current_scope[-1] if current_scope else None
                     ))
             
+            # Extract constructor calls (new ClassName())
+            elif node.type == 'object_creation_expression':
+                # Try to find the type/class being instantiated
+                type_node = node.child_by_field_name('type')
+                if not type_node and node.child_count > 0:
+                    # Fallback: first child might be the type
+                    type_node = node.children[0]
+                
+                if type_node:
+                    # Extract class name
+                    if type_node.type == 'type_identifier':
+                        class_name = type_node.text.decode('utf-8') if hasattr(type_node.text, 'decode') else str(type_node.text)
+                        enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                        scope = current_scope[-1] if current_scope else None
+                        references.append(ScopedReference(
+                            from_entity=enclosing.name if enclosing else file_path_str,
+                            to_entity=class_name,
+                            reference_type='calls',
+                            file_path=file_path_str,
+                            line_number=node.start_point[0] + 1,
+                            scope=scope,
+                            context={'expected_type': 'class', 'is_constructor': True}
+                        ))
+                    elif type_node.type == 'generic_type':
+                        # Handle generic types like new ArrayList<String>()
+                        type_identifier = type_node.child_by_field_name('type')
+                        if type_identifier:
+                            class_name = type_identifier.text.decode('utf-8') if hasattr(type_identifier.text, 'decode') else str(type_identifier.text)
+                            enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                            scope = current_scope[-1] if current_scope else None
+                            references.append(ScopedReference(
+                                from_entity=enclosing.name if enclosing else file_path_str,
+                                to_entity=class_name,
+                                reference_type='calls',
+                                file_path=file_path_str,
+                                line_number=node.start_point[0] + 1,
+                                scope=scope,
+                                context={'expected_type': 'class', 'is_constructor': True}
+                            ))
+            
             # Extract method calls
             elif node.type == 'method_invocation':
                 name_node = node.child_by_field_name('name')

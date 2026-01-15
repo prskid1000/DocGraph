@@ -224,7 +224,7 @@ class GraphBuilder:
         source_id = None
         target_id = None
         
-        # Handle IMPORTS relationships (File -> Module)
+        # Handle IMPORTS relationships (File -> Module/File)
         if ref.reference_type == 'imports':
             # Source is the file - find file node ID
             file_id = hashlib.md5(ref.file_path.encode()).hexdigest()
@@ -241,14 +241,39 @@ class GraphBuilder:
             if not source_id:
                 source_id = file_id  # Use hash as fallback
             
-            # Target is a Module node
+            # Target is a Module node or File node (for relative imports)
             module_name = ref.to_entity
-            module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
-            module_key = f"module:{module_name.split('.')[-1]}::{module_name}"
-            target_id = self.node_ids.get(module_key)
-            # If not found, use the module_id (module node should be created)
-            if not target_id:
-                target_id = module_id
+            
+            # Handle relative imports (./base, ../module, etc.)
+            if module_name.startswith('./') or module_name.startswith('../'):
+                # For relative imports, try to resolve to a file
+                source_file = Path(ref.file_path)
+                try:
+                    target_file = (source_file.parent / module_name).resolve()
+                    target_file_str = str(target_file)
+                    target_id = hashlib.md5(target_file_str.encode()).hexdigest()
+                    
+                    # Try to find existing file node
+                    target_file_key_variants = [
+                        f"file:{target_file.name}:{target_file_str}",
+                        f"file:::{target_file_str}",
+                    ]
+                    for key in target_file_key_variants:
+                        existing_id = self.node_ids.get(key)
+                        if existing_id:
+                            target_id = existing_id
+                            break
+                except (ValueError, OSError):
+                    # If path resolution fails, fall back to module node
+                    target_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
+            else:
+                # Absolute import - create Module node
+                module_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
+                module_key = f"module:{module_name.split('.')[-1]}::{module_name}"
+                target_id = self.node_ids.get(module_key)
+                # If not found, use the module_id (module node should be created)
+                if not target_id:
+                    target_id = module_id
         
         # Handle INHERITS relationships (Class -> Class)
         elif ref.reference_type == 'inherits':
@@ -256,10 +281,23 @@ class GraphBuilder:
             source_key = f"class:{ref.from_entity}:{ref.file_path}"
             source_id = self.node_ids.get(source_key)
             
+            # If not found by exact match, try partial match
+            if not source_id:
+                for key, node_id in self.node_ids.items():
+                    if key.startswith(f"class:{ref.from_entity}:") and ref.file_path in key:
+                        source_id = node_id
+                        break
+            
             # Target is the base class (try resolved first, then lookup)
             if resolved_target:
                 target_key = f"class:{resolved_target.name}:{resolved_target.file_path}"
                 target_id = self.node_ids.get(target_key)
+                # If not found, try partial match
+                if not target_id:
+                    for key, node_id in self.node_ids.items():
+                        if key.startswith(f"class:{resolved_target.name}:") and resolved_target.file_path in key:
+                            target_id = node_id
+                            break
             else:
                 # Try to find base class by name (search across all files)
                 base_name = ref.to_entity

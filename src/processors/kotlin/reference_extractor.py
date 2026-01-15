@@ -70,6 +70,39 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                         scope=current_scope[-1] if current_scope else None
                     ))
             
+            # Extract constructor calls (ClassName() or ClassName(...))
+            # In Kotlin, constructors are called like regular function calls
+            # We need to detect when it's a constructor call vs method call
+            # This is tricky - we'll look for patterns like ClassName() where ClassName is a class
+            elif node.type == 'call_expression':
+                # Check if this might be a constructor call
+                # In Kotlin, constructor calls look like: ClassName() or ClassName(args)
+                # The function part should be a type_identifier or user_type
+                function_node = node.child_by_field_name('function')
+                if function_node:
+                    # Check if it's a type identifier (likely a constructor call)
+                    if function_node.type in ['type_identifier', 'user_type', 'identifier']:
+                        # Try to determine if this is a constructor call
+                        # If the identifier matches a class name in scope, it's likely a constructor
+                        class_name = function_node.text.decode('utf-8') if hasattr(function_node.text, 'decode') else str(function_node.text)
+                        # For now, we'll treat capitalized identifiers as potential constructor calls
+                        # This is a heuristic - in Kotlin, class names are typically PascalCase
+                        if class_name and class_name[0].isupper() if class_name else False:
+                            enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                            scope = current_scope[-1] if current_scope else None
+                            references.append(ScopedReference(
+                                from_entity=enclosing.name if enclosing else file_path_str,
+                                to_entity=class_name,
+                                reference_type='calls',
+                                file_path=file_path_str,
+                                line_number=node.start_point[0] + 1,
+                                scope=scope,
+                                context={'expected_type': 'class', 'is_constructor': True}
+                            ))
+                        else:
+                            # Regular function call - handled below
+                            pass
+            
             # Extract method calls
             elif node.type == 'method_invocation':
                 name_node = node.child_by_field_name('name')

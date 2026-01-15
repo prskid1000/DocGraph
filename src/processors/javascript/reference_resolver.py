@@ -77,11 +77,22 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
                 pass
         
         for ref in valid_references:
-            target = self._resolve_reference(ref)
-            if target:
+            # For IMPORTS, allow them through even if they can't be resolved to entities
+            # (they're file-to-file/module relationships, not entity relationships)
+            if ref.reference_type == 'imports':
+                resolved[ref.reference_type].append((ref, None))
+            # For INHERITS, allow them through even if target can't be resolved
+            # (the graph builder will try to find the base class by name)
+            elif ref.reference_type == 'inherits':
+                target = self._resolve_reference(ref)
+                # Always add INHERITS, even if target is None (graph builder will search by name)
                 resolved[ref.reference_type].append((ref, target))
             else:
-                self.unresolved_references.append(ref)
+                target = self._resolve_reference(ref)
+                if target:
+                    resolved[ref.reference_type].append((ref, target))
+                else:
+                    self.unresolved_references.append(ref)
         
         total_resolved = sum(len(v) for v in resolved.values())
         total_valid = len(valid_references)
@@ -125,9 +136,13 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
         if not target_name:
             return False
         
-        # Skip keywords
+        # Skip keywords (except 'super' for CALLS, as it's a valid call target)
         if target_name.lower() in JS_KEYWORDS:
-            return False
+            if target_name.lower() == 'super' and ref.reference_type == 'calls':
+                # Allow 'super' for CALLS - it calls parent constructor/methods
+                pass
+            else:
+                return False
         
         # Skip built-in globals (unless it's an import)
         if target_name in JS_BUILTINS and ref.reference_type != 'imports':
@@ -137,14 +152,13 @@ class JavaScriptReferenceResolver(BaseReferenceResolver):
         if ref.reference_type == 'inherits' and target_name.startswith('extends '):
             return False
         
-        # Skip external module imports (relative paths, node modules, etc.)
+        # Skip external module imports (node modules, etc.)
         if ref.reference_type == 'imports':
-            # Skip relative imports (./base, ../module, etc.)
-            if target_name.startswith('./') or target_name.startswith('../'):
-                return False
+            # Allow relative imports (./base, ../module) - they might be in the codebase
+            # We'll try to resolve them and only skip if they can't be resolved
             # Skip common node modules that aren't in the codebase
             common_node_modules = {'fs', 'path', 'os', 'util', 'http', 'https', 'crypto', 'stream', 'events', 'buffer'}
-            if target_name in common_node_modules:
+            if target_name in common_node_modules and not (target_name.startswith('./') or target_name.startswith('../')):
                 return False
         
         # Skip common object property names that are not entities

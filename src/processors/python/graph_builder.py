@@ -28,14 +28,46 @@ class PythonGraphBuilder(BaseGraphBuilder):
         
         # Build relationships from references
         for ref in references:
-            # Find source entity
-            source_key = f"function:{ref.from_entity}:{ref.file_path}"
-            if source_key not in node_ids:
-                source_key = f"class:{ref.from_entity}:{ref.file_path}"
-            if source_key not in node_ids:
-                continue
+            source_id = None
             
-            source_id = node_ids[source_key]
+            # Handle IMPORTS - source is the file
+            if ref.reference_type == 'imports':
+                # For imports, from_entity is typically the file path
+                if ref.from_entity == ref.file_path:
+                    # Use file path hash as source ID
+                    source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+                else:
+                    # Try to find file entity
+                    file_key = f"file:{ref.from_entity}:{ref.file_path}"
+                    source_id = node_ids.get(file_key)
+                    if not source_id:
+                        source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+            else:
+                # For other relationship types, try to find source entity
+                # Try multiple entity types
+                for entity_type in ['function', 'class', 'variable']:
+                    source_key = f"{entity_type}:{ref.from_entity}:{ref.file_path}"
+                    if source_key in node_ids:
+                        source_id = node_ids[source_key]
+                        break
+                
+                # If not found by exact match, try partial match
+                if not source_id:
+                    for key, node_id in node_ids.items():
+                        if (key.startswith(f"function:{ref.from_entity}:") or 
+                            key.startswith(f"class:{ref.from_entity}:") or
+                            key.startswith(f"variable:{ref.from_entity}:")):
+                            if ref.file_path in key:
+                                source_id = node_id
+                                break
+                
+                # If source is a file path (for top-level references), use file as source
+                if not source_id and ref.from_entity == ref.file_path:
+                    source_id = hashlib.md5(ref.file_path.encode()).hexdigest()
+            
+            # Skip if we still can't find a source
+            if not source_id:
+                continue
             
             # For now, we'll resolve target in the main graph builder
             # This is a placeholder - actual resolution happens later

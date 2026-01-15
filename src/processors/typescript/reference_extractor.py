@@ -89,6 +89,49 @@ class TypeScriptReferenceExtractor(BaseReferenceExtractor):
                                     line_number=node.start_point[0] + 1
                                 ))
             
+            # Extract new expressions (constructor calls)
+            elif node.type == 'new_expression':
+                # Try to find constructor node (could be field 'constructor' or first child)
+                constructor_node = node.child_by_field_name('constructor')
+                if not constructor_node and node.child_count > 0:
+                    # Fallback: first child is usually the constructor
+                    constructor_node = node.children[0]
+                
+                if constructor_node:
+                    # Handle different constructor patterns
+                    if constructor_node.type == 'identifier':
+                        # Simple constructor: new ClassName()
+                        class_name = constructor_node.text.decode('utf-8') if hasattr(constructor_node.text, 'decode') else str(constructor_node.text)
+                        scope = current_scope[-1] if current_scope else None
+                        enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                        
+                        references.append(ScopedReference(
+                            from_entity=enclosing.name if enclosing else file_path_str,
+                            to_entity=class_name,
+                            reference_type='calls',
+                            file_path=file_path_str,
+                            line_number=node.start_point[0] + 1,
+                            scope=scope,
+                            context={'expected_type': 'class', 'is_constructor': True}
+                        ))
+                    elif constructor_node.type == 'member_expression':
+                        # Qualified constructor: new obj.ClassName()
+                        property_node = constructor_node.child_by_field_name('property')
+                        if property_node:
+                            class_name = property_node.text.decode('utf-8') if hasattr(property_node.text, 'decode') else str(property_node.text)
+                            scope = current_scope[-1] if current_scope else None
+                            enclosing = self._find_enclosing_entity(node.start_point[0] + 1, entities)
+                            
+                            references.append(ScopedReference(
+                                from_entity=enclosing.name if enclosing else file_path_str,
+                                to_entity=class_name,
+                                reference_type='calls',
+                                file_path=file_path_str,
+                                line_number=node.start_point[0] + 1,
+                                scope=scope,
+                                context={'expected_type': 'class', 'is_constructor': True}
+                            ))
+            
             # Extract function calls
             elif node.type == 'call_expression':
                 function_node = node.child_by_field_name('function')
