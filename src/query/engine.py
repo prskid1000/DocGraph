@@ -154,41 +154,82 @@ class QueryEngine:
         
         return references
     
-    def get_call_graph(self, function_name: str, depth: int = 2) -> Dict[str, Any]:
+    def get_call_graph(self, function_name: str, depth: int = 2, codebase_id: Optional[str] = None) -> Dict[str, Any]:
         """Get call graph for a function.
         
         Args:
             function_name: Name of the function.
             depth: Maximum depth to traverse.
+            codebase_id: Optional codebase filter (defaults to instance codebase_id).
             
         Returns:
             Dictionary with function, calls, and called_by.
         """
-        query = GraphQueries.get_call_graph(function_name, depth)
-        results = self.neo4j.execute_query(query, {'function_name': function_name})
+        codebase_filter = codebase_id or self.codebase_id
+        query = GraphQueries.get_call_graph(function_name, depth, codebase_filter)
+        params = {'function_name': function_name}
+        if codebase_filter:
+            params['codebase_id'] = codebase_filter
+        results = self.neo4j.execute_query(query, params)
         
         if results:
-            record = results[0]
+            # Aggregate results from all functions with the same name
+            all_calls = []
+            all_called_by = []
+            seen_call_ids = set()
+            seen_caller_ids = set()
+            first_function = None
+            
+            for record in results:
+                func = record.get('f')
+                if func and not first_function:
+                    first_function = dict(func)
+                
+                # Collect all unique calls
+                calls = record.get('calls', [])
+                for c in calls:
+                    if c:
+                        c_dict = dict(c)
+                        call_id = c_dict.get('id') or f"{c_dict.get('name', '')}:{c_dict.get('file_path', '')}"
+                        if call_id not in seen_call_ids:
+                            seen_call_ids.add(call_id)
+                            all_calls.append(c_dict)
+                
+                # Collect all unique callers
+                called_by = record.get('called_by', [])
+                for c in called_by:
+                    if c:
+                        c_dict = dict(c)
+                        caller_id = c_dict.get('id') or f"{c_dict.get('name', '')}:{c_dict.get('file_path', '')}"
+                        if caller_id not in seen_caller_ids:
+                            seen_caller_ids.add(caller_id)
+                            all_called_by.append(c_dict)
+            
             return {
-                'function': dict(record['f']),
-                'calls': [dict(c) for c in record.get('calls', [])],
-                'called_by': [dict(c) for c in record.get('called_by', [])]
+                'function': first_function,
+                'calls': all_calls,
+                'called_by': all_called_by
             }
         return {'function': None, 'calls': [], 'called_by': []}
     
-    def get_dependencies(self, file_path: str) -> List[Dict[str, Any]]:
+    def get_dependencies(self, file_path: str, codebase_id: Optional[str] = None) -> List[Dict[str, Any]]:
         """Get import/module dependencies for a file.
         
         Args:
             file_path: Path to the file.
+            codebase_id: Optional codebase filter (defaults to instance codebase_id).
             
         Returns:
             List of module dependencies.
         """
-        query = GraphQueries.get_dependencies(file_path)
-        results = self.neo4j.execute_query(query, {'file_path': file_path})
+        codebase_filter = codebase_id or self.codebase_id
+        query = GraphQueries.get_dependencies(file_path, codebase_filter)
+        params = {'file_path': file_path}
+        if codebase_filter:
+            params['codebase_id'] = codebase_filter
+        results = self.neo4j.execute_query(query, params)
         
-        return [dict(record['m']) for record in results]
+        return [dict(record['m']) for record in results if record.get('m')]
     
     def get_context(self, file_path: str, line_number: int,
                    context_lines: int = 50) -> Dict[str, Any]:
@@ -200,8 +241,10 @@ class QueryEngine:
             context_lines: Number of context lines.
             
         Returns:
-            Dictionary with entities and related entities in context.
+            Dictionary with entities, related entities, and source code in context.
         """
+        import os
+        
         query = GraphQueries.get_context_around_location(file_path, line_number, context_lines)
         results = self.neo4j.execute_query(query, {
             'file_path': file_path,
@@ -218,11 +261,26 @@ class QueryEngine:
             related = record.get('related_entities', [])
             related_entities.extend([dict(r) for r in related])
         
+        # Read source code from file
+        code = ""
+        try:
+            if os.path.exists(file_path):
+                with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
+                    lines = f.readlines()
+                    start_line = max(0, line_number - context_lines - 1)
+                    end_line = min(len(lines), line_number + context_lines)
+                    code_lines = lines[start_line:end_line]
+                    code = ''.join(code_lines)
+        except Exception as e:
+            logger.warning(f"Failed to read source code from {file_path}: {e}")
+            code = f"// Unable to read source code: {str(e)}"
+        
         return {
             'file_path': file_path,
             'line_number': line_number,
             'entities': entities,
-            'related_entities': list(set([str(r) for r in related_entities]))
+            'related_entities': list(set([str(r) for r in related_entities])),
+            'code': code
         }
     
     def query_graph(self, cypher_query: str, parameters: Optional[Dict[str, Any]] = None) -> List[Dict[str, Any]]:

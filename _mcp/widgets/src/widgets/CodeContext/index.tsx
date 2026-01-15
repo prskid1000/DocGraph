@@ -1,7 +1,7 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useWidgetProps } from "../../use-widget-props";
-import { ExpandableCard, NestedObject, formatKey, formatValue } from "../../entity-utils";
+import { ExpandableCard, NestedObject } from "../../entity-utils";
 
 interface RelatedEntity {
   name: string;
@@ -9,11 +9,22 @@ interface RelatedEntity {
   distance: number;
 }
 
+interface Entity {
+  id?: string;
+  name?: string;
+  entity_type?: string;
+  signature?: string;
+  file_path?: string;
+  start_line?: number;
+  [key: string]: any;
+}
+
 interface ContextData {
   file_path: string;
   line_number: number;
-  code: string;
+  code?: string;
   related_entities?: RelatedEntity[];
+  entities?: Entity[];
   id?: string;
   name?: string;
 }
@@ -27,6 +38,7 @@ interface CodeContextResponse {
   file_path?: string;
   line_number?: number;
   code?: string;
+  entities?: Entity[];
   related_entities?: RelatedEntity[];
   [key: string]: any;
 }
@@ -41,10 +53,16 @@ function CodeContextWidget() {
   // Check for errors
   const error = data.error;
 
-  // Extract context data
+  // Extract context data - handle both nested data.data and flat structure
   const context = data.data 
     ? (Array.isArray(data.data) ? data.data[0] : data.data)
-    : (data.file_path ? data as unknown as ContextData : null);
+    : (data.file_path ? {
+        file_path: data.file_path,
+        line_number: data.line_number || 0,
+        code: data.code || '',
+        related_entities: data.related_entities || [],
+        entities: data.entities || []
+      } as ContextData : null);
 
   // Check if data has results array
   const hasResults = Array.isArray(data?.data) && data.data.length > 1;
@@ -107,10 +125,45 @@ function CodeContextWidget() {
       {/* Code Display */}
       <div className="mb-4">
         <h3 className="text-sm font-semibold text-gray-700 mb-2">Source Code</h3>
-        <div className="bg-gray-900 rounded border border-gray-700 p-4">
-          <pre className="text-sm font-mono text-green-400 overflow-x-auto">{context.code}</pre>
-        </div>
+        {context.code ? (
+          <div className="bg-gray-900 rounded border border-gray-700 p-4">
+            <pre className="text-sm font-mono text-green-400 overflow-x-auto whitespace-pre-wrap">{context.code}</pre>
+          </div>
+        ) : (
+          <div className="bg-gray-100 rounded border border-gray-300 p-4">
+            <p className="text-sm text-gray-600">Source code not available. File may not exist or be readable.</p>
+          </div>
+        )}
       </div>
+
+      {/* Entities in Context */}
+      {context.entities && Array.isArray(context.entities) && context.entities.length > 0 && (
+        <div className="mb-4">
+          <h3 className="text-sm font-semibold text-gray-700 mb-3">
+            Entities in Context ({context.entities.length})
+          </h3>
+          <div className="space-y-2">
+            {context.entities.map((entity: any, idx: number) => (
+              <div key={entity.id || idx} className="border border-teal-200 rounded-lg bg-white shadow-sm p-3">
+                <div className="flex items-center gap-3 flex-wrap">
+                  <span className="px-2 py-0.5 rounded text-xs font-medium bg-teal-100 text-teal-800 border border-teal-200">
+                    {entity.entity_type || 'Entity'}
+                  </span>
+                  <span className="font-semibold text-gray-900 font-mono text-sm">{entity.name || 'Unknown'}</span>
+                  {entity.signature && (
+                    <span className="text-xs text-gray-600 font-mono">{entity.signature}</span>
+                  )}
+                  {entity.file_path && entity.start_line && (
+                    <span className="text-xs text-gray-600 font-mono">
+                      {entity.file_path}:{entity.start_line}
+                    </span>
+                  )}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
 
       {/* Related Entities */}
       {context.related_entities && context.related_entities.length > 0 && (

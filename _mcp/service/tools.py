@@ -179,11 +179,56 @@ def get_call_graph_handler(codebase_id: str, function_name: str, depth: int = 2)
             vector_db=get_vector_db(codebase_id) if get_vector_db else None,
             embedding_model=shared_instances.get('embedding_model')
         )
-        graph = engine.get_call_graph(function_name, depth=depth)
+        graph = engine.get_call_graph(function_name, depth=depth, codebase_id=codebase_id)
+        
+        # Transform data structure to match widget expectations
+        # Widget expects: { name, type, file_path, line_number, children: [...] }
+        function_data = graph.get('function')
+        
+        # Combine calls and called_by into children array
+        calls = graph.get('calls', [])
+        called_by = graph.get('called_by', [])
+        children = []
+        
+        # Add "calls" (functions this function calls)
+        for call in calls:
+            if call:  # Filter out None values
+                children.append({
+                    'name': call.get('name', ''),
+                    'type': 'Function',
+                    'file_path': call.get('file_path', ''),
+                    'line_number': call.get('start_line') or call.get('line_number'),
+                    'id': call.get('id', ''),
+                    'direction': 'calls',
+                    **{k: v for k, v in call.items() if k not in ['name', 'type', 'file_path', 'line_number', 'start_line', 'id']}
+                })
+        
+        # Add "called_by" (functions that call this function)
+        for caller in called_by:
+            if caller:  # Filter out None values
+                children.append({
+                    'name': caller.get('name', ''),
+                    'type': 'Function',
+                    'file_path': caller.get('file_path', ''),
+                    'line_number': caller.get('start_line') or caller.get('line_number'),
+                    'id': caller.get('id', ''),
+                    'direction': 'called_by',
+                    **{k: v for k, v in caller.items() if k not in ['name', 'type', 'file_path', 'line_number', 'start_line', 'id']}
+                })
+        
+        # Create the root node structure - always return valid structure even if function not found
+        # This allows widget to show "No call graph data found" instead of loading forever
+        call_graph_data = {
+            'name': function_data.get('name', function_name) if function_data else function_name,
+            'type': 'Function',
+            'file_path': function_data.get('file_path', '') if function_data else '',
+            'line_number': (function_data.get('start_line') or function_data.get('line_number')) if function_data else None,
+            'children': children
+        }
         
         return {
             "success": True,
-            "data": graph,
+            "data": call_graph_data,
             "function_name": function_name,
             "depth": depth,
             "codebase_id": codebase_id
@@ -208,13 +253,28 @@ def get_dependencies_handler(codebase_id: str, file_path: str) -> Dict[str, Any]
             vector_db=get_vector_db(codebase_id) if get_vector_db else None,
             embedding_model=shared_instances.get('embedding_model')
         )
-        deps = engine.get_dependencies(file_path)
+        deps = engine.get_dependencies(file_path, codebase_id=codebase_id)
+        
+        # Transform data to match widget expectations
+        # Widget expects array of { name, type, file_path, line_number, id, ... }
+        transformed_deps = []
+        for dep in deps:
+            if dep:  # Filter out None values
+                transformed_deps.append({
+                    'name': dep.get('name', dep.get('path', 'Unknown')),
+                    'type': 'Module',
+                    'file_path': dep.get('file_path', dep.get('path', '')),
+                    'line_number': dep.get('start_line') or dep.get('line_number'),
+                    'id': dep.get('id', ''),
+                    **{k: v for k, v in dep.items() if k not in ['name', 'type', 'file_path', 'line_number', 'start_line', 'id', 'path']}
+                })
         
         return {
             "success": True,
-            "data": deps,
+            "data": transformed_deps,
             "file_path": file_path,
-            "codebase_id": codebase_id
+            "codebase_id": codebase_id,
+            "total_results": len(transformed_deps)
         }
     except Exception as e:
         return {

@@ -77,16 +77,29 @@ class GraphQueries:
         """
     
     @staticmethod
-    def get_call_graph(function_name: str, depth: int = 2) -> str:
+    def get_call_graph(function_name: str, depth: int = 2, codebase_id: Optional[str] = None) -> str:
         """Get call graph for a function.
         
         Args:
             function_name: Name of the function.
             depth: Maximum depth to traverse.
+            codebase_id: Optional codebase filter.
             
         Returns:
             Cypher query string.
         """
+        if codebase_id:
+            # Use separate queries for calls and called_by to avoid WHERE clause issues with OPTIONAL MATCH
+            # Filter codebase_id in the pattern itself for better performance
+            return f"""
+                MATCH (f:Function {{name: $function_name, codebase_id: $codebase_id}})
+                OPTIONAL MATCH (f)-[:CALLS*1..{depth}]->(called:Function {{codebase_id: $codebase_id}})
+                WITH f, collect(DISTINCT called) as called_list
+                OPTIONAL MATCH (caller:Function {{codebase_id: $codebase_id}})-[:CALLS*1..{depth}]->(f)
+                RETURN f, 
+                       [c IN called_list WHERE c IS NOT NULL] as calls,
+                       [c IN collect(DISTINCT caller) WHERE c IS NOT NULL] as called_by
+            """
         return f"""
             MATCH (f:Function {{name: $function_name}})
             OPTIONAL MATCH path1 = (f)-[:CALLS*1..{depth}]->(called:Function)
@@ -97,15 +110,22 @@ class GraphQueries:
         """
     
     @staticmethod
-    def get_dependencies(file_path: str) -> str:
+    def get_dependencies(file_path: str, codebase_id: Optional[str] = None) -> str:
         """Get all dependencies for a file.
         
         Args:
             file_path: Path to the file.
+            codebase_id: Optional codebase filter.
             
         Returns:
             Cypher query string.
         """
+        if codebase_id:
+            return """
+                MATCH (f:File {path: $file_path, codebase_id: $codebase_id})
+                MATCH (f)-[:IMPORTS]->(m:Module {codebase_id: $codebase_id})
+                RETURN m
+            """
         return """
             MATCH (f:File {path: $file_path})
             MATCH (f)-[:IMPORTS]->(m:Module)
