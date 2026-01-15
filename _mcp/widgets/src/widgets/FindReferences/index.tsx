@@ -1,16 +1,39 @@
-import React, { useState } from "react";
+import { useState } from "react";
 import { createRoot } from "react-dom/client";
 import { useWidgetProps } from "../../use-widget-props";
-import { ExpandableCard, NestedObject, formatKey, formatValue } from "../../entity-utils";
+import { ExpandableCard, NestedObject } from "../../entity-utils";
 
-interface Reference {
+interface ReferenceSource {
+  file_path: string;
+  name: string;
+  start_line: number;
+  start_column: number;
+  end_line: number;
+  end_column: number;
+  codebase_id: string;
   id: string;
-  entity_name: string;
+}
+
+interface ReferenceRelationship {
   file_path: string;
   line_number: number;
-  context?: string;
-  type?: string;
-  name?: string;
+}
+
+interface ReferenceTarget {
+  file_path: string;
+  name: string;
+  start_line: number;
+  start_column: number;
+  end_line: number;
+  end_column: number;
+  codebase_id: string;
+  id: string;
+}
+
+interface Reference {
+  source: ReferenceSource;
+  relationship: ReferenceRelationship;
+  target: ReferenceTarget;
   [key: string]: any;
 }
 
@@ -34,7 +57,6 @@ function FindReferencesWidget() {
   const results: Reference[] = Array.isArray(data?.data) ? (data.data as Reference[]) : [];
   const entityName = data.entity_name || "";
   const totalResults = data.total_results || results.length;
-  const success = data.success !== false;
 
   // Check for isError flag (highest priority)
   const isError = data.isError === true;
@@ -104,27 +126,46 @@ function FindReferencesWidget() {
       {/* Results */}
       {hasResults ? (
         <div className="space-y-4">
-          {results.map((ref, idx) => (
-            <ExpandableCard
-              key={ref.id || idx}
-              expanded={!!expanded[ref.id || idx]}
-              onToggle={() => setExpanded((prev) => ({ ...prev, [ref.id || idx]: !prev[ref.id || idx] }))}
-              header={
-                <div className="flex items-center gap-3 mb-2">
-                  <h3 className="text-lg font-semibold text-gray-900 truncate" title={ref.name || ref.entity_name || ref.id}>
-                    {ref.name || ref.entity_name || ref.id}
-                  </h3>
-                  <span className="text-sm text-gray-600 font-mono">
-                    {ref.file_path}:{ref.line_number}
-                  </span>
+          {results.map((ref, idx) => {
+            // Extract information from nested structure
+            const filePath = ref.relationship?.file_path || '';
+            const lineNumber = ref.relationship?.line_number;
+            const targetName = ref.target?.name || '';
+            const referenceId = ref.target?.id || ref.source?.id || `ref-${idx}`;
+            
+            // Format file path for display (extract just filename if path is long)
+            const displayPath = filePath ? (filePath.split(/[/\\]/).pop() || filePath) : '';
+            const fullPath = filePath;
+            
+            return (
+              <ExpandableCard
+                key={referenceId}
+                expanded={!!expanded[referenceId]}
+                onToggle={() => setExpanded((prev) => ({ ...prev, [referenceId]: !prev[referenceId] }))}
+                header={
+                  <div className="flex items-center gap-3 flex-wrap">
+                    {targetName && (
+                      <h3 className="text-lg font-semibold text-gray-900 truncate" title={targetName}>
+                        {targetName}
+                      </h3>
+                    )}
+                    {filePath && lineNumber !== undefined && (
+                      <span className="text-sm text-gray-600 font-mono truncate" title={fullPath}>
+                        {displayPath}:{lineNumber}
+                      </span>
+                    )}
+                    {!targetName && !filePath && (
+                      <span className="text-sm text-gray-500">Reference {idx + 1}</span>
+                    )}
+                  </div>
+                }
+              >
+                <div className="mt-2">
+                  <NestedObject data={ref} />
                 </div>
-              }
-            >
-              <div className="mt-2">
-                <NestedObject data={ref} excludeKeys={["id", "name", "entity_name", "file_path", "line_number"]} />
-              </div>
-            </ExpandableCard>
-          ))}
+              </ExpandableCard>
+            );
+          })}
         </div>
       ) : (
         <div className="text-center py-12">
