@@ -298,8 +298,28 @@ class GraphBuilder:
                                 found_target = True
                                 break
                     
-                    # If still not found, use the hash (will be used to create/link the file node)
-                    # The relationship will be created with this ID
+                    # If still not found, check if it's in pending nodes
+                    if not found_target:
+                        target_exists = any(n.get('id') == target_id for n in self.pending_nodes)
+                        if not target_exists:
+                            # Create a File node for the referenced file (even if it doesn't exist)
+                            # This allows IMPORTS relationships to work for external file references
+                            target_file_node = self._create_file_node(target_file_str, target_file.suffix.lstrip('.'))
+                            target_file_node['id'] = target_id  # Use the computed ID
+                            target_file_node['properties']['id'] = target_id
+                            # Make sure codebase_id is set
+                            target_file_node['properties']['codebase_id'] = self.codebase_id
+                            self.pending_nodes.append(target_file_node)
+                            # Add to node_ids with all key variants
+                            for key in target_file_key_variants:
+                                self.node_ids[key] = target_id
+                        else:
+                            # Find the existing pending node and add to node_ids
+                            for node in self.pending_nodes:
+                                if node.get('id') == target_id:
+                                    for key in target_file_key_variants:
+                                        self.node_ids[key] = target_id
+                                    break
                 except (ValueError, OSError):
                     # If path resolution fails, fall back to module node
                     target_id = hashlib.md5(f"module:{module_name}".encode()).hexdigest()
@@ -716,7 +736,8 @@ class GraphBuilder:
                     self.node_ids[module_key] = module_id
         
         # Batch insert nodes (processes in chunks of batch_size)
-        logger.info(f"Inserting {len(self.pending_nodes)} nodes in batches of {batch_size}...")
+        initial_node_count = len(self.pending_nodes)
+        logger.info(f"Inserting {initial_node_count} nodes in batches of {batch_size}...")
         self._batch_insert_nodes(batch_size)
         
         # IMPORTANT: After nodes are inserted, we need to rebuild node_ids mapping
@@ -789,6 +810,22 @@ class GraphBuilder:
             logger.info(f"Created {len(self.pending_relationships)} relationships: {calls_count} CALLS, {refs_count} REFERENCES, {imports_count} IMPORTS, {inherits_count} INHERITS, {has_param_count} HAS_PARAMETER, {returns_count} RETURNS, {contains_count} CONTAINS")
         else:
             logger.warning("No resolved references provided. Relationships will not be created.")
+        
+        # If any new nodes were added during relationship creation (e.g., CONTAINS target file nodes),
+        # insert them before inserting relationships
+        new_node_count = len(self.pending_nodes) - initial_node_count
+        if new_node_count > 0:
+            # Only insert the new nodes (slice from initial_node_count to end)
+            new_nodes = self.pending_nodes[initial_node_count:]
+            logger.info(f"Inserting {new_node_count} additional nodes (e.g., CONTAINS target files) in batches of {batch_size}...")
+            # Temporarily replace pending_nodes with just the new ones
+            old_pending_nodes = self.pending_nodes
+            self.pending_nodes = new_nodes
+            self._batch_insert_nodes(batch_size)
+            # Restore the full list
+            self.pending_nodes = old_pending_nodes
+            # Rebuild node_ids after inserting new nodes
+            self._rebuild_node_ids_after_insert()
         
         # Batch insert relationships (processes in chunks of batch_size)
         logger.info(f"Inserting {len(self.pending_relationships)} relationships in batches of {batch_size}...")
