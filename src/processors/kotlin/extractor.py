@@ -19,8 +19,24 @@ class KotlinEntityExtractor(BaseEntityExtractor):
             return entities
         
         def extract_kotlin_entities(node: tree_sitter.Node, parent=None):
-            if node.type == 'class_declaration':
-                name_node = node.child_by_field_name('name')
+            # Handle both class_declaration and ERROR nodes that contain classes
+            is_class_node = node.type == 'class_declaration'
+            is_error_with_class = node.type == 'ERROR' and any(child.type == 'class' for child in node.children)
+            
+            if is_class_node or is_error_with_class:
+                # For ERROR nodes, find the class identifier
+                name_node = None
+                if is_class_node:
+                    name_node = node.child_by_field_name('name')
+                else:
+                    # In ERROR node, look for identifier after 'class' token
+                    for i, child in enumerate(node.children):
+                        if child.type == 'class' and i + 1 < len(node.children):
+                            next_child = node.children[i + 1]
+                            if next_child.type == 'identifier':
+                                name_node = next_child
+                                break
+                
                 if name_node:
                     name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     entities.append(CodeEntity(

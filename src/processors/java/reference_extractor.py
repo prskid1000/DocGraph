@@ -86,7 +86,15 @@ class JavaReferenceExtractor(BaseReferenceExtractor):
             
             # Extract import statements
             if node.type == 'import_declaration':
+                # Java imports use scoped_identifier child, not 'source' field
                 source = node.child_by_field_name('source')
+                if not source:
+                    # Look for scoped_identifier in children
+                    for child in node.children:
+                        if child.type == 'scoped_identifier':
+                            source = child
+                            break
+                
                 if source:
                     package_name = source.text.decode('utf-8') if hasattr(source.text, 'decode') else str(source.text)
                     references.append(ScopedReference(

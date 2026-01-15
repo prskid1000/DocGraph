@@ -23,8 +23,10 @@ class HTMLGraphBuilder(BaseGraphBuilder):
         for entity in entities:
             node_id = self._generate_node_id(entity)
             node_ids[f"{entity.entity_type}:{entity.name}:{entity.file_path}"] = node_id
-        # Default node id for file
-        file_node_id = node_ids.get(f"file:{file_path}:{file_path}", "file_node")
+        # Default node id for file - use hash of file path
+        file_node_id = node_ids.get(f"file:{file_path}:{file_path}")
+        if not file_node_id:
+            file_node_id = hashlib.md5(file_path.encode()).hexdigest()
         for ref in references:
             rel_type = ref.reference_type.lower()
             if rel_type == "imports":

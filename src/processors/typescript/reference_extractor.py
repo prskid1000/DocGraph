@@ -41,12 +41,21 @@ class TypeScriptReferenceExtractor(BaseReferenceExtractor):
                         for child in node.children:
                             if child.type == 'class_heritage':
                                 # class_heritage contains the extends clause
-                                # Look for identifier or member_expression in it
+                                # Look for extends_clause or identifier/member_expression in it
                                 for heritage_child in child.children:
-                                    if heritage_child.type in ['identifier', 'member_expression']:
+                                    if heritage_child.type == 'extends_clause':
+                                        # extends_clause contains the base class
+                                        for extends_child in heritage_child.children:
+                                            if extends_child.type in ['type_identifier', 'identifier', 'member_expression']:
+                                                superclass = extends_child
+                                                break
+                                        if superclass:
+                                            break
+                                    elif heritage_child.type in ['identifier', 'member_expression', 'type_identifier']:
                                         superclass = heritage_child
                                         break
-                                break
+                                if superclass:
+                                    break
                     
                     if superclass:
                         superclass_name = superclass.text.decode('utf-8') if hasattr(superclass.text, 'decode') else str(superclass.text)

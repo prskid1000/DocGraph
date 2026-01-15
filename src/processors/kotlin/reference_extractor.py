@@ -27,22 +27,83 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
         
         def extract_kotlin_refs(node: tree_sitter.Node):
             # Track scope
-            if node.type == 'class_declaration':
-                name_node = node.child_by_field_name('name')
+            # Handle both class_declaration and ERROR nodes that contain classes
+            is_class_node = node.type == 'class_declaration'
+            is_error_with_class = node.type == 'ERROR' and any(child.type == 'class' for child in node.children)
+            
+            if is_class_node or is_error_with_class:
+                # For ERROR nodes, find the class identifier
+                name_node = None
+                if is_class_node:
+                    name_node = node.child_by_field_name('name')
+                else:
+                    # In ERROR node, look for identifier after 'class' token
+                    for i, child in enumerate(node.children):
+                        if child.type == 'class' and i + 1 < len(node.children):
+                            next_child = node.children[i + 1]
+                            if next_child.type == 'identifier':
+                                name_node = next_child
+                                break
+                
                 if name_node:
                     class_name = name_node.text.decode('utf-8') if hasattr(name_node.text, 'decode') else str(name_node.text)
                     current_scope.append(class_name)
                     
                     # Extract INHERITS relationships
                     # Kotlin uses colon syntax: class Derived : BaseClass
-                    superclass_node = node.child_by_field_name('superclass')
+                    superclass_node = None
+                    if is_class_node:
+                        superclass_node = node.child_by_field_name('superclass')
+                    
                     if not superclass_node:
                         # Try to find supertype in children (Kotlin uses different structure)
                         # Look for type_identifier after colon or in supertype_list
+                        # The inheritance colon comes AFTER the constructor parameters, not inside them
+                        # Pattern: "class Name(params) : BaseClass" or "class Name : BaseClass"
+                        # In ERROR nodes, the colon might be inside an ERROR child node
                         for i, child in enumerate(node.children):
-                            if child.type == ':' or child.type == 'supertype_clause':
+                            # Look for ERROR node that contains both ')' and ':' (inheritance pattern)
+                            if child.type == 'ERROR':
+                                error_text = child.text.decode('utf-8') if hasattr(child.text, 'decode') else str(child.text)
+                                # Check if this ERROR contains the inheritance pattern: ") :"
+                                if ')' in error_text and ':' in error_text:
+                                    # The next identifier after this ERROR should be the base class
+                                    for j, next_child in enumerate(node.children[i+1:], start=i+1):
+                                        if next_child.type in ['type_identifier', 'user_type', 'type_reference', 'identifier']:
+                                            # Make sure it's not part of formal_parameters
+                                            if next_child.type == 'identifier':
+                                                # Check if it's followed by '(' (would be constructor call, not base class)
+                                                if j+1 < len(node.children) and node.children[j+1].type != '(':
+                                                    superclass_node = next_child
+                                                    break
+                                                elif j+1 >= len(node.children) or node.children[j+1].type != '(':
+                                                    superclass_node = next_child
+                                                    break
+                                            else:
+                                                superclass_node = next_child
+                                                break
+                                    if superclass_node:
+                                        break
+                            elif child.type == ':':
+                                # Direct colon - check if it's for inheritance (after ')')
+                                # Look backwards for ')'
+                                found_closing_paren = False
+                                for k in range(i-1, max(-1, i-10), -1):
+                                    if node.children[k].type == ')':
+                                        found_closing_paren = True
+                                        break
+                                
+                                if found_closing_paren or i == 1:  # Colon right after class name (no constructor)
+                                    # Next identifier should be the base class
+                                    for j, next_child in enumerate(node.children[i+1:], start=i+1):
+                                        if next_child.type in ['type_identifier', 'user_type', 'type_reference', 'identifier']:
+                                            superclass_node = next_child
+                                            break
+                                    if superclass_node:
+                                        break
+                            elif child.type == 'supertype_clause':
                                 # Next type_identifier or user_type should be the superclass
-                                for next_child in node.children[i+1:]:
+                                for next_child in child.children:
                                     if next_child.type in ['type_identifier', 'user_type', 'type_reference']:
                                         superclass_node = next_child
                                         break
@@ -59,13 +120,13 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                     
                     if superclass_node:
                         # Extract the type identifier from superclass node
-                        if superclass_node.type in ['type_identifier', 'user_type', 'type_reference']:
+                        if superclass_node.type in ['type_identifier', 'user_type', 'type_reference', 'identifier']:
                             superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
                         else:
                             # If it's a container node, find the type_identifier inside it
                             type_id = None
                             for child in superclass_node.children:
-                                if child.type in ['type_identifier', 'user_type', 'type_reference']:
+                                if child.type in ['type_identifier', 'user_type', 'type_reference', 'identifier']:
                                     type_id = child
                                     break
                             if type_id:
@@ -74,6 +135,9 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                                 superclass_name = superclass_node.text.decode('utf-8') if hasattr(superclass_node.text, 'decode') else str(superclass_node.text)
                         
                         superclass_name = superclass_name.replace('extends', '').replace(':', '').strip()
+                        # Remove parentheses if present (e.g., "BaseClass(name)" -> "BaseClass")
+                        if '(' in superclass_name:
+                            superclass_name = superclass_name.split('(')[0].strip()
                         base_name = superclass_name.split('.')[-1].strip()
                         if base_name:
                             references.append(ScopedReference(
@@ -94,7 +158,15 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
             
             # Extract import statements
             if node.type == 'import_declaration':
+                # Kotlin imports may use scoped_identifier or identifier child, not 'source' field
                 source = node.child_by_field_name('source')
+                if not source:
+                    # Look for scoped_identifier or identifier in children
+                    for child in node.children:
+                        if child.type in ['scoped_identifier', 'identifier', 'type_identifier']:
+                            source = child
+                            break
+                
                 if source:
                     package_name = source.text.decode('utf-8') if hasattr(source.text, 'decode') else str(source.text)
                     references.append(ScopedReference(
@@ -160,9 +232,15 @@ class KotlinReferenceExtractor(BaseReferenceExtractor):
                 extract_kotlin_refs(child)
             
             # Pop scope
-            if node.type == 'class_declaration':
-                if current_scope:
-                    current_scope.pop()
+            if node.type in ['class_declaration', 'ERROR']:
+                # Check if this ERROR node contained a class
+                if node.type == 'ERROR':
+                    if any(child.type == 'class' for child in node.children):
+                        if current_scope:
+                            current_scope.pop()
+                else:
+                    if current_scope:
+                        current_scope.pop()
             elif node.type == 'method_declaration':
                 if current_scope:
                     current_scope.pop()
