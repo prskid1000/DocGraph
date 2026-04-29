@@ -1,15 +1,15 @@
-"""Parallel indexer pipeline.
+"""Parallel indexer pipeline with per-file delta updates.
 
-Walker → ProcessPool[parse] → Embed batcher → Bulk writer (Kuzu UNWIND)
+Cache (.docgraph/cache.json) stores per-file `{hash, entities, edges}` so
+incremental runs can:
+  1. DETACH DELETE only changed files' nodes (incident edges removed too).
+  2. Re-parse only changed files.
+  3. Re-resolve edges that crossed the changed/unchanged boundary
+     (unchanged-file edges into unchanged-file targets are still in the DB
+     and don't need to be touched).
 
-Two-pass edge resolution: first all entities are written and a global
-symbol table (qname → id, name → [ids]) is built; then edges are matched
-against the table and bulk-inserted.
-
-Tier 4 differentiator edges:
-  SIMILAR_TO        — vector top-K
-  CO_CHANGED_WITH   — git log --name-only over last N commits
-  TESTS             — heuristic name match for test functions
+Tier 4 differentiator edges (SIMILAR_TO, CO_CHANGED_WITH, TESTS) are
+always recomputed because they're cheap and global.
 """
 from __future__ import annotations
 
@@ -20,10 +20,10 @@ import os
 import subprocess
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable
 
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
@@ -33,7 +33,7 @@ from rich.progress import (
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder
-from docgraph.parse import detect_language, parse_file, FileParse
+from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
 
 log = logging.getLogger(__name__)
@@ -45,11 +45,9 @@ ProgressCb = Callable[[str, int, int], None] | None
 
 
 def walk_files(cfg: Config) -> list[Path]:
-    """Yield all parseable files under repo_root, respecting ignores."""
     out: list[Path] = []
     root = cfg.repo_root
     for dirpath, dirnames, filenames in os.walk(root):
-        # Prune ignored dirs in-place
         rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
         dirnames[:] = [
             d for d in dirnames
@@ -71,11 +69,10 @@ def walk_files(cfg: Config) -> list[Path]:
     return out
 
 
-# --- Parse worker (runs in subprocess) ------------------------------------
+# --- Parse worker ---------------------------------------------------------
 
 
 def _parse_worker(args: tuple[str, str]) -> dict | None:
-    """Top-level so it's picklable. Returns serialized FileParse dict."""
     file_path, repo_root = args
     try:
         fp = parse_file(Path(file_path), Path(repo_root))
@@ -92,9 +89,6 @@ def _parse_worker(args: tuple[str, str]) -> dict | None:
         return {"_error": f"{file_path}: {e}"}
 
 
-# --- Cache ----------------------------------------------------------------
-
-
 def _file_hash(path: Path) -> str:
     h = hashlib.sha1()
     try:
@@ -104,7 +98,10 @@ def _file_hash(path: Path) -> str:
     return h.hexdigest()
 
 
-def load_cache(cfg: Config) -> dict[str, str]:
+# --- Cache ----------------------------------------------------------------
+
+
+def load_cache(cfg: Config) -> dict[str, dict]:
     if not cfg.cache_path.exists():
         return {}
     try:
@@ -113,11 +110,11 @@ def load_cache(cfg: Config) -> dict[str, str]:
         return {}
 
 
-def save_cache(cfg: Config, cache: dict[str, str]) -> None:
+def save_cache(cfg: Config, cache: dict[str, dict]) -> None:
     cfg.cache_path.write_text(json.dumps(cache))
 
 
-# --- Main pipeline --------------------------------------------------------
+# --- Indexer --------------------------------------------------------------
 
 
 class Indexer:
@@ -127,117 +124,171 @@ class Indexer:
         self.embedder = embedder or Embedder(cfg.embedding_model)
         self._next_id = 1
 
+    # ---- ID allocation ----
+    def _seed_ids_from_db(self) -> None:
+        """Continue allocating after the max id currently in the DB."""
+        max_id = 0
+        for label in ("File", "Module", "Class", "Function", "Variable"):
+            try:
+                rows = self.db.fetch_all(f"MATCH (n:{label}) RETURN max(n.id) AS m")
+                m = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
+                if m > max_id:
+                    max_id = m
+            except Exception:
+                pass
+        self._next_id = max_id + 1
+
     def _new_id(self) -> int:
         i = self._next_id
         self._next_id += 1
         return i
 
+    # ---- DB delete ----
+    def _delete_files_from_db(self, files: list[str]) -> None:
+        """DETACH DELETE all entities + the File node for each path."""
+        if not files:
+            return
+        # Delete entities first (matches all by .file property)
+        for label in ("Function", "Class", "Variable"):
+            self.db.execute(
+                f"MATCH (n:{label}) WHERE n.file IN $files DETACH DELETE n",
+                {"files": files},
+            )
+        # Then delete File nodes
+        self.db.execute(
+            "MATCH (n:File) WHERE n.path IN $files DETACH DELETE n",
+            {"files": files},
+        )
+        # Tier 4: delete CO_CHANGED edges involving these (will be recomputed)
+        # SIMILAR_TO already gone via DETACH DELETE on Function/Class
+        # Module nodes left alone (cheap, may be reused; orphans tolerated)
+
+    # ---- Main entrypoint ----
     def index_all(self, incremental: bool = True, progress_cb: ProgressCb = None) -> dict:
         t0 = time.perf_counter()
-        files = walk_files(self.cfg)
         cache = load_cache(self.cfg) if incremental else {}
+        files_on_disk = walk_files(self.cfg)
+        on_disk_rel = {
+            str(f.relative_to(self.cfg.repo_root)).replace("\\", "/"): f
+            for f in files_on_disk
+        }
 
-        # Filter to changed files
-        changed: list[Path] = []
-        new_cache: dict[str, str] = {}
-        for f in files:
-            rel = str(f.relative_to(self.cfg.repo_root)).replace("\\", "/")
-            h = _file_hash(f)
-            new_cache[rel] = h
-            if cache.get(rel) != h:
-                changed.append(f)
+        # Compute hashes; identify changed/added/deleted
+        changed: list[Path] = []  # changed or added
+        unchanged_rels: set[str] = set()
+        new_hashes: dict[str, str] = {}
+        for rel, path in on_disk_rel.items():
+            h = _file_hash(path)
+            new_hashes[rel] = h
+            cached = cache.get(rel)
+            if cached and cached.get("hash") == h:
+                unchanged_rels.add(rel)
+            else:
+                changed.append(path)
 
-        log.info(f"{len(files)} files total, {len(changed)} to (re)parse")
+        deleted_rels = [rel for rel in cache.keys() if rel not in on_disk_rel]
+        log.info(
+            f"{len(on_disk_rel)} files: {len(changed)} changed/added, "
+            f"{len(deleted_rels)} deleted, {len(unchanged_rels)} unchanged"
+        )
 
-        if not changed and incremental:
-            return {"files": len(files), "changed": 0, "elapsed": 0.0}
+        # No changes: bail
+        if incremental and not changed and not deleted_rels:
+            return {
+                "files": len(on_disk_rel), "changed": 0, "deleted": 0,
+                "entities": sum(len(c.get("entities", [])) for c in cache.values()),
+                "elapsed": time.perf_counter() - t0, "errors": 0,
+            }
 
-        # MVP: any change → full rebuild. Real per-file delta updates need
-        # CASCADE deletes which Kuzu doesn't ergonomically support yet.
-        # Trade-off: simpler + always correct vs. slower on small edits.
-        self.db.wipe(self.cfg.db_path)
-        self.db = GraphDB(self.cfg.db_path, self.embedder.dim)
-        self.db.init_schema()
-        # Re-parse all files now (we'd lost the prior parse), so set changed = files
-        changed = files
+        # Full reindex path
+        if not incremental:
+            self.db.wipe(self.cfg.db_path)
+            self.db = GraphDB(self.cfg.db_path, self.embedder.dim)
+            self.db.init_schema()
+            self._next_id = 1
+            cache = {}
+            unchanged_rels = set()
+            deleted_rels = []
+            changed = list(files_on_disk)
 
-        # 1. Parse in parallel
-        parsed: list[FileParse] = []
+        # ---- Step 1: delete affected nodes from DB ----
+        affected = [str(p.relative_to(self.cfg.repo_root)).replace("\\", "/")
+                    for p in changed]
+        self._delete_files_from_db(affected + deleted_rels)
+        for rel in deleted_rels:
+            cache.pop(rel, None)
+
+        # ---- Step 2: parse changed files in parallel ----
+        parsed: dict[str, FileParse] = {}
         errors: list[str] = []
+        if changed:
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                BarColumn(),
+                MofNCompleteColumn(),
+                TimeElapsedColumn(),
+            ) as prog:
+                ptask = prog.add_task("Parsing", total=len(changed))
+                args_iter = [(str(f), str(self.cfg.repo_root)) for f in changed]
+                with ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
+                    for result in ex.map(_parse_worker, args_iter, chunksize=8):
+                        prog.advance(ptask)
+                        if result is None:
+                            continue
+                        if "_error" in result:
+                            errors.append(result["_error"])
+                            continue
+                        fp = FileParse(
+                            file=result["file"],
+                            language=result["language"],
+                            lines=result["lines"],
+                            entities=[Entity(**e) for e in result["entities"]],
+                            edges=[RawEdge(**e) for e in result["edges"]],
+                        )
+                        parsed[fp.file] = fp
+                        # Update cache
+                        cache[fp.file] = {
+                            "hash": new_hashes[fp.file],
+                            "language": fp.language,
+                            "lines": fp.lines,
+                            "entities": result["entities"],
+                            "edges": result["edges"],
+                        }
 
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            MofNCompleteColumn(),
-            TimeElapsedColumn(),
-        ) as prog:
-            ptask = prog.add_task("Parsing", total=len(changed))
-            args_iter = [(str(f), str(self.cfg.repo_root)) for f in changed]
-            with ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
-                for result in ex.map(_parse_worker, args_iter, chunksize=8):
-                    prog.advance(ptask)
-                    if result is None:
-                        continue
-                    if "_error" in result:
-                        errors.append(result["_error"])
-                        continue
-                    fp = FileParse(
-                        file=result["file"],
-                        language=result["language"],
-                        lines=result["lines"],
-                        entities=[_entity_from_dict(e) for e in result["entities"]],
-                        edges=[_edge_from_dict(e) for e in result["edges"]],
-                    )
-                    parsed.append(fp)
-                    if progress_cb:
-                        progress_cb("parse", len(parsed), len(changed))
+        # ---- Step 3: seed ID allocator ----
+        self._seed_ids_from_db()
 
-        # 2. Build node rows + symbol table
-        log.info(f"Parsed {len(parsed)} files, {sum(len(p.entities) for p in parsed)} entities")
+        # ---- Step 4: build node rows for newly-parsed files ----
         file_rows: list[dict] = []
         class_rows: list[dict] = []
         function_rows: list[dict] = []
         variable_rows: list[dict] = []
-        module_rows: dict[str, dict] = {}  # name → row
+        # qname → (label, id) for ALL entities (across cache, for edge resolution)
+        # plus tracking which are new for embedding
+        new_embed_targets: list[tuple[str, int, str]] = []  # (label, id, text) for embedding
 
-        # qname → (label, id)
-        qname_index: dict[str, tuple[str, int]] = {}
-        # name → list[(label, id, file)]  for fuzzy resolution
-        name_index: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
-        # file path → File node id
-        file_index: dict[str, int] = {}
-        # qname → (file, line_start) for embedding text retrieval
-        embed_targets: list[tuple[str, int, str]] = []  # (label, id, text)
-
-        for fp in parsed:
+        for rel, fp in parsed.items():
             fid = self._new_id()
-            file_index[fp.file] = fid
             file_rows.append({
                 "id": fid,
-                "path": fp.file,
+                "path": rel,
                 "language": fp.language,
                 "lines": fp.lines,
-                "hash": new_cache.get(fp.file, ""),
+                "hash": new_hashes[rel],
                 "pagerank": 0.0,
             })
             for ent in fp.entities:
                 eid = self._new_id()
-                qname_index[ent.qname] = (
-                    "Class" if ent.kind in ("class", "interface") else
-                    "Function" if ent.kind in ("function", "method") else
-                    "Variable",
-                    eid,
-                )
-                name_index[ent.name].append(
-                    (qname_index[ent.qname][0], eid, ent.file)
-                )
+                # Stash id back into cache entity for lookups later
+                # (we'll rebuild the cache entity with ids below)
+                ent.extra["_id"] = eid
                 if ent.kind in ("class", "interface"):
                     class_rows.append({
                         "id": eid,
                         "name": ent.name,
                         "qname": ent.qname,
-                        "file": ent.file,
+                        "file": rel,
                         "line_start": ent.line_start,
                         "line_end": ent.line_end,
                         "body": ent.body,
@@ -245,18 +296,18 @@ class Indexer:
                         "embedding": [0.0] * self.embedder.dim,
                         "pagerank": 0.0,
                     })
-                    embed_targets.append(("Class", eid, f"{ent.name}\n{ent.body[:1500]}"))
+                    new_embed_targets.append(("Class", eid, f"{ent.name}\n{ent.body[:1500]}"))
                 elif ent.kind in ("function", "method"):
                     is_test = (
                         ent.name.startswith("test_") or
-                        ent.name.startswith("test") and ent.name[4:5].isupper() or
-                        "/test" in ent.file or "/tests/" in ent.file or "_test." in ent.file
+                        (ent.name.startswith("test") and len(ent.name) > 4 and ent.name[4:5].isupper()) or
+                        "/test" in rel or "/tests/" in rel or "_test." in rel
                     )
                     function_rows.append({
                         "id": eid,
                         "name": ent.name,
                         "qname": ent.qname,
-                        "file": ent.file,
+                        "file": rel,
                         "line_start": ent.line_start,
                         "line_end": ent.line_end,
                         "body": ent.body,
@@ -266,19 +317,19 @@ class Indexer:
                         "embedding": [0.0] * self.embedder.dim,
                         "pagerank": 0.0,
                     })
-                    embed_targets.append(("Function", eid, f"{ent.name}\n{ent.body[:1500]}"))
+                    new_embed_targets.append(("Function", eid, f"{ent.name}\n{ent.body[:1500]}"))
                 else:
                     variable_rows.append({
                         "id": eid,
                         "name": ent.name,
                         "qname": ent.qname,
-                        "file": ent.file,
+                        "file": rel,
                         "line": ent.line_start,
-                        "scope": ent.extra.get("scope", "module"),
+                        "scope": ent.extra.get("scope", "module") if isinstance(ent.extra, dict) else "module",
                     })
 
-        # 3. Embed all targets in batches
-        if embed_targets:
+        # ---- Step 5: embed new entities ----
+        if new_embed_targets:
             with Progress(
                 SpinnerColumn(),
                 TextColumn("Embedding"),
@@ -286,65 +337,72 @@ class Indexer:
                 MofNCompleteColumn(),
                 TimeElapsedColumn(),
             ) as prog:
-                etask = prog.add_task("Embedding", total=len(embed_targets))
+                etask = prog.add_task("Embedding", total=len(new_embed_targets))
                 vectors = self.embedder.embed(
-                    [t[2] for t in embed_targets],
+                    [t[2] for t in new_embed_targets],
                     batch_size=self.cfg.embed_batch_size,
                 )
-                prog.advance(etask, len(embed_targets))
-            # Splice vectors back into rows
+                prog.advance(etask, len(new_embed_targets))
             vec_by_id: dict[tuple[str, int], list[float]] = {}
-            for (label, eid, _), vec in zip(embed_targets, vectors):
+            for (label, eid, _), vec in zip(new_embed_targets, vectors):
                 vec_by_id[(label, eid)] = vec
-            for row in class_rows:
-                row["embedding"] = vec_by_id.get(("Class", row["id"]), [0.0] * self.embedder.dim)
-            for row in function_rows:
-                row["embedding"] = vec_by_id.get(("Function", row["id"]), [0.0] * self.embedder.dim)
+            for r in class_rows:
+                r["embedding"] = vec_by_id.get(("Class", r["id"]), [0.0] * self.embedder.dim)
+            for r in function_rows:
+                r["embedding"] = vec_by_id.get(("Function", r["id"]), [0.0] * self.embedder.dim)
 
-        # 4. Bulk write nodes
-        log.info("Writing nodes to Kuzu...")
+        # ---- Step 6: write new nodes ----
+        log.info(
+            f"Writing {len(file_rows)} files, {len(class_rows)} classes, "
+            f"{len(function_rows)} functions, {len(variable_rows)} variables"
+        )
         self.db.insert_nodes("File", file_rows)
         self.db.insert_nodes("Class", class_rows)
         self.db.insert_nodes("Function", function_rows)
         self.db.insert_nodes("Variable", variable_rows)
 
-        # 5. Resolve and write edges
-        log.info("Resolving edges...")
-        contains_edges: list[tuple[str, str, dict]] = []
-        # File CONTAINS class/function/variable
-        for fp in parsed:
-            fid = file_index[fp.file]
-            for ent in fp.entities:
-                if ent.qname not in qname_index:
-                    continue
-                label, eid = qname_index[ent.qname]
-                # Only top-level (non-method) belong directly to file
-                if "::" not in ent.qname.replace(fp.file + "::", "", 1):
-                    contains_edges.append(("File", label, {"from_id": fid, "to_id": eid}))
+        # ---- Step 7: build full symbol table from DB ----
+        # qname → (label, id); name → list[(label, id, file)]
+        qname_index: dict[str, tuple[str, int]] = {}
+        name_index: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
+        file_index: dict[str, int] = {}
+        for label in ("Function", "Class", "Variable"):
+            for r in self.db.fetch_all(
+                f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, "
+                f"n.qname AS qname, n.file AS file"
+            ):
+                qname_index[r["qname"]] = (label, r["id"])
+                name_index[r["name"]].append((label, r["id"], r["file"]))
+        for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path"):
+            file_index[r["path"]] = r["id"]
 
-        # Class CONTAINS method/var (parent qname is in qname_index)
-        for fp in parsed:
-            for ent in fp.entities:
-                if ent.qname not in qname_index:
-                    continue
-                parts = ent.qname.split("::")
-                if len(parts) >= 3:
-                    parent_q = "::".join(parts[:-1])
-                    if parent_q in qname_index:
-                        plabel, pid = qname_index[parent_q]
-                        elabel, eid = qname_index[ent.qname]
-                        if plabel == "Class":
-                            contains_edges.append(("Class", elabel, {"from_id": pid, "to_id": eid}))
+        changed_set = set(parsed.keys())  # for "edge needs reinsertion?" check
 
-        # Group by (from_label, to_label)
-        from collections import defaultdict as _dd
-        contains_groups: dict[tuple[str, str], list[dict]] = _dd(list)
-        for from_lbl, to_lbl, row in contains_edges:
-            contains_groups[(from_lbl, to_lbl)].append(row)
-        for (fl, tl), rows in contains_groups.items():
-            self.db.insert_edges("CONTAINS", fl, tl, rows)
+        def needs_insert(src_file: str, target_file: str | None) -> bool:
+            """True if either endpoint was just (re)created."""
+            if src_file in changed_set:
+                return True
+            if target_file and target_file in changed_set:
+                return True
+            return False
 
-        # CALLS, INSTANTIATES, REFERENCES_
+        def resolve(name: str, src_file: str, prefer_kind: str | None = None) -> tuple[str, int, str] | None:
+            """Resolve a name. Prefer same-file definitions; then any. Returns (label, id, file)."""
+            cands = name_index.get(name, [])
+            if not cands:
+                return None
+            same_file = [c for c in cands if c[2] == src_file]
+            pool = same_file or cands
+            if prefer_kind:
+                pref = [c for c in pool if c[0] == prefer_kind]
+                if pref:
+                    pool = pref
+            return pool[0]
+
+        # ---- Step 8: re-resolve and write edges ----
+        # Combine RawEdges from cache (covers both unchanged and just-parsed files).
+        # For each edge, decide if it needs DB insertion.
+        contains_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         calls_rows: list[dict] = []
         inst_rows: list[dict] = []
         inherits_rows: list[dict] = []
@@ -352,96 +410,124 @@ class Indexer:
         decorated_class_rows: list[dict] = []
         imports_file_rows: list[dict] = []
         imports_module_rows: list[dict] = []
+        module_rows_by_name: dict[str, dict] = {}
 
-        # Build set of qnames per file for scoped lookup
-        qnames_by_file: dict[str, list[str]] = defaultdict(list)
-        for q in qname_index:
-            try:
-                f = q.split("::")[0]
-                qnames_by_file[f].append(q)
-            except IndexError:
+        # Pre-load existing modules so we don't duplicate
+        for r in self.db.fetch_all("MATCH (m:Module) RETURN m.id AS id, m.name AS name"):
+            module_rows_by_name[r["name"]] = {"id": r["id"], "name": r["name"], "language": ""}
+
+        # CONTAINS edges from cached entities (only for changed files; unchanged are still in DB)
+        for rel, file_data in cache.items():
+            if rel not in changed_set:
                 continue
+            fid = file_index.get(rel)
+            if fid is None:
+                continue
+            # qnames in this file
+            for ent_dict in file_data["entities"]:
+                qname = ent_dict["qname"]
+                if qname not in qname_index:
+                    continue
+                label, eid = qname_index[qname]
+                # Only top-level entities are contained directly in File
+                # Class methods are CONTAINS'd by Class (handled below)
+                parts = qname.split("::")
+                if len(parts) == 2:
+                    contains_groups[("File", label)].append({"from_id": fid, "to_id": eid})
+                elif len(parts) >= 3:
+                    parent_q = "::".join(parts[:-1])
+                    if parent_q in qname_index:
+                        plabel, pid = qname_index[parent_q]
+                        if plabel == "Class":
+                            contains_groups[("Class", label)].append({"from_id": pid, "to_id": eid})
 
-        def resolve(name: str, src_file: str, prefer_kind: str | None = None) -> tuple[str, int] | None:
-            """Resolve a target name. Prefer same-file definitions; then any."""
-            cands = name_index.get(name, [])
-            if not cands:
-                return None
-            # Same file first
-            same_file = [c for c in cands if c[2] == src_file]
-            pool = same_file or cands
-            if prefer_kind:
-                pref = [c for c in pool if c[0] == prefer_kind]
-                if pref:
-                    pool = pref
-            label, eid, _ = pool[0]
-            return (label, eid)
+        # Other edges from cached RawEdges
+        for rel, file_data in cache.items():
+            for raw in file_data.get("edges", []):
+                kind = raw["kind"]
+                src_qname = raw.get("src_qname")
+                target_name = raw.get("target_name")
+                src_file = rel
+                line = raw.get("line", 0)
 
-        for fp in parsed:
-            for edge in fp.edges:
-                if edge.kind == "CALLS":
-                    if edge.src_qname is None or edge.src_qname not in qname_index:
+                if kind == "IMPORTS":
+                    if not needs_insert(src_file, None):
+                        # Try to find the resolved file target to also check
+                        pass
+                    src_fid = file_index.get(src_file)
+                    if src_fid is None:
                         continue
-                    src_label, src_id = qname_index[edge.src_qname]
-                    if src_label != "Function":
-                        continue
-                    target = resolve(edge.target_name, fp.file, prefer_kind="Function")
-                    if target and target[0] == "Function":
-                        calls_rows.append({"from_id": src_id, "to_id": target[1], "line": edge.line})
-                elif edge.kind == "INSTANTIATES":
-                    if edge.src_qname is None or edge.src_qname not in qname_index:
-                        continue
-                    src_label, src_id = qname_index[edge.src_qname]
-                    if src_label != "Function":
-                        continue
-                    target = resolve(edge.target_name, fp.file, prefer_kind="Class")
-                    if target and target[0] == "Class":
-                        inst_rows.append({"from_id": src_id, "to_id": target[1], "line": edge.line})
-                elif edge.kind == "INHERITS":
-                    if edge.src_qname is None or edge.src_qname not in qname_index:
-                        continue
-                    src_label, src_id = qname_index[edge.src_qname]
-                    if src_label != "Class":
-                        continue
-                    target = resolve(edge.target_name, fp.file, prefer_kind="Class")
-                    if target and target[0] == "Class":
-                        inherits_rows.append({"from_id": src_id, "to_id": target[1]})
-                elif edge.kind == "DECORATED_BY":
-                    if edge.src_qname is None or edge.src_qname not in qname_index:
-                        continue
-                    src_label, src_id = qname_index[edge.src_qname]
-                    target = resolve(edge.target_name, fp.file, prefer_kind="Function")
-                    if target and target[0] == "Function":
-                        if src_label == "Function":
-                            decorated_func_rows.append({"from_id": src_id, "to_id": target[1]})
-                        elif src_label == "Class":
-                            decorated_class_rows.append({"from_id": src_id, "to_id": target[1]})
-                elif edge.kind == "IMPORTS":
-                    src_fid = file_index[fp.file]
-                    # Try matching another File by path prefix
-                    target_path = edge.target_name.replace(".", "/")
+                    target_path = (target_name or "").replace(".", "/")
                     matched_fid = None
-                    for path, fid in file_index.items():
+                    matched_path = None
+                    for path, fid_ in file_index.items():
                         if path.startswith(target_path) or target_path in path:
-                            matched_fid = fid
+                            matched_fid = fid_
+                            matched_path = path
                             break
                     if matched_fid:
-                        imports_file_rows.append({"from_id": src_fid, "to_id": matched_fid})
+                        if needs_insert(src_file, matched_path):
+                            imports_file_rows.append({"from_id": src_fid, "to_id": matched_fid})
                     else:
-                        # Module node
-                        if edge.target_name not in module_rows:
+                        if not needs_insert(src_file, None):
+                            continue
+                        if target_name not in module_rows_by_name:
                             mid = self._new_id()
-                            module_rows[edge.target_name] = {
-                                "id": mid,
-                                "name": edge.target_name,
-                                "language": fp.language,
+                            module_rows_by_name[target_name] = {
+                                "id": mid, "name": target_name,
+                                "language": file_data.get("language", ""),
                             }
-                        mid = module_rows[edge.target_name]["id"]
+                        mid = module_rows_by_name[target_name]["id"]
                         imports_module_rows.append({"from_id": src_fid, "to_id": mid})
+                    continue
 
-        if module_rows:
-            self.db.insert_nodes("Module", list(module_rows.values()))
+                if not src_qname or src_qname not in qname_index:
+                    continue
+                src_label, src_id = qname_index[src_qname]
 
+                if kind == "CALLS":
+                    if src_label != "Function":
+                        continue
+                    target = resolve(target_name, src_file, prefer_kind="Function")
+                    if target and target[0] == "Function":
+                        if needs_insert(src_file, target[2]):
+                            calls_rows.append({"from_id": src_id, "to_id": target[1], "line": line})
+                elif kind == "INSTANTIATES":
+                    if src_label != "Function":
+                        continue
+                    target = resolve(target_name, src_file, prefer_kind="Class")
+                    if target and target[0] == "Class":
+                        if needs_insert(src_file, target[2]):
+                            inst_rows.append({"from_id": src_id, "to_id": target[1], "line": line})
+                elif kind == "INHERITS":
+                    if src_label != "Class":
+                        continue
+                    target = resolve(target_name, src_file, prefer_kind="Class")
+                    if target and target[0] == "Class":
+                        if needs_insert(src_file, target[2]):
+                            inherits_rows.append({"from_id": src_id, "to_id": target[1]})
+                elif kind == "DECORATED_BY":
+                    target = resolve(target_name, src_file, prefer_kind="Function")
+                    if target and target[0] == "Function":
+                        if needs_insert(src_file, target[2]):
+                            if src_label == "Function":
+                                decorated_func_rows.append({"from_id": src_id, "to_id": target[1]})
+                            elif src_label == "Class":
+                                decorated_class_rows.append({"from_id": src_id, "to_id": target[1]})
+
+        # Insert new modules
+        new_modules = [
+            v for k, v in module_rows_by_name.items()
+            if not self.db.fetch_all(
+                "MATCH (m:Module) WHERE m.id = $id RETURN m.id", {"id": v["id"]}
+            )
+        ]
+        if new_modules:
+            self.db.insert_nodes("Module", new_modules)
+
+        # Insert collected edges
+        for (fl, tl), rows in contains_groups.items():
+            self.db.insert_edges("CONTAINS", fl, tl, rows)
         self.db.insert_edges("CALLS", "Function", "Function", calls_rows)
         self.db.insert_edges("INSTANTIATES", "Function", "Class", inst_rows)
         self.db.insert_edges("INHERITS", "Class", "Class", inherits_rows)
@@ -450,57 +536,94 @@ class Indexer:
         self.db.insert_edges("IMPORTS", "File", "File", imports_file_rows)
         self.db.insert_edges("IMPORTS", "File", "Module", imports_module_rows)
 
-        # 6. Tier 4 — SIMILAR_TO
-        log.info("Computing SIMILAR_TO edges...")
-        self._write_similar_edges(function_rows, "Function")
-        self._write_similar_edges(class_rows, "Class")
+        # ---- Step 9: Tier 4 + PageRank (always recomputed; cheap and global) ----
+        # Wipe and rebuild SIMILAR_TO and CO_CHANGED_WITH; PageRank too.
+        try:
+            self.db.execute("MATCH ()-[r:SIMILAR_TO]->() DELETE r")
+            self.db.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
+            self.db.execute("MATCH ()-[r:TESTS]->() DELETE r")
+        except Exception:
+            pass
 
-        # 7. Tier 4 — CO_CHANGED_WITH
+        # Re-pull current Function/Class rows for similarity
+        log.info("Computing SIMILAR_TO edges...")
+        sim_rows = self.db.fetch_all(
+            "MATCH (n:Function) RETURN n.id AS id, n.embedding AS embedding"
+        )
+        self._write_similar_edges(sim_rows, "Function")
+        sim_rows = self.db.fetch_all(
+            "MATCH (n:Class) RETURN n.id AS id, n.embedding AS embedding"
+        )
+        self._write_similar_edges(sim_rows, "Class")
+
         log.info("Computing CO_CHANGED_WITH from git history...")
+        # Refresh file_index post-insert
+        file_index = {
+            r["path"]: r["id"]
+            for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
+        }
         self._write_co_changed(file_index)
 
-        # 8. Tier 4 — TESTS
         log.info("Linking TESTS edges...")
-        self._write_tests_edges(function_rows, name_index, qname_index)
+        function_rows_db = self.db.fetch_all(
+            "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
+        )
+        # Build quick name index from DB
+        name_index2: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for r in self.db.fetch_all("MATCH (n:Function) RETURN n.id AS id, n.name AS name"):
+            name_index2[r["name"]].append(("Function", r["id"]))
+        for r in self.db.fetch_all("MATCH (n:Class) RETURN n.id AS id, n.name AS name"):
+            name_index2[r["name"]].append(("Class", r["id"]))
+        self._write_tests_edges(function_rows_db, name_index2)
 
-        # 9. PageRank
         log.info("Running PageRank...")
         scores = compute_pagerank(self.db)
         write_pagerank(self.db, scores)
 
-        # 10. Save cache
-        save_cache(self.cfg, new_cache)
+        # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----
+        # Cache entities should not carry _id (transient); strip.
+        for rel in cache:
+            for ent in cache[rel].get("entities", []):
+                if "extra" in ent and isinstance(ent["extra"], dict):
+                    ent["extra"].pop("_id", None)
+        save_cache(self.cfg, cache)
 
         elapsed = time.perf_counter() - t0
         return {
-            "files": len(files),
-            "changed": len(changed),
-            "entities": sum(len(p.entities) for p in parsed),
+            "files": len(on_disk_rel),
+            "changed": len(parsed),
+            "deleted": len(deleted_rels),
+            "entities": sum(len(c.get("entities", [])) for c in cache.values()),
             "elapsed": elapsed,
             "errors": len(errors),
         }
 
+    # ---- Tier 4 helpers ----
     def _write_similar_edges(self, rows: list[dict], label: str) -> None:
         if len(rows) < 2:
             return
         import numpy as np
         ids = [r["id"] for r in rows]
-        mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
-        # Normalize
+        try:
+            mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
+        except Exception:
+            return
         norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
         mat = mat / norms
-        # Cosine similarity matrix (chunked for memory if huge)
         sim_edges: list[dict] = []
         k = self.cfg.similar_top_k
         n = len(ids)
         chunk = 512
         for start in range(0, n, chunk):
             end = min(start + chunk, n)
-            sims = mat[start:end] @ mat.T  # (chunk, n)
+            sims = mat[start:end] @ mat.T
             for i in range(end - start):
                 row = sims[i]
-                row[start + i] = -1  # exclude self
-                top = np.argpartition(-row, k)[:k]
+                row[start + i] = -1
+                top_k = min(k, n - 1)
+                if top_k <= 0:
+                    continue
+                top = np.argpartition(-row, top_k)[:top_k]
                 for j in top:
                     score = float(row[j])
                     if score < 0.5:
@@ -540,7 +663,7 @@ class Indexer:
             files = [f for f in commit_files if f in file_index]
             for i, a in enumerate(files):
                 for b in files[i + 1:]:
-                    pair = tuple(sorted([a, b]))  # type: ignore
+                    pair = tuple(sorted([a, b]))
                     pair_count[pair] += 1
 
         rows = [
@@ -553,13 +676,12 @@ class Indexer:
     def _write_tests_edges(
         self,
         function_rows: list[dict],
-        name_index: dict,
-        qname_index: dict,
+        name_index: dict[str, list[tuple[str, int]]],
     ) -> None:
         rows_func: list[dict] = []
         rows_class: list[dict] = []
         for fr in function_rows:
-            if not fr["is_test"]:
+            if not fr.get("is_test"):
                 continue
             stripped = fr["name"]
             for prefix in ("test_", "test"):
@@ -568,8 +690,7 @@ class Indexer:
                     break
             if not stripped:
                 continue
-            cands = name_index.get(stripped, [])
-            for label, eid, _ in cands:
+            for label, eid in name_index.get(stripped, []):
                 if eid == fr["id"]:
                     continue
                 if label == "Function":
@@ -580,13 +701,3 @@ class Indexer:
             self.db.insert_edges("TESTS", "Function", "Function", rows_func)
         if rows_class:
             self.db.insert_edges("TESTS", "Function", "Class", rows_class)
-
-
-def _entity_from_dict(d: dict):
-    from docgraph.parse import Entity
-    return Entity(**d)
-
-
-def _edge_from_dict(d: dict):
-    from docgraph.parse import RawEdge
-    return RawEdge(**d)
