@@ -80,6 +80,17 @@ NODE_DDL = [
         embedding DOUBLE[384],
         PRIMARY KEY (id)
     )""",
+    # External documentation chunks (from `docgraph docs add <url>`).
+    # Each Doc is a chunk of a fetched page; multiple per source URL.
+    """CREATE NODE TABLE IF NOT EXISTS Doc(
+        id INT64,
+        source STRING,
+        title STRING,
+        idx INT64,
+        body STRING,
+        embedding DOUBLE[384],
+        PRIMARY KEY (id)
+    )""",
 ]
 
 # Edge tables — Kuzu requires explicit FROM/TO node tables. We declare the

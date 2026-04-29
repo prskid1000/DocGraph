@@ -454,6 +454,28 @@ class Indexer:
 
         changed_set = set(parsed.keys())  # for "edge needs reinsertion?" check
 
+        # Scope-aware resolution: per-file set of files that file imports.
+        # Built from the same fuzzy IMPORTS-target match we use for the edge
+        # itself, so resolve() can prefer call-targets in imported files over
+        # same-named symbols in unrelated files. This is the best we can do
+        # without a real LSP — in practice it kills most cross-file CALLS
+        # hallucinations on overloads / generics / re-exports.
+        file_imports: dict[str, set[str]] = defaultdict(set)
+        for rel, file_data in cache.items():
+            for raw in file_data.get("edges", []):
+                if raw.get("kind") != "IMPORTS":
+                    continue
+                target_name = raw.get("target_name") or ""
+                target_path = target_name.replace(".", "/")
+                if not target_path:
+                    continue
+                for path in file_index:
+                    if path == rel:
+                        continue
+                    if path.startswith(target_path) or target_path in path:
+                        file_imports[rel].add(path)
+                        break
+
         def needs_insert(src_file: str, target_file: str | None) -> bool:
             """True if either endpoint was just (re)created."""
             if src_file in changed_set:
@@ -463,12 +485,18 @@ class Indexer:
             return False
 
         def resolve(name: str, src_file: str, prefer_kind: str | None = None) -> tuple[str, int, str] | None:
-            """Resolve a name. Prefer same-file definitions; then any. Returns (label, id, file)."""
+            """Resolve a name. Prefer same-file → imported-file → global.
+            Returns (label, id, file)."""
             cands = name_index.get(name, [])
             if not cands:
                 return None
             same_file = [c for c in cands if c[2] == src_file]
-            pool = same_file or cands
+            if same_file:
+                pool = same_file
+            else:
+                imported = file_imports.get(src_file, ())
+                from_imports = [c for c in cands if c[2] in imported]
+                pool = from_imports or cands
             if prefer_kind:
                 pref = [c for c in pool if c[0] == prefer_kind]
                 if pref:

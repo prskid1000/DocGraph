@@ -43,8 +43,15 @@ def make_app(cfg: Config) -> FastAPI:
 
     # --- JSON API ---
     @app.get("/api/search")
-    async def api_search(q: str, kind: str | None = None, limit: int = 10):
-        return retriever.search(q, kind=kind, limit=limit)
+    async def api_search(
+        q: str, kind: str | None = None, limit: int = 10,
+        focus_file: str | None = None, focus_symbol: str | None = None,
+        rerank: bool = False,
+    ):
+        return retriever.search(
+            q, kind=kind, limit=limit,
+            focus_file=focus_file, focus_symbol=focus_symbol, rerank=rerank,
+        )
 
     @app.get("/api/definition")
     async def api_definition(name: str, file: str | None = None):
@@ -98,6 +105,10 @@ def make_app(cfg: Config) -> FastAPI:
     @app.get("/api/rules_for")
     async def api_rules_for(file: str):
         return retriever.rules_for(file)
+
+    @app.get("/api/search_docs")
+    async def api_search_docs(q: str, limit: int = 10):
+        return retriever.search_docs(q, limit=limit)
 
     @app.get("/api/graph")
     async def api_graph(limit_nodes: int = 2000):

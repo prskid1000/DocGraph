@@ -32,14 +32,18 @@ def make_mcp(cfg: Config) -> FastMCP:
         limit: int = 10,
         focus_file: str | None = None,
         focus_symbol: str | None = None,
+        rerank: bool = False,
     ) -> list[dict]:
         """Hybrid search for code entities by natural-language query.
         kind: 'function' | 'class' | None (both).
         focus_file / focus_symbol: bias ranking toward the agent's current
-        location via personalized PageRank."""
+        location via personalized PageRank.
+        rerank: run a cross-encoder over the top candidates for higher
+        precision (downloads a ~33 MB model on first use)."""
         return retriever.search(
             query, kind=kind, limit=limit,
             focus_file=focus_file, focus_symbol=focus_symbol,
+            rerank=rerank,
         )
 
     @mcp.tool()
@@ -111,6 +115,12 @@ def make_mcp(cfg: Config) -> FastMCP:
     def git_recent(file: str | None = None, limit: int = 20) -> list[dict]:
         """Recent commits across the repo or scoped to one file."""
         return retriever.git_recent(file=file, limit=limit)
+
+    @mcp.tool()
+    def search_docs(query: str, limit: int = 10) -> list[dict]:
+        """Semantic search across ingested external documentation.
+        Add docs first: `docgraph docs add <url>`. Cursor @Docs parity."""
+        return retriever.search_docs(query, limit=limit)
 
     @mcp.tool()
     def rules_for(file: str) -> list[dict]:

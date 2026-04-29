@@ -30,6 +30,9 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI.
 - **Diff-aware retrieval** — `git_changes` returns changed entities plus 1-hop callers in one call. Cursor's `@Commit` joined to the graph.
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
+- **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (still local, still ONNX).
+- **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
+- **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them.
 
 ## Performance
 
@@ -65,6 +68,9 @@ Requires Python 3.10+. The first run downloads the embedding model (~30 MB BGE-s
 | `docgraph stats [path]` | Print entity + edge counts |
 | `docgraph clear [path]` | Delete `.docgraph/` for the repo |
 | `docgraph install-mcp [path]` | Print the JSON snippet for Cursor / Claude Desktop |
+| `docgraph docs add <url>` | Fetch & ingest external documentation for `search_docs` |
+| `docgraph docs list` | Show ingested docs |
+| `docgraph docs remove <url>` | Remove a doc URL's chunks |
 | `docgraph version` | Print version |
 
 `path` defaults to the current directory; the repo root is auto-detected by walking up to find `.git`.
@@ -106,6 +112,8 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 | `git_blame(file, line_start, line_end?)` | `git blame` per line. Mirrors Cursor Blame |
 | `git_recent(file?, limit=20)` | Recent commits, optionally scoped to a file |
 | `rules_for(file)` | Auto-attach rules for a file: matches `.cursor/rules/*.mdc` by glob, plus `AGENTS.md` / `CLAUDE.md` always-on. Drop in existing Cursor `.mdc` rules and they work here |
+| `search_docs(query, limit=10)` | Semantic search across ingested external docs (`docgraph docs add <url>`). Cursor `@Docs` parity |
+| `search(..., rerank=True)` | Cross-encoder rerank (Jina tiny, ~33 MB) over the top candidates for token-level precision. Opt-in; first call downloads the model |
 
 ## Relationships extracted
 
@@ -215,9 +223,8 @@ Covers indexer correctness, per-file delta updates, all retrieval methods, every
 
 ## Roadmap
 
-- Precise (compiler-grade) symbol resolution via SCIP / LSP for type-aware `CALLS` (kills hallucinated edges in TS / Java overloads).
+- Precise (compiler-grade) symbol resolution via SCIP / LSP daemons (we already have scope-aware-via-imports as a strong heuristic).
 - Optional LLM-generated docstrings at index time (opt-in via API key) — Greptile's recall lift.
-- AST sub-function chunking — multiple embeddings per long function.
 - Pre-download / cache embedding model so cold start is sub-second.
 - Watcher → live UI websocket so the graph redraws on reindex.
 

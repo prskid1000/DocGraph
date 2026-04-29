@@ -15,6 +15,7 @@ from docgraph.db import GraphDB
 from docgraph.embed import Embedder
 from docgraph.git_tools import blame_lines, changed_entities, recent_commits
 from docgraph.rank import PersonalizedRanker
+from docgraph.rerank import Reranker
 from docgraph.rules import rules_for as _rules_for
 
 
@@ -24,6 +25,12 @@ class Retriever:
         self.embedder = embedder
         self.cfg = cfg
         self._ranker: PersonalizedRanker | None = None
+        self._reranker: Reranker | None = None
+
+    def _reranker_(self) -> Reranker:
+        if self._reranker is None:
+            self._reranker = Reranker()
+        return self._reranker
 
     def _ranker_(self) -> PersonalizedRanker:
         if self._ranker is None:
@@ -69,10 +76,15 @@ class Retriever:
         limit: int = 10,
         focus_file: str | None = None,
         focus_symbol: str | None = None,
+        rerank: bool = False,
     ) -> list[dict]:
         """Hybrid search. If focus_file or focus_symbol is provided, ranks
         results by personalized PageRank biased toward that focus point —
-        the model sees results most relevant to where the agent is working."""
+        the model sees results most relevant to where the agent is working.
+
+        rerank=True runs a cross-encoder over the top candidates for
+        token-level precision (downloads a small ~33 MB model on first use).
+        """
         qvec = self.embedder.embed([query])[0]
         results: list[dict] = []
         labels = ("Function",) if kind == "function" else ("Class",) if kind == "class" else ("Function", "Class")
@@ -124,6 +136,17 @@ class Retriever:
                     "ppr": float(ppr_boost),
                 })
         results.sort(key=lambda x: x["score"], reverse=True)
+
+        if rerank and results:
+            try:
+                results = self._reranker_().rerank(
+                    query, results, text_key="snippet", top_k=50,
+                )
+            except Exception as e:  # noqa: BLE001
+                # Don't fail the search if the reranker can't load (offline,
+                # no model, etc.) — degrade silently to bi-encoder ranking.
+                import logging
+                logging.getLogger(__name__).warning(f"Rerank failed, falling back: {e}")
         return results[:limit]
 
     def _focus_ids(self, focus_file: str | None, focus_symbol: str | None) -> list[int]:
@@ -586,6 +609,39 @@ class Retriever:
         if self.cfg is None:
             return []
         return _rules_for(self.cfg, file)
+
+    # --- @Docs (external knowledge) ---------------------------------------
+
+    def search_docs(self, query: str, limit: int = 10) -> list[dict]:
+        """Semantic search across ingested external documentation
+        (`docgraph docs add <url>`). Cursor `@Docs` parity."""
+        try:
+            rows = self.db.fetch_all(
+                "MATCH (d:Doc) RETURN d.id AS id, d.source AS source, "
+                "d.title AS title, d.idx AS idx, d.body AS body, "
+                "d.embedding AS embedding"
+            )
+        except Exception:
+            return []
+        if not rows:
+            return []
+        qvec = self.embedder.embed([query])[0]
+        mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
+        qv = np.array(qvec, dtype=np.float32)
+        qv = qv / (np.linalg.norm(qv) + 1e-9)
+        mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
+        sims = (mat @ qv).tolist()
+        out = []
+        for r, s in zip(rows, sims):
+            out.append({
+                "source": r["source"],
+                "title": r["title"],
+                "idx": r["idx"],
+                "snippet": (r["body"] or "")[:600],
+                "score": float(s),
+            })
+        out.sort(key=lambda x: x["score"], reverse=True)
+        return out[:limit]
 
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
         nodes: list[dict] = []

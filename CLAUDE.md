@@ -31,6 +31,8 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher` / `git_*` / `rules_for`. **All Cypher lives here or in `db.py`.** |
 | `docgraph/git_tools.py` | `git diff` / `blame` / `log` shell-outs, joined to graph entities. |
 | `docgraph/rules.py` | Parses `.cursor/rules/*.mdc` + `AGENTS.md` / `CLAUDE.md`; glob-matches per file. |
+| `docgraph/rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB); used when `search(rerank=True)`. |
+| `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. |
 | `docgraph/mcp_tools.py` | 14 MCP tools (6 base + 8 differentiators). Keep this surface tight. |
 | `docgraph/server.py` | FastAPI: web UI + JSON API. |
@@ -123,6 +125,8 @@ Differentiators (the wedge against Cursor / Greptile / Sourcegraph):
 - `git_blame(file, line_start, line_end?)` — Cursor Blame parity.
 - `git_recent(file?, limit)` — recent commits scoped to a file or repo.
 - `rules_for(file)` — Cursor-rules ecosystem compatibility: matches `.cursor/rules/*.mdc` by glob plus `AGENTS.md` / `CLAUDE.md` always-on.
+- `search_docs(query)` — semantic search across `docgraph docs add <url>`-ingested external docs (Cursor `@Docs` parity).
+- `search(rerank=True)` — opt-in cross-encoder rerank over the top 50 candidates. Falls back silently if the model can't load (offline, missing).
 
 Don't add more without a strong reason. `search` accepts `focus_file` / `focus_symbol` for personalized PageRank — prefer threading those through over adding new tools.
 
@@ -149,6 +153,22 @@ Cursor parity:
 `Retriever._chunk_max_sims()` runs the query embedding against ALL chunk vectors once per search call and pools by parent_qname. The score for a parent entity = `max(entity_sim, best_chunk_sim)`. Cheap because there are typically <500 chunks per repo and one matmul handles them all.
 
 Incremental delete: `_delete_files_from_db()` includes a `MATCH (n:Chunk) WHERE n.file IN $files DETACH DELETE n` step before file nodes go.
+
+## Scope-aware resolution
+
+`index.py` builds `file_imports: dict[str, set[str]]` from cached `IMPORTS` RawEdges before the resolution loop. `resolve()` prefers same-file → imported-file → global candidates. This is a real precision lift over name-only matching but doesn't replace a real LSP — overload resolution within an imported file is still name-based.
+
+## Cross-encoder reranker
+
+`Reranker` class lazy-loads `jinaai/jina-reranker-v1-tiny-en` (~33 MB ONNX) via `fastembed.rerank.cross_encoder.TextCrossEncoder`. Only called when `search(rerank=True)`. Wraps in try/except so an unavailable model degrades gracefully to the bi-encoder ranking — never fails the request.
+
+`RERANK_TOP_K = 50` candidates fed in; results past 50 keep their bi-encoder rank.
+
+## @Docs
+
+- `docs.add_doc(cfg, url)` — fetch URL with stdlib `urllib`, parse HTML via subclassed `HTMLParser` (no BS4 dep), chunk via `chunk_doc()`, embed, store `Doc` rows.
+- Idempotent: re-ingesting the same URL deletes prior chunks first.
+- `Retriever.search_docs(query, limit)` — pure cosine similarity over `Doc.embedding`. Separate from code search; agent picks which to call.
 
 ## UI engines
 

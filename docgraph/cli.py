@@ -186,6 +186,60 @@ def clear(
     console.print(f"[green]Cleared[/green] {cfg.data_dir}")
 
 
+docs_app = typer.Typer(help="Manage external documentation (Cursor @Docs parity).")
+app.add_typer(docs_app, name="docs")
+
+
+@docs_app.command("add")
+def docs_add(
+    url: str = typer.Argument(..., help="Documentation URL to fetch and index"),
+    path: Path = typer.Option(Path.cwd(), "--path", help="Repo whose .docgraph/ to write to"),
+) -> None:
+    """Fetch a URL, chunk + embed it, store as Doc nodes for semantic search."""
+    cfg = load_config(path)
+    from docgraph.docs import add_doc
+    console.print(f"[cyan]Fetching[/cyan] {url}")
+    try:
+        out = add_doc(cfg, url)
+    except Exception as e:  # noqa: BLE001
+        console.print(f"[red]Failed:[/red] {e}")
+        raise typer.Exit(1)
+    if "error" in out:
+        console.print(f"[yellow]{out['error']}[/yellow]")
+        raise typer.Exit(1)
+    console.print(f"[green]Indexed[/green] {out['chunks']} chunks — {out['title'] or url}")
+
+
+@docs_app.command("list")
+def docs_list(
+    path: Path = typer.Option(Path.cwd(), "--path"),
+) -> None:
+    """List all ingested doc URLs and their chunk counts."""
+    cfg = load_config(path)
+    from docgraph.docs import list_docs
+    rows = list_docs(cfg)
+    if not rows:
+        console.print("[yellow]No docs ingested yet. Try:[/yellow] docgraph docs add <url>")
+        return
+    table = Table(title="Ingested docs")
+    table.add_column("Source"); table.add_column("Title"); table.add_column("Chunks", justify="right")
+    for r in rows:
+        table.add_row(r["source"], r.get("title") or "", str(r["chunks"]))
+    console.print(table)
+
+
+@docs_app.command("remove")
+def docs_remove(
+    url: str = typer.Argument(...),
+    path: Path = typer.Option(Path.cwd(), "--path"),
+) -> None:
+    """Delete all chunks for a previously-ingested doc URL."""
+    cfg = load_config(path)
+    from docgraph.docs import remove_doc
+    n = remove_doc(cfg, url)
+    console.print(f"[green]Removed[/green] {n} chunks for {url}")
+
+
 @app.command(name="install-mcp")
 def install_mcp(
     path: Path = typer.Argument(Path.cwd()),
