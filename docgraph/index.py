@@ -35,6 +35,7 @@ from docgraph.db import GraphDB
 from docgraph.embed import Embedder
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
+from docgraph.summary import build_embedding_text
 
 log = logging.getLogger(__name__)
 
@@ -44,38 +45,42 @@ ProgressCb = Callable[[str, int, int], None] | None
 # --- Walker ---------------------------------------------------------------
 
 
-def walk_files(cfg: Config) -> list[Path]:
-    out: list[Path] = []
-    root = cfg.repo_root
-    for dirpath, dirnames, filenames in os.walk(root):
-        rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
-        dirnames[:] = [
-            d for d in dirnames
-            if not cfg.is_ignored(f"{rel_dir}/{d}/" if rel_dir != "." else f"{d}/")
-        ]
-        for fname in filenames:
-            full = Path(dirpath) / fname
-            rel = str(full.relative_to(root)).replace("\\", "/")
-            if cfg.is_ignored(rel):
-                continue
-            if detect_language(full) is None:
-                continue
-            try:
-                if full.stat().st_size > MAX_FILE_BYTES:
+def walk_files(cfg: Config) -> list[tuple[Path, str]]:
+    """Return [(absolute_path, logical_rel)]. logical_rel includes a `<repo>/`
+    prefix in multi-root mode; in single-root mode it's just the rel path."""
+    out: list[tuple[Path, str]] = []
+    for root, prefix in cfg.roots_with_prefix():
+        for dirpath, dirnames, filenames in os.walk(root):
+            rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
+            dirnames[:] = [
+                d for d in dirnames
+                if not cfg.is_ignored(
+                    f"{rel_dir}/{d}/" if rel_dir != "." else f"{d}/", root=root
+                )
+            ]
+            for fname in filenames:
+                full = Path(dirpath) / fname
+                rel = str(full.relative_to(root)).replace("\\", "/")
+                if cfg.is_ignored(rel, root=root):
                     continue
-            except OSError:
-                continue
-            out.append(full)
+                if detect_language(full) is None:
+                    continue
+                try:
+                    if full.stat().st_size > MAX_FILE_BYTES:
+                        continue
+                except OSError:
+                    continue
+                out.append((full, f"{prefix}{rel}"))
     return out
 
 
 # --- Parse worker ---------------------------------------------------------
 
 
-def _parse_worker(args: tuple[str, str]) -> dict | None:
-    file_path, repo_root = args
+def _parse_worker(args: tuple[str, str, str]) -> dict | None:
+    file_path, repo_root, rel_override = args
     try:
-        fp = parse_file(Path(file_path), Path(repo_root))
+        fp = parse_file(Path(file_path), Path(repo_root), rel_override=rel_override)
         if fp is None:
             return None
         return {
@@ -168,13 +173,11 @@ class Indexer:
         t0 = time.perf_counter()
         cache = load_cache(self.cfg) if incremental else {}
         files_on_disk = walk_files(self.cfg)
-        on_disk_rel = {
-            str(f.relative_to(self.cfg.repo_root)).replace("\\", "/"): f
-            for f in files_on_disk
-        }
+        # logical_rel → absolute path
+        on_disk_rel: dict[str, Path] = {rel: path for path, rel in files_on_disk}
 
         # Compute hashes; identify changed/added/deleted
-        changed: list[Path] = []  # changed or added
+        changed: list[tuple[Path, str]] = []  # (absolute_path, logical_rel)
         unchanged_rels: set[str] = set()
         new_hashes: dict[str, str] = {}
         for rel, path in on_disk_rel.items():
@@ -184,7 +187,7 @@ class Indexer:
             if cached and cached.get("hash") == h:
                 unchanged_rels.add(rel)
             else:
-                changed.append(path)
+                changed.append((path, rel))
 
         deleted_rels = [rel for rel in cache.keys() if rel not in on_disk_rel]
         log.info(
@@ -212,8 +215,7 @@ class Indexer:
             changed = list(files_on_disk)
 
         # ---- Step 1: delete affected nodes from DB ----
-        affected = [str(p.relative_to(self.cfg.repo_root)).replace("\\", "/")
-                    for p in changed]
+        affected = [rel for _path, rel in changed]
         self._delete_files_from_db(affected + deleted_rels)
         for rel in deleted_rels:
             cache.pop(rel, None)
@@ -230,7 +232,16 @@ class Indexer:
                 TimeElapsedColumn(),
             ) as prog:
                 ptask = prog.add_task("Parsing", total=len(changed))
-                args_iter = [(str(f), str(self.cfg.repo_root)) for f in changed]
+                # parse worker receives (absolute_path, owning_root, logical_rel)
+                args_iter = []
+                roots = self.cfg.roots_with_prefix()
+                for path, logical_rel in changed:
+                    owner = self.cfg.repo_root
+                    for root, prefix in roots:
+                        if prefix == "" or logical_rel.startswith(prefix):
+                            owner = root
+                            break
+                    args_iter.append((str(path), str(owner), logical_rel))
                 with ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
                     for result in ex.map(_parse_worker, args_iter, chunksize=8):
                         prog.advance(ptask)
@@ -296,7 +307,14 @@ class Indexer:
                         "embedding": [0.0] * self.embedder.dim,
                         "pagerank": 0.0,
                     })
-                    new_embed_targets.append(("Class", eid, f"{ent.name}\n{ent.body[:1500]}"))
+                    new_embed_targets.append((
+                        "Class",
+                        eid,
+                        build_embedding_text(
+                            ent.name, ent.qname, ent.signature, ent.body,
+                            fp.language, ent.kind,
+                        ),
+                    ))
                 elif ent.kind in ("function", "method"):
                     is_test = (
                         ent.name.startswith("test_") or
@@ -317,7 +335,14 @@ class Indexer:
                         "embedding": [0.0] * self.embedder.dim,
                         "pagerank": 0.0,
                     })
-                    new_embed_targets.append(("Function", eid, f"{ent.name}\n{ent.body[:1500]}"))
+                    new_embed_targets.append((
+                        "Function",
+                        eid,
+                        build_embedding_text(
+                            ent.name, ent.qname, ent.signature, ent.body,
+                            fp.language, ent.kind,
+                        ),
+                    ))
                 else:
                     variable_rows.append({
                         "id": eid,
@@ -637,34 +662,35 @@ class Indexer:
             self.db.insert_edges("SIMILAR_TO", label, label, sim_edges)
 
     def _write_co_changed(self, file_index: dict[str, int]) -> None:
-        try:
-            out = subprocess.check_output(
-                ["git", "log", f"-{self.cfg.co_change_window}", "--name-only", "--pretty=format:---"],
-                cwd=self.cfg.repo_root,
-                text=True,
-                stderr=subprocess.DEVNULL,
-            )
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            return
-        commits: list[set[str]] = []
-        cur: set[str] = set()
-        for line in out.splitlines():
-            if line.startswith("---"):
-                if cur:
-                    commits.append(cur)
-                cur = set()
-            elif line.strip():
-                cur.add(line.strip().replace("\\", "/"))
-        if cur:
-            commits.append(cur)
-
         pair_count: dict[tuple[str, str], int] = defaultdict(int)
-        for commit_files in commits:
-            files = [f for f in commit_files if f in file_index]
-            for i, a in enumerate(files):
-                for b in files[i + 1:]:
-                    pair = tuple(sorted([a, b]))
-                    pair_count[pair] += 1
+        for root, prefix in self.cfg.roots_with_prefix():
+            try:
+                out = subprocess.check_output(
+                    ["git", "log", f"-{self.cfg.co_change_window}", "--name-only", "--pretty=format:---"],
+                    cwd=root,
+                    text=True,
+                    stderr=subprocess.DEVNULL,
+                )
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                continue
+            commits: list[set[str]] = []
+            cur: set[str] = set()
+            for line in out.splitlines():
+                if line.startswith("---"):
+                    if cur:
+                        commits.append(cur)
+                    cur = set()
+                elif line.strip():
+                    cur.add(prefix + line.strip().replace("\\", "/"))
+            if cur:
+                commits.append(cur)
+
+            for commit_files in commits:
+                files = [f for f in commit_files if f in file_index]
+                for i, a in enumerate(files):
+                    for b in files[i + 1:]:
+                        pair = tuple(sorted([a, b]))
+                        pair_count[pair] += 1
 
         rows = [
             {"from_id": file_index[a], "to_id": file_index[b], "count": c}

@@ -6,21 +6,43 @@ All Cypher queries here are Kuzu-flavored:
 """
 from __future__ import annotations
 
+import re
+
 import numpy as np
 
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder
+from docgraph.rank import PersonalizedRanker
 
 
 class Retriever:
     def __init__(self, db: GraphDB, embedder: Embedder):
         self.db = db
         self.embedder = embedder
+        self._ranker: PersonalizedRanker | None = None
 
-    def search(self, query: str, kind: str | None = None, limit: int = 10) -> list[dict]:
+    def _ranker_(self) -> PersonalizedRanker:
+        if self._ranker is None:
+            self._ranker = PersonalizedRanker(self.db)
+        return self._ranker
+
+    def search(
+        self,
+        query: str,
+        kind: str | None = None,
+        limit: int = 10,
+        focus_file: str | None = None,
+        focus_symbol: str | None = None,
+    ) -> list[dict]:
+        """Hybrid search. If focus_file or focus_symbol is provided, ranks
+        results by personalized PageRank biased toward that focus point —
+        the model sees results most relevant to where the agent is working."""
         qvec = self.embedder.embed([query])[0]
         results: list[dict] = []
         labels = ("Function",) if kind == "function" else ("Class",) if kind == "class" else ("Function", "Class")
+
+        ppr = self._maybe_ppr(focus_file, focus_symbol)
+
         for label in labels:
             rows = self.db.fetch_all(
                 f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.qname AS qname, "
@@ -38,7 +60,10 @@ class Retriever:
             for r, s in zip(rows, sims.tolist()):
                 name_boost = 0.3 if qlow in r["name"].lower() else 0.0
                 pr = r.get("pagerank") or 0.0
-                score = s + name_boost + pr * 0.1
+                ppr_boost = ppr.get(r["id"], 0.0) if ppr else 0.0
+                # Use personalized PR when present; fall back to global.
+                rank_term = (ppr_boost * 0.5) if ppr else (pr * 0.1)
+                score = s + name_boost + rank_term
                 results.append({
                     "label": label,
                     "id": r["id"],
@@ -49,9 +74,42 @@ class Retriever:
                     "snippet": (r["body"] or "")[:300],
                     "score": float(score),
                     "pagerank": float(pr),
+                    "ppr": float(ppr_boost),
                 })
         results.sort(key=lambda x: x["score"], reverse=True)
         return results[:limit]
+
+    def _focus_ids(self, focus_file: str | None, focus_symbol: str | None) -> list[int]:
+        """Translate a file path or symbol name into seed node IDs."""
+        ids: list[int] = []
+        if focus_file:
+            for label, prop in (("File", "path"), ("Function", "file"), ("Class", "file")):
+                for r in self.db.fetch_all(
+                    f"MATCH (n:{label}) WHERE n.{prop} = $f RETURN n.id AS id",
+                    {"f": focus_file},
+                ):
+                    ids.append(r["id"])
+        if focus_symbol:
+            for label in ("Function", "Class"):
+                for r in self.db.fetch_all(
+                    f"MATCH (n:{label}) WHERE n.name = $s RETURN n.id AS id",
+                    {"s": focus_symbol},
+                ):
+                    ids.append(r["id"])
+        return ids
+
+    def _maybe_ppr(
+        self, focus_file: str | None, focus_symbol: str | None
+    ) -> dict[int, float] | None:
+        if not focus_file and not focus_symbol:
+            return None
+        ids = self._focus_ids(focus_file, focus_symbol)
+        if not ids:
+            return None
+        try:
+            return self._ranker_().personalized(ids)
+        except Exception:
+            return None
 
     def definition(self, name: str, file: str | None = None) -> list[dict]:
         params: dict = {"name": name}
@@ -168,6 +226,277 @@ class Retriever:
                 pass
         out.sort(key=lambda x: x.get("pagerank") or 0.0, reverse=True)
         return out[:limit]
+
+    # --- Multi-hop / impact / test_impact / cypher ---------------------
+
+    def explore(
+        self,
+        seeds: list[str],
+        hops: int = 3,
+        limit: int = 25,
+        edges: tuple[str, ...] = ("CALLS", "REFERENCES_", "SIMILAR_TO", "INHERITS", "TESTS"),
+    ) -> dict:
+        """Multi-hop graph walk from one or more seed names. Returns nodes
+        ranked by min-distance and pagerank — the agent gets a 1-shot view of
+        the relevant subgraph instead of having to chain `neighborhood` calls.
+
+        seeds: symbol names (Function/Class). hops: 1..5.
+        """
+        hops = max(1, min(int(hops), 5))
+        if not seeds:
+            return {"nodes": [], "edges": []}
+
+        # Resolve seed names to IDs (Function or Class)
+        seed_ids: list[int] = []
+        for s in seeds:
+            for r in self.db.fetch_all(
+                "MATCH (n) WHERE (label(n) = 'Function' OR label(n) = 'Class') AND n.name = $s "
+                "RETURN n.id AS id",
+                {"s": s},
+            ):
+                seed_ids.append(r["id"])
+        if not seed_ids:
+            return {"nodes": [], "edges": []}
+
+        # BFS — each level we expand via every requested edge type.
+        seen: dict[int, int] = {sid: 0 for sid in seed_ids}  # id → min-distance
+        frontier = set(seed_ids)
+        edge_records: list[dict] = []
+        for d in range(1, hops + 1):
+            if not frontier:
+                break
+            next_frontier: set[int] = set()
+            for edge in edges:
+                try:
+                    rows = self.db.fetch_all(
+                        f"MATCH (a)-[r:{edge}]-(b) WHERE a.id IN $ids "
+                        f"RETURN a.id AS src, b.id AS dst",
+                        {"ids": list(frontier)},
+                    )
+                except Exception:
+                    continue
+                for row in rows:
+                    edge_records.append({"src": row["src"], "dst": row["dst"], "kind": edge})
+                    if row["dst"] not in seen:
+                        seen[row["dst"]] = d
+                        next_frontier.add(row["dst"])
+            frontier = next_frontier
+
+        if not seen:
+            return {"nodes": [], "edges": []}
+
+        rows = self.db.fetch_all(
+            "MATCH (n) WHERE n.id IN $ids AND (label(n) = 'Function' OR label(n) = 'Class') "
+            "RETURN n.id AS id, n.name AS name, n.qname AS qname, n.file AS file, "
+            "n.line_start AS line, label(n) AS kind, "
+            "coalesce(n.pagerank, 0.0) AS pagerank",
+            {"ids": list(seen.keys())},
+        )
+        nodes = []
+        for r in rows:
+            d = seen[r["id"]]
+            # Higher score = closer + more central
+            score = (1.0 / (d + 1)) + (r["pagerank"] or 0.0) * 0.5
+            r["distance"] = d
+            r["score"] = score
+            nodes.append(r)
+        nodes.sort(key=lambda x: x["score"], reverse=True)
+        return {"nodes": nodes[:limit], "edges": edge_records}
+
+    def impact_of(
+        self,
+        target: str,
+        depth: int = 3,
+        limit: int = 50,
+    ) -> dict:
+        """Blast radius of a file or symbol. Returns:
+          - callers: transitive callers (CALLS reverse, up to `depth` hops)
+          - importers: files that import this file
+          - co_changed: files that historically changed alongside
+          - tests: tests that exercise the target
+
+        target: a symbol name OR a file path. We try file first, then symbol.
+        """
+        depth = max(1, min(int(depth), 5))
+        out: dict = {"target": target, "callers": [], "importers": [], "co_changed": [], "tests": []}
+
+        is_file = bool(self.db.fetch_all(
+            "MATCH (f:File) WHERE f.path = $t RETURN f.id LIMIT 1", {"t": target}
+        ))
+
+        if is_file:
+            # Importers
+            out["importers"] = self.db.fetch_all(
+                "MATCH (a:File)-[:IMPORTS]->(b:File) WHERE b.path = $t "
+                "RETURN a.path AS file",
+                {"t": target},
+            )
+            # Co-changed
+            out["co_changed"] = self.db.fetch_all(
+                "MATCH (a:File)-[r:CO_CHANGED_WITH]-(b:File) WHERE a.path = $t "
+                "RETURN b.path AS file, r.count AS count ORDER BY r.count DESC LIMIT 25",
+                {"t": target},
+            )
+            # Transitive callers of any function in this file
+            try:
+                rows = self.db.fetch_all(
+                    f"MATCH path = (caller:Function)-[:CALLS*1..{depth}]->(callee:Function) "
+                    f"WHERE callee.file = $t "
+                    f"UNWIND nodes(path) AS n "
+                    f"RETURN DISTINCT n.qname AS qname, n.name AS name, n.file AS file, "
+                    f"n.line_start AS line, coalesce(n.pagerank,0.0) AS pagerank "
+                    f"ORDER BY pagerank DESC LIMIT $lim",
+                    {"t": target, "lim": limit},
+                )
+                out["callers"] = rows
+            except Exception:
+                out["callers"] = []
+            # Tests
+            try:
+                out["tests"] = self.db.fetch_all(
+                    "MATCH (t:Function)-[:TESTS]->(target) WHERE target.file = $t "
+                    "RETURN t.name AS name, t.file AS file, t.line_start AS line "
+                    "LIMIT $lim",
+                    {"t": target, "lim": limit},
+                )
+            except Exception:
+                out["tests"] = []
+        else:
+            # Symbol path
+            try:
+                out["callers"] = self.db.fetch_all(
+                    f"MATCH path = (caller)-[:CALLS*1..{depth}]->(target:Function) "
+                    f"WHERE target.name = $t "
+                    f"UNWIND nodes(path) AS n RETURN DISTINCT n.qname AS qname, n.name AS name, "
+                    f"n.file AS file, n.line_start AS line, "
+                    f"coalesce(n.pagerank,0.0) AS pagerank "
+                    f"ORDER BY pagerank DESC LIMIT $lim",
+                    {"t": target, "lim": limit},
+                )
+            except Exception:
+                out["callers"] = []
+            try:
+                out["tests"] = self.db.fetch_all(
+                    "MATCH (test:Function)-[:TESTS]->(target) WHERE target.name = $t "
+                    "RETURN test.name AS name, test.file AS file, test.line_start AS line "
+                    "LIMIT $lim",
+                    {"t": target, "lim": limit},
+                )
+            except Exception:
+                out["tests"] = []
+            # File of the symbol → its importers + co-changed
+            files_of_symbol = self.db.fetch_all(
+                "MATCH (n) WHERE (label(n) = 'Function' OR label(n) = 'Class') AND n.name = $t "
+                "RETURN DISTINCT n.file AS file LIMIT 5",
+                {"t": target},
+            )
+            for fr in files_of_symbol:
+                f = fr["file"]
+                out["importers"].extend(self.db.fetch_all(
+                    "MATCH (a:File)-[:IMPORTS]->(b:File) WHERE b.path = $f RETURN a.path AS file",
+                    {"f": f},
+                ))
+                out["co_changed"].extend(self.db.fetch_all(
+                    "MATCH (a:File)-[r:CO_CHANGED_WITH]-(b:File) WHERE a.path = $f "
+                    "RETURN b.path AS file, r.count AS count ORDER BY r.count DESC LIMIT 10",
+                    {"f": f},
+                ))
+        return out
+
+    def test_impact(self, target: str, limit: int = 25) -> list[dict]:
+        """Tests that exercise `target` (file or symbol). Differentiator:
+        we already have TESTS edges + reverse CALLS, no competitor exposes
+        this as a primitive."""
+        is_file = bool(self.db.fetch_all(
+            "MATCH (f:File) WHERE f.path = $t RETURN f.id LIMIT 1", {"t": target}
+        ))
+        seen: set[tuple[str, str]] = set()
+        out: list[dict] = []
+
+        def add(rows: list[dict], via: str) -> None:
+            for r in rows:
+                key = (r.get("name"), r.get("file"))
+                if key in seen:
+                    continue
+                seen.add(key)
+                r["via"] = via
+                out.append(r)
+                if len(out) >= limit:
+                    return
+
+        if is_file:
+            try:
+                add(self.db.fetch_all(
+                    "MATCH (t:Function)-[:TESTS]->(target) WHERE target.file = $t "
+                    "RETURN t.name AS name, t.file AS file, t.line_start AS line",
+                    {"t": target},
+                ), "TESTS")
+            except Exception:
+                pass
+            try:
+                add(self.db.fetch_all(
+                    "MATCH (t:Function)-[:CALLS*1..3]->(callee:Function) "
+                    "WHERE callee.file = $t AND t.is_test = true "
+                    "RETURN DISTINCT t.name AS name, t.file AS file, t.line_start AS line "
+                    "LIMIT $lim",
+                    {"t": target, "lim": limit},
+                ), "CALLS*")
+            except Exception:
+                pass
+        else:
+            try:
+                add(self.db.fetch_all(
+                    "MATCH (t:Function)-[:TESTS]->(target) WHERE target.name = $t "
+                    "RETURN t.name AS name, t.file AS file, t.line_start AS line",
+                    {"t": target},
+                ), "TESTS")
+            except Exception:
+                pass
+            try:
+                add(self.db.fetch_all(
+                    "MATCH (t:Function)-[:CALLS*1..3]->(callee:Function) "
+                    "WHERE callee.name = $t AND t.is_test = true "
+                    "RETURN DISTINCT t.name AS name, t.file AS file, t.line_start AS line "
+                    "LIMIT $lim",
+                    {"t": target, "lim": limit},
+                ), "CALLS*")
+            except Exception:
+                pass
+        return out[:limit]
+
+    # Cypher escape hatch ---------------------------------------------------
+
+    _WRITE_KEYWORDS = (
+        "CREATE", "MERGE", "DELETE", "DETACH",
+        "SET", "REMOVE", "DROP", "ALTER", "COPY",
+    )
+
+    @classmethod
+    def _is_read_only(cls, query: str) -> bool:
+        upper = query.upper()
+        # Strip string literals so e.g. "MERGE" inside a string doesn't false-positive
+        stripped = re.sub(r"'[^']*'|\"[^\"]*\"", "", upper)
+        for kw in cls._WRITE_KEYWORDS:
+            if re.search(rf"\b{kw}\b", stripped):
+                return False
+        return True
+
+    def cypher(self, query: str, limit: int = 100) -> dict:
+        """Read-only Cypher escape hatch. Lets the agent author its own graph
+        queries — none of the competitors expose this. Rejects writes; caps
+        rows.
+
+        Returns {"rows": [...], "rejected": str | None}.
+        """
+        if not self._is_read_only(query):
+            return {"rows": [], "rejected": "write keyword detected (CREATE/MERGE/SET/DELETE/...)"}
+        # Append a LIMIT safety net unless one exists
+        if "LIMIT" not in query.upper():
+            query = f"{query.rstrip(';')} LIMIT {int(limit)}"
+        try:
+            return {"rows": self.db.fetch_all(query)[:limit], "rejected": None}
+        except Exception as e:  # noqa: BLE001
+            return {"rows": [], "rejected": f"query error: {e}"}
 
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
         nodes: list[dict] = []

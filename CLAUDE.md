@@ -21,18 +21,20 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | File | Purpose |
 |---|---|
 | `docgraph/cli.py` | Typer entry. Add subcommands here. |
-| `docgraph/config.py` | Auto-detects repo root (walks up for `.git`), respects `.gitignore` + `.docgraphignore`. |
+| `docgraph/config.py` | Auto-detects repo root, respects `.gitignore` + `.docgraphignore`. Multi-root via `extra_roots`; persisted in `.docgraph/repos.json`. |
 | `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. |
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
+| `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
 | `docgraph/db.py` | Kuzu schema + bulk insert helpers. |
 | `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). |
-| `docgraph/rank.py` | NetworkX PageRank over CALLS+REFERENCES_+INHERITS+INSTANTIATES. |
-| `docgraph/retrieve.py` | Hybrid retrieval. **All Cypher lives here or in `db.py`.** |
-| `docgraph/mcp_tools.py` | 6 MCP tools. Keep this surface tight. |
+| `docgraph/rank.py` | NetworkX PageRank + `PersonalizedRanker` (query-time personalized PR with cached graph). |
+| `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher`. **All Cypher lives here or in `db.py`.** |
+| `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. |
+| `docgraph/mcp_tools.py` | 10 MCP tools (6 base + 4 differentiators). Keep this surface tight. |
 | `docgraph/server.py` | FastAPI: web UI + JSON API. |
-| `docgraph/ui/index.html` | Single-page graph viewer. Vanilla JS, canvas, no deps. |
+| `docgraph/ui/index.html` | Single-page graph viewer. Canvas + Sigma.js (lazy-loaded from esm.sh, auto-engages > 2 k nodes). |
 
-Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB) and `<repo>/.docgraph/cache.json` (per-file `{hash, entities, edges}` for delta updates).
+Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB), `<repo>/.docgraph/cache.json` (per-file `{hash, entities, edges}`), `<repo>/.docgraph/repos.json` (multi-repo list).
 
 ## Kuzu Cypher gotchas (learned the hard way)
 
@@ -69,9 +71,22 @@ The trickiest part of the codebase. Read `index.py::index_all` carefully before 
 
 If you change the parse output shape, update the cache writer **and** the cache reader in lockstep.
 
-## Testing the indexer after changes
+## Testing
 
-There's no formal test suite yet. Smoke test by:
+```bash
+.venv/Scripts/python -m pytest                 # ~17s, 60 tests
+```
+
+Tests in `tests/`:
+- `test_unit.py` — config, summary/docstring extraction, watch filter, multi-root helpers (no embedder, fast)
+- `test_indexer.py` — full + incremental + delete cycles, idempotency
+- `test_retrieval.py` — original 6 retriever methods
+- `test_new_tools.py` — `explore`, `impact_of`, `test_impact`, `cypher` (incl. write-blocker tests), personalized PageRank
+- `test_multi_repo.py` — multi-root walker, cross-repo indexing, path roundtrip
+
+**Kuzu writer-visibility gotcha:** a `kuzu.Connection` opened with `read_only=False` doesn't see its own writes via subsequent `fetch_all` queries in the same process. The fixture closes the writer and reopens read-only after indexing. If you write a new test and reads come back empty, that's the cause.
+
+You can also smoke test manually:
 
 ```bash
 # 1. Clean baseline
@@ -92,11 +107,30 @@ diff /tmp/full_stats.txt /tmp/incremental_stats.txt
 
 If the diff is non-empty, your change broke incremental correctness.
 
-## MCP tool surface — keep it tight
+## MCP tool surface — 6 base + 4 differentiators
 
-6 tools, no more without a strong reason: `search`, `definition`, `references`, `call_graph`, `file_map`, `neighborhood`. The whole point is "fewer, sharper tools than the competition."
+Base: `search`, `definition`, `references`, `call_graph`, `file_map`, `neighborhood`.
 
-`neighborhood` is the differentiator — it ranks related code via `CALLS + REFERENCES_ + SIMILAR_TO + INHERITS + TESTS` together, ordered by PageRank. It answers "what else should I read to understand this?"
+Differentiators (the wedge against Cursor / Greptile / Sourcegraph):
+
+- `explore(seeds, hops, limit)` — multi-hop BFS from one or more seeds in a single call. Replaces N chained `neighborhood` lookups.
+- `impact_of(target, depth)` — blast radius of a file or symbol: callers + importers + co-changed files + tests.
+- `test_impact(target)` — tests that exercise this code via `TESTS` edges + reverse `CALLS*`.
+- `cypher(query, limit)` — read-only Cypher escape hatch. Rejects writes (CREATE/MERGE/SET/DELETE/...). Lets agents author their own graph queries.
+
+Don't add more without a strong reason. `search` accepts `focus_file` / `focus_symbol` for personalized PageRank — prefer threading those through over adding new tools.
+
+## Multi-repo
+
+`extra_roots: list[Path]` on `Config`, persisted in `.docgraph/repos.json`. Walker emits `(absolute_path, logical_rel)` where `logical_rel = "<repo>/<rel>"` in multi-root mode. Cross-repo `IMPORTS` resolve via the existing fuzzy substring match — no schema change. `_write_co_changed` runs `git log` per root and prefixes paths.
+
+## Watch mode
+
+`docgraph watch` opens a writer connection for its lifetime — kill `serve` / `mcp` against the same DB first. Pre-debounce filter (`_WatchFilter`) drops ignored / unsupported-language paths *before* watchfiles emits them so `git checkout` of `node_modules` doesn't fire 5 k events.
+
+## UI engines
+
+Canvas (default, O(N²) force) and Sigma.js (WebGL, lazy-loaded from esm.sh). Auto-engages > 2 k nodes; manual toggle button. No build step.
 
 ## Coding conventions
 
@@ -138,14 +172,15 @@ pkill -f docgraph                              # *nix
 - Putting `∈` or other non-cp1252 chars in MCP tool docstrings → crashes the call on Windows.
 - Calling `type(r)` in Cypher → `function TYPE does not exist`.
 - Forgetting that `File.path` is the name property (not `File.name`).
-- Re-running the indexer while `docgraph serve` is running → DB lock error.
+- Re-running the indexer while `docgraph serve` / `docgraph mcp` / `docgraph watch` is running → DB lock error.
 - Using `tree-sitter-language-pack 1.6+` thinking it's the old Goldziher API — it isn't, it's a Rust rewrite that needs network downloads.
 - Inserting nodes with IDs starting at 1 on an incremental run → duplicate-PK error from Kuzu. Always `_seed_ids_from_db()` first.
+- Reading from a Kuzu writer connection right after writing → empty results. Reopen as `read_only=True`.
 
 ## Known limitations / next-up
 
+- No SCIP / LSP integration → `CALLS` is name-based and will mis-resolve TS / Java overloads. Roadmap.
+- LLM-generated docstrings (Greptile-style) require an opt-in API key path — not built yet.
 - Embedding model loads fresh per process (~1s cold). Pre-warming or caching across CLI invocations would help.
-- No `docgraph watch` mode yet.
-- Force-directed canvas renderer is O(N²) per frame; fine to ~2k nodes. For larger graphs, drop in Cosmograph (WebGL) at `docgraph/ui/index.html`.
 - `IMPORTS_SYMBOL` and `OVERRIDES` edges declared in the schema but not extracted by any tags query yet.
-- Cross-repo references (monorepo) are not modeled — every `.docgraph/` is per-repo.
+- The watcher holds a writer lock for its lifetime — kill `serve` / `mcp` first.

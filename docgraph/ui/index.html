@@ -95,6 +95,7 @@
         <div class="controls">
           <button id="reset-view">Reset</button>
           <button id="reload-graph">Reload</button>
+          <button id="toggle-engine" title="Switch renderer">Canvas</button>
         </div>
         <div class="legend">
           <div class="row"><span class="swatch" style="background: #7dd3fc"></span>Function</div>
@@ -137,7 +138,19 @@
     let canvas, ctx, viewport = { tx: 0, ty: 0, scale: 1 };
     let selectedId = null, hoverId = null, dragging = null;
 
+    // Renderer state. "canvas" is the default O(N^2) force renderer; "webgl"
+    // loads Sigma.js lazily via esm.sh. Auto-switch threshold: 2000 nodes.
+    let engine = "canvas";
+    let sigmaInstance = null;
+    let rafId = null;
+    const WEBGL_THRESHOLD = 2000;
+
     const COLORS = { Function: "#7dd3fc", Class: "#a78bfa", File: "#34d399" };
+    const EDGE_COLORS_HEX = {
+      CALLS: "#7dd3fc55", INHERITS: "#a78bfa80", REFERENCES_: "#ffffff20",
+      IMPORTS: "#34d39940", SIMILAR_TO: "#fb718530", TESTS: "#f59e0b50",
+      CO_CHANGED_WITH: "#ffffff10", INSTANTIATES: "#a78bfa50",
+    };
 
     async function loadStats() {
       const s = await api("/api/stats");
@@ -146,10 +159,20 @@
 
     async function loadGraph() {
       $("#loading").style.display = "";
-      graph = await api("/api/graph?limit_nodes=1500");
-      buildLayout();
-      $("#loading").style.display = "none";
-      render();
+      graph = await api("/api/graph?limit_nodes=4000");
+      // Auto-pick engine based on size. User toggle (after first load) sticks.
+      if (!engineUserOverride) {
+        const desired = graph.nodes.length > WEBGL_THRESHOLD ? "webgl" : "canvas";
+        if (desired !== engine) await setEngine(desired, /*skipReload*/ true);
+      }
+      if (engine === "canvas") {
+        buildLayout();
+        $("#loading").style.display = "none";
+        render();
+      } else {
+        await mountSigma();
+        $("#loading").style.display = "none";
+      }
     }
 
     function buildLayout() {
@@ -297,9 +320,139 @@
     }
 
     function tick() {
+      if (engine !== "canvas") return;
       step();
       render();
-      requestAnimationFrame(tick);
+      rafId = requestAnimationFrame(tick);
+    }
+
+    // ----- Sigma.js (WebGL) engine -----------------------------------------
+    let engineUserOverride = false;
+    let sigmaModules = null;
+
+    async function loadSigma() {
+      if (sigmaModules) return sigmaModules;
+      const [sigmaPkg, graphPkg, fa2Pkg] = await Promise.all([
+        import("https://esm.sh/sigma@3.0.0"),
+        import("https://esm.sh/graphology@0.25.4"),
+        import("https://esm.sh/graphology-layout-forceatlas2@0.10.1"),
+      ]);
+      sigmaModules = {
+        Sigma: sigmaPkg.default || sigmaPkg.Sigma,
+        Graph: graphPkg.default || graphPkg.MultiGraph,
+        forceAtlas2: fa2Pkg.default || fa2Pkg,
+      };
+      return sigmaModules;
+    }
+
+    async function mountSigma() {
+      unmountCanvas();
+      unmountSigma();
+      const { Sigma, Graph, forceAtlas2 } = await loadSigma();
+      const host = $("#graph");
+      // Sigma needs a sized container element it owns; remove the canvas/host children
+      // except for the overlays (controls, legend, loading).
+      let container = document.getElementById("sigma-host");
+      if (!container) {
+        container = document.createElement("div");
+        container.id = "sigma-host";
+        container.style.cssText = "position:absolute;inset:0;";
+        host.insertBefore(container, host.firstChild);
+      }
+
+      const g = new Graph({ multi: true, allowSelfLoops: true });
+      const maxPR = Math.max(0.0001, ...graph.nodes.map(n => n.pagerank || 0));
+      const N = Math.max(1, graph.nodes.length);
+      graph.nodes.forEach((n, i) => {
+        const angle = (i / N) * Math.PI * 2;
+        g.addNode(String(n.id), {
+          label: n.name,
+          file: n.file,
+          kind: n.kind,
+          pagerank: n.pagerank || 0,
+          x: Math.cos(angle) * 100,
+          y: Math.sin(angle) * 100,
+          size: 2 + Math.sqrt((n.pagerank || 0) / maxPR) * 14,
+          color: COLORS[n.kind] || "#888",
+        });
+      });
+      for (const e of graph.edges) {
+        const s = String(e.src), t = String(e.dst);
+        if (g.hasNode(s) && g.hasNode(t)) {
+          g.addEdge(s, t, {
+            kind: e.kind,
+            color: EDGE_COLORS_HEX[e.kind] || "#ffffff10",
+            size: 0.5,
+          });
+        }
+      }
+      // Static FA2 layout — runs once, no worker.
+      try {
+        const settings = forceAtlas2.inferSettings(g);
+        forceAtlas2.assign(g, { iterations: 120, settings });
+      } catch (e) { console.warn("FA2 failed:", e); }
+
+      sigmaInstance = new Sigma(g, container, {
+        renderEdgeLabels: false,
+        defaultEdgeColor: "#ffffff10",
+        labelColor: { color: "#e6e6e6" },
+        labelSize: 11,
+        labelDensity: 0.6,
+        zIndex: true,
+      });
+      sigmaInstance.on("clickNode", ({ node }) => {
+        const id = parseInt(node, 10);
+        const attrs = g.getNodeAttributes(node);
+        select(id, attrs.label);
+        // Highlight: dim everything else
+        sigmaInstance.setSetting("nodeReducer", (n, data) =>
+          n === node ? { ...data, zIndex: 2 } : { ...data, color: data.color + "55", zIndex: 0 }
+        );
+        sigmaInstance.setSetting("edgeReducer", (e, data) => {
+          const ext = g.extremities(e);
+          if (ext[0] === node || ext[1] === node) return { ...data, zIndex: 1 };
+          return { ...data, hidden: true };
+        });
+      });
+      sigmaInstance.on("clickStage", () => {
+        sigmaInstance.setSetting("nodeReducer", null);
+        sigmaInstance.setSetting("edgeReducer", null);
+      });
+    }
+
+    function unmountSigma() {
+      if (sigmaInstance) {
+        try { sigmaInstance.kill(); } catch {}
+        sigmaInstance = null;
+      }
+      const c = document.getElementById("sigma-host");
+      if (c) c.remove();
+    }
+
+    function unmountCanvas() {
+      if (rafId) { cancelAnimationFrame(rafId); rafId = null; }
+      if (canvas && canvas.parentNode) {
+        canvas.parentNode.removeChild(canvas);
+        canvas = null;
+        ctx = null;
+      }
+    }
+
+    async function setEngine(next, skipReload) {
+      if (next === engine && !skipReload) return;
+      engine = next;
+      $("#toggle-engine").textContent = next === "webgl" ? "WebGL" : "Canvas";
+      if (skipReload) return;
+      if (next === "canvas") {
+        unmountSigma();
+        setupCanvas();
+        buildLayout();
+        render();
+        tick();
+      } else {
+        unmountCanvas();
+        await mountSigma();
+      }
     }
 
     function nodeAt(px, py) {
@@ -476,6 +629,11 @@
 
     function setupControls() {
       $("#reset-view").onclick = () => {
+        if (engine === "webgl" && sigmaInstance) {
+          try { sigmaInstance.getCamera().animatedReset(); } catch {}
+          return;
+        }
+        if (!canvas) return;
         viewport.tx = canvas.width / 2;
         viewport.ty = canvas.height / 2;
         viewport.scale = 1;
@@ -486,6 +644,11 @@
         }
       };
       $("#reload-graph").onclick = () => loadGraph();
+      $("#toggle-engine").onclick = () => {
+        engineUserOverride = true;
+        const next = engine === "canvas" ? "webgl" : "canvas";
+        setEngine(next, false);
+      };
     }
 
     setupCanvas();

@@ -21,6 +21,11 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Live graph UI** — single HTML file, force-directed canvas, no npm build.
 - **MCP server** — 6 tight tools, stdio for editors or HTTP for web clients.
 - **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). The "what else will my change break?" answer.
+- **Differentiator MCP tools** — `explore` (multi-hop), `impact_of` (blast radius), `test_impact` (which tests cover this?), and `cypher` (raw read-only graph query). No competitor exposes these.
+- **Personalized PageRank** — `search` ranks results by proximity to the file/symbol the agent is currently editing.
+- **Watcher** — `docgraph watch` auto-reindexes on file changes (Rust `notify` under the hood).
+- **Multi-repo** — `--repo` (repeatable) merges several repos into one graph; cross-repo `IMPORTS` resolve naturally.
+- **WebGL graph** — Sigma.js auto-engages above 2 k nodes.
 
 ## Performance
 
@@ -49,7 +54,8 @@ Requires Python 3.10+. The first run downloads the embedding model (~30 MB BGE-s
 
 | Command | What it does |
 |---|---|
-| `docgraph index [path]` | Parallel index. Incremental by default; `--full` to wipe and rebuild |
+| `docgraph index [path]` | Parallel index. Incremental by default; `--full` to wipe and rebuild. Pass `--repo PATH` (repeatable) for multi-repo. |
+| `docgraph watch [path]` | Auto-reindex on file changes (debounced; respects ignores) |
 | `docgraph serve [path]` | Start the web UI + JSON API on port 5500 |
 | `docgraph mcp [path]` | Run MCP server (stdio default; `--transport http` for HTTP) |
 | `docgraph stats [path]` | Print entity + edge counts |
@@ -82,12 +88,16 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 
 | Tool | What it returns |
 |---|---|
-| `search(query, kind?, limit=10)` | Hybrid vector + name + PageRank ranked results |
+| `search(query, kind?, limit=10, focus_file?, focus_symbol?)` | Hybrid vector + name + PageRank. Pass a focus → personalized PageRank biases ranking toward what the agent is reading |
 | `definition(name, file?)` | Full body + metadata of a symbol |
 | `references(name)` | All callers / usages |
 | `call_graph(name, depth=2)` | Forward + backward call graph (depth 1–5) |
 | `file_map(file)` | Entities + outgoing imports for a file |
 | `neighborhood(name, limit=10)` | PageRank-ranked related code via calls + similarity + tests + inheritance — the "what else should I read?" tool |
+| `explore(seeds, hops=3, limit=25)` | Multi-hop BFS subgraph from one or more seed names. Replaces chained `neighborhood` calls |
+| `impact_of(target, depth=3)` | Blast radius: transitive callers, importers, co-changed files, and tests for a file or symbol |
+| `test_impact(target)` | Tests that exercise `target` (file or symbol) via TESTS + reverse `CALLS*` |
+| `cypher(query, limit=100)` | Read-only Cypher escape hatch for power agents. Rejects writes, caps rows |
 
 ## Relationships extracted
 
@@ -172,13 +182,32 @@ Data lives at `<repo>/.docgraph/`:
 | MCP tools | 6 | 7 | 14 | n/a |
 | Install | `pipx install` | manual | manual | proprietary IDE |
 
+## Multi-repo
+
+```bash
+docgraph index --repo /path/to/repo-b --repo /path/to/repo-c
+docgraph watch       # picks up all repos automatically (persisted in .docgraph/repos.json)
+docgraph serve
+```
+
+In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/src/foo.py`) so they stay unique. Cross-repo `IMPORTS` resolve naturally through the existing fuzzy import matcher.
+
+## Tests
+
+```bash
+pip install pytest
+pytest                   # ~17s (one-time embedder load + 60 tests)
+```
+
+Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (including the cypher write-blocker), multi-repo walking, watch filter logic, and the embedding-text builder.
+
 ## Roadmap
 
+- Precise (compiler-grade) symbol resolution via SCIP / LSP for type-aware `CALLS` (kills hallucinated edges in TS / Java overloads).
+- Optional LLM-generated docstrings at index time (opt-in via API key) — Greptile's recall lift.
+- AST sub-function chunking — multiple embeddings per long function.
 - Pre-download / cache embedding model so cold start is sub-second.
-- Optional `query_graph` MCP tool for raw Cypher (power users).
-- Watcher mode (`docgraph watch`) auto-reindexes on file changes.
-- Cross-repo links for monorepo / multi-repo setups.
-- Sigma.js / Cosmograph backend for >5k node graphs.
+- Watcher → live UI websocket so the graph redraws on reindex.
 
 ## License
 

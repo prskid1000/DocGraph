@@ -66,6 +66,23 @@ def make_app(cfg: Config) -> FastAPI:
     async def api_neighborhood(name: str, limit: int = 10):
         return retriever.neighborhood(name, limit=limit)
 
+    @app.get("/api/explore")
+    async def api_explore(seeds: str, hops: int = 3, limit: int = 25):
+        seed_list = [s.strip() for s in seeds.split(",") if s.strip()]
+        return retriever.explore(seeds=seed_list, hops=hops, limit=limit)
+
+    @app.get("/api/impact_of")
+    async def api_impact_of(target: str, depth: int = 3, limit: int = 50):
+        return retriever.impact_of(target, depth=depth, limit=limit)
+
+    @app.get("/api/test_impact")
+    async def api_test_impact(target: str, limit: int = 25):
+        return retriever.test_impact(target, limit=limit)
+
+    @app.post("/api/cypher")
+    async def api_cypher(payload: dict):
+        return retriever.cypher(payload.get("query", ""), limit=int(payload.get("limit", 100)))
+
     @app.get("/api/graph")
     async def api_graph(limit_nodes: int = 2000):
         return retriever.graph_dump(limit_nodes=limit_nodes)
@@ -81,8 +98,16 @@ def make_app(cfg: Config) -> FastAPI:
 
     @app.get("/api/file_content")
     async def api_file_content(file: str):
-        full = (cfg.repo_root / file).resolve()
-        if not str(full).startswith(str(cfg.repo_root.resolve())):
+        full = cfg.path_for(file).resolve()
+        allowed = False
+        for root, _ in cfg.roots_with_prefix():
+            try:
+                full.relative_to(root.resolve())
+                allowed = True
+                break
+            except ValueError:
+                continue
+        if not allowed:
             raise HTTPException(403, "outside repo")
         if not full.exists():
             raise HTTPException(404)

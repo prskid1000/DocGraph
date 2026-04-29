@@ -286,7 +286,7 @@ DEF_KIND_MAP = {
 }
 
 
-def parse_file(path: Path, repo_root: Path) -> FileParse | None:
+def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> FileParse | None:
     lang_key = detect_language(path)
     if lang_key is None:
         return None
@@ -301,7 +301,7 @@ def parse_file(path: Path, repo_root: Path) -> FileParse | None:
         tree = parser.parse(source)
     except Exception:
         return None
-    rel = str(path.relative_to(repo_root)).replace("\\", "/")
+    rel = rel_override if rel_override is not None else str(path.relative_to(repo_root)).replace("\\", "/")
     lines = source.count(b"\n") + 1
 
     entities: list[Entity] = []

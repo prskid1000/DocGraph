@@ -46,12 +46,24 @@ def version() -> None:
 def index(
     path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
     full: bool = typer.Option(False, "--full", "-f", help="Force full reindex"),
+    repo: list[Path] = typer.Option(
+        None, "--repo", "-r",
+        help="Additional repo root to include (repeatable). Stored in .docgraph/repos.json.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Index a codebase. Incremental by default; pass --full to wipe and rebuild."""
+    """Index a codebase. Incremental by default; pass --full to wipe and rebuild.
+
+    Pass `--repo` (repeatable) to index multiple repos into one graph. The list
+    is persisted; subsequent commands (watch, serve, mcp) will see all repos
+    automatically.
+    """
     _setup_logging(verbose)
-    cfg = load_config(path)
+    cfg = load_config(path, extra_roots=repo if repo else None)
     console.print(f"[cyan]Indexing[/cyan] {cfg.repo_root}")
+    if cfg.extra_roots:
+        for r in cfg.extra_roots:
+            console.print(f"  + {r}")
     console.print(f"  workers: {cfg.workers}  db: {cfg.db_path}")
     db = GraphDB(cfg.db_path, embedding_dim=384)
     db.init_schema()
@@ -61,6 +73,24 @@ def index(
     for k, v in stats.items():
         table.add_row(k, f"{v:.2f}" if isinstance(v, float) else str(v))
     console.print(table)
+
+
+@app.command()
+def watch(
+    path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
+    debounce: int = typer.Option(500, "--debounce", help="Debounce window (ms) before reindex fires"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Watch the repo and incrementally reindex on file changes.
+
+    Holds a writer lock on the DB — kill any `docgraph serve` / `docgraph mcp`
+    processes against the same repo before starting.
+    """
+    _setup_logging(verbose)
+    cfg = load_config(path)
+    console.print(f"[cyan]Watching[/cyan] {cfg.repo_root}  debounce={debounce}ms")
+    from docgraph.watch import watch_repo
+    watch_repo(cfg, debounce_ms=debounce)
 
 
 @app.command()
