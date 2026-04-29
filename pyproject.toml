@@ -1,0 +1,56 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "docgraph"
+version = "2.0.0"
+description = "Local code knowledge graph for LLMs — single-file embedded DB, parallel indexing, live graph UI, MCP server"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "DocGraph" }]
+keywords = ["mcp", "code-intelligence", "knowledge-graph", "tree-sitter", "kuzu"]
+
+dependencies = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "kuzu>=0.7",
+    "tree-sitter>=0.25",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-java",
+    "tree-sitter-go",
+    "tree-sitter-rust",
+    "tree-sitter-c",
+    "tree-sitter-cpp",
+    "tree-sitter-c-sharp",
+    "tree-sitter-ruby",
+    "tree-sitter-php",
+    "tree-sitter-bash",
+    "tree-sitter-html",
+    "tree-sitter-css",
+    "tree-sitter-json",
+    "tree-sitter-yaml",
+    "fastembed>=0.4",
+    "fastmcp>=2.0",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "pathspec>=0.12",
+    "pyarrow>=18.0",
+    "networkx>=3.3",
+    "scipy>=1.13",
+    "pydantic>=2.9",
+    "sse-starlette>=2.1",
+    "orjson>=3.10",
+]
+
+[project.scripts]
+docgraph = "docgraph.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["docgraph"]
+
+[tool.hatch.build.targets.wheel.force-include]
+"docgraph/ui/index.html" = "docgraph/ui/index.html"
