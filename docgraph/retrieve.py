@@ -10,21 +10,57 @@ import re
 
 import numpy as np
 
+from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder
+from docgraph.git_tools import blame_lines, changed_entities, recent_commits
 from docgraph.rank import PersonalizedRanker
+from docgraph.rules import rules_for as _rules_for
 
 
 class Retriever:
-    def __init__(self, db: GraphDB, embedder: Embedder):
+    def __init__(self, db: GraphDB, embedder: Embedder, cfg: Config | None = None):
         self.db = db
         self.embedder = embedder
+        self.cfg = cfg
         self._ranker: PersonalizedRanker | None = None
 
     def _ranker_(self) -> PersonalizedRanker:
         if self._ranker is None:
             self._ranker = PersonalizedRanker(self.db)
         return self._ranker
+
+    def _chunk_max_sims(self, qvec) -> dict[str, float]:
+        """For each parent_qname, the best cosine similarity across its
+        sub-chunks. Empty when no chunks exist."""
+        try:
+            rows = self.db.fetch_all(
+                "MATCH (c:Chunk) RETURN c.parent_qname AS qname, c.embedding AS embedding"
+            )
+        except Exception:
+            return {}
+        if not rows:
+            return {}
+        mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
+        qv = np.array(qvec, dtype=np.float32)
+        qv = qv / (np.linalg.norm(qv) + 1e-9)
+        norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
+        mat = mat / norms
+        sims = (mat @ qv).tolist()
+        out: dict[str, float] = {}
+        for r, s in zip(rows, sims):
+            q = r["qname"]
+            if q not in out or s > out[q]:
+                out[q] = float(s)
+        return out
+
+    def _redact(self, file: str | None, body: str | None, snippet: str | None = None) -> tuple[str | None, str | None]:
+        """Mask body/snippet if the file is AI-blocked. Returns (body, snippet)."""
+        if not file or self.cfg is None:
+            return body, snippet
+        if self.cfg.ai_blocked_logical(file):
+            return "[redacted by .cursorignore]", "[redacted]"
+        return body, snippet
 
     def search(
         self,
@@ -42,6 +78,12 @@ class Retriever:
         labels = ("Function",) if kind == "function" else ("Class",) if kind == "class" else ("Function", "Class")
 
         ppr = self._maybe_ppr(focus_file, focus_symbol)
+
+        # Per-entity max chunk similarity (sub-function chunking lift):
+        # for any qname, the best score across its sub-chunks rivals the
+        # entity-level score so a query that matches a small piece of a
+        # 500-line function still surfaces it.
+        chunk_max = self._chunk_max_sims(self.embedder.embed([query])[0])
 
         for label in labels:
             rows = self.db.fetch_all(
@@ -63,7 +105,12 @@ class Retriever:
                 ppr_boost = ppr.get(r["id"], 0.0) if ppr else 0.0
                 # Use personalized PR when present; fall back to global.
                 rank_term = (ppr_boost * 0.5) if ppr else (pr * 0.1)
-                score = s + name_boost + rank_term
+                # Take max(entity_sim, best_chunk_sim) so long-body entities
+                # don't lose recall when only one section matches the query.
+                best_sim = max(s, chunk_max.get(r["qname"], -1.0))
+                score = best_sim + name_boost + rank_term
+                s = best_sim  # for the returned `score` field below
+                _, snippet = self._redact(r["file"], None, (r["body"] or "")[:300])
                 results.append({
                     "label": label,
                     "id": r["id"],
@@ -71,7 +118,7 @@ class Retriever:
                     "qname": r["qname"],
                     "file": r["file"],
                     "line": r["line_start"],
-                    "snippet": (r["body"] or "")[:300],
+                    "snippet": snippet,
                     "score": float(score),
                     "pagerank": float(pr),
                     "ppr": float(ppr_boost),
@@ -126,6 +173,8 @@ class Retriever:
                 params,
             ):
                 r["label"] = label
+                body, _ = self._redact(r.get("file"), r.get("body"))
+                r["body"] = body
                 rows.append(r)
         return rows
 
@@ -497,6 +546,46 @@ class Retriever:
             return {"rows": self.db.fetch_all(query)[:limit], "rejected": None}
         except Exception as e:  # noqa: BLE001
             return {"rows": [], "rejected": f"query error: {e}"}
+
+    # --- Git-aware retrieval ----------------------------------------------
+
+    def git_changes(self, ref: str | None = None) -> dict:
+        """Diff-aware retrieval. ref:
+          - None    → unstaged + staged working-tree diff
+          - "HEAD"  → last commit
+          - "main"  → branch diff vs main
+          - "<sha>" → that commit
+
+        Returns changed files + entities + the 1-hop callers of changed
+        functions, so the agent gets a 'what's about to break' picture in one
+        call. Mirrors Cursor's @Commit / @Recent Changes / @PR but joined to
+        the graph.
+        """
+        if self.cfg is None:
+            return {"ref": ref, "files": [], "entities": [], "callers_of_changed": [],
+                    "error": "Config not attached to Retriever"}
+        return changed_entities(self.cfg, self.db, ref)
+
+    def git_blame(self, file: str, line_start: int = 1, line_end: int | None = None) -> list[dict]:
+        """`git blame` for a file/line range. Mirrors Cursor Blame."""
+        if self.cfg is None:
+            return []
+        return blame_lines(self.cfg, file, line_start=line_start, line_end=line_end)
+
+    def git_recent(self, file: str | None = None, limit: int = 20) -> list[dict]:
+        """Recent commits, optionally scoped to a file path."""
+        if self.cfg is None:
+            return []
+        return recent_commits(self.cfg, file_path=file, limit=limit)
+
+    # --- Auto-attach rules (.cursor/rules/*.mdc + AGENTS.md / CLAUDE.md) --
+
+    def rules_for(self, file: str) -> list[dict]:
+        """Cursor-rules-compatible auto-attach: return rules whose globs
+        match `file`, plus AGENTS.md / CLAUDE.md as always-apply."""
+        if self.cfg is None:
+            return []
+        return _rules_for(self.cfg, file)
 
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
         nodes: list[dict] = []

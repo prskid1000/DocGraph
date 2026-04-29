@@ -35,7 +35,7 @@ from docgraph.db import GraphDB
 from docgraph.embed import Embedder
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
-from docgraph.summary import build_embedding_text
+from docgraph.summary import build_embedding_text, chunk_body
 
 log = logging.getLogger(__name__)
 
@@ -133,7 +133,7 @@ class Indexer:
     def _seed_ids_from_db(self) -> None:
         """Continue allocating after the max id currently in the DB."""
         max_id = 0
-        for label in ("File", "Module", "Class", "Function", "Variable"):
+        for label in ("File", "Module", "Class", "Function", "Variable", "Chunk"):
             try:
                 rows = self.db.fetch_all(f"MATCH (n:{label}) RETURN max(n.id) AS m")
                 m = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
@@ -159,6 +159,14 @@ class Indexer:
                 f"MATCH (n:{label}) WHERE n.file IN $files DETACH DELETE n",
                 {"files": files},
             )
+        # Sub-function chunks (separate node table; not auto-cascaded)
+        try:
+            self.db.execute(
+                "MATCH (n:Chunk) WHERE n.file IN $files DETACH DELETE n",
+                {"files": files},
+            )
+        except Exception:
+            pass
         # Then delete File nodes
         self.db.execute(
             "MATCH (n:File) WHERE n.path IN $files DETACH DELETE n",
@@ -376,15 +384,58 @@ class Indexer:
             for r in function_rows:
                 r["embedding"] = vec_by_id.get(("Function", r["id"]), [0.0] * self.embedder.dim)
 
+        # ---- Step 5b: build sub-chunks for long entities ----
+        chunk_rows: list[dict] = []
+        chunk_contains_func: list[dict] = []
+        chunk_contains_class: list[dict] = []
+        # Walk parsed entities + use the freshly-assigned ids stored on ent.extra
+        for rel, fp in parsed.items():
+            for ent in fp.entities:
+                eid = ent.extra.get("_id") if isinstance(ent.extra, dict) else None
+                if eid is None:
+                    continue
+                if ent.kind not in ("function", "method", "class", "interface"):
+                    continue
+                pieces = chunk_body(ent.body or "")
+                if not pieces:
+                    continue
+                parent_label = "Class" if ent.kind in ("class", "interface") else "Function"
+                for idx, piece in enumerate(pieces):
+                    cid = self._new_id()
+                    chunk_rows.append({
+                        "id": cid,
+                        "parent_qname": ent.qname,
+                        "parent_label": parent_label,
+                        "file": rel,
+                        "idx": idx,
+                        "body": piece[:6000],
+                        "embedding": [0.0] * self.embedder.dim,
+                    })
+                    if parent_label == "Function":
+                        chunk_contains_func.append({"from_id": eid, "to_id": cid})
+                    else:
+                        chunk_contains_class.append({"from_id": eid, "to_id": cid})
+
+        # Embed all chunks in one batch
+        if chunk_rows:
+            chunk_texts = [r["body"] for r in chunk_rows]
+            chunk_vecs = self.embedder.embed(chunk_texts, batch_size=self.cfg.embed_batch_size)
+            for r, v in zip(chunk_rows, chunk_vecs):
+                r["embedding"] = v
+
         # ---- Step 6: write new nodes ----
         log.info(
             f"Writing {len(file_rows)} files, {len(class_rows)} classes, "
-            f"{len(function_rows)} functions, {len(variable_rows)} variables"
+            f"{len(function_rows)} functions, {len(variable_rows)} variables, "
+            f"{len(chunk_rows)} chunks"
         )
         self.db.insert_nodes("File", file_rows)
         self.db.insert_nodes("Class", class_rows)
         self.db.insert_nodes("Function", function_rows)
         self.db.insert_nodes("Variable", variable_rows)
+        self.db.insert_nodes("Chunk", chunk_rows)
+        self.db.insert_edges("CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func)
+        self.db.insert_edges("CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class)
 
         # ---- Step 7: build full symbol table from DB ----
         # qname → (label, id); name → list[(label, id, file)]

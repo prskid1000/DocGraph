@@ -56,23 +56,54 @@ class Config:
     co_change_window: int = 200  # last N commits scanned for CO_CHANGED_WITH
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
+    ai_block_specs: dict[Path, pathspec.PathSpec] = field(init=False)
+    ai_block_spec: pathspec.PathSpec = field(init=False)
 
     def __post_init__(self) -> None:
+        # Two-tier ignore (Cursor parity):
+        #   - INDEX-EXCLUDE patterns: skip during walk entirely. Sources:
+        #       DEFAULT_IGNORES, .gitignore, .docgraphignore, .cursorindexingignore
+        #   - AI-BLOCK patterns: file is indexed (graph still includes File node)
+        #       but search/definition results are masked. Source: .cursorignore
         self.ignore_specs = {}
+        self.ai_block_specs = {}
         for root in [self.repo_root, *self.extra_roots]:
-            patterns = list(DEFAULT_IGNORES)
-            gi = root / ".gitignore"
-            if gi.exists():
-                patterns.extend(gi.read_text(encoding="utf-8", errors="ignore").splitlines())
-            dgi = root / ".docgraphignore"
-            if dgi.exists():
-                patterns.extend(dgi.read_text(encoding="utf-8", errors="ignore").splitlines())
-            self.ignore_specs[root] = pathspec.PathSpec.from_lines("gitwildmatch", patterns)
+            index_patterns = list(DEFAULT_IGNORES)
+            for fname in (".gitignore", ".docgraphignore", ".cursorindexingignore"):
+                p = root / fname
+                if p.exists():
+                    index_patterns.extend(p.read_text(encoding="utf-8", errors="ignore").splitlines())
+            self.ignore_specs[root] = pathspec.PathSpec.from_lines("gitwildmatch", index_patterns)
+
+            ai_block_patterns: list[str] = []
+            ci = root / ".cursorignore"
+            if ci.exists():
+                ai_block_patterns.extend(ci.read_text(encoding="utf-8", errors="ignore").splitlines())
+            self.ai_block_specs[root] = pathspec.PathSpec.from_lines("gitwildmatch", ai_block_patterns)
         self.ignore_spec = self.ignore_specs[self.repo_root]
+        self.ai_block_spec = self.ai_block_specs[self.repo_root]
 
     def is_ignored(self, rel_path: str, root: Path | None = None) -> bool:
+        """Should we exclude this path from indexing entirely?"""
         spec = self.ignore_specs[root] if root is not None else self.ignore_spec
         return spec.match_file(rel_path)
+
+    def is_ai_blocked(self, rel_path: str, root: Path | None = None) -> bool:
+        """Should we mask this path from AI / search results? (.cursorignore)
+        Indexed but redacted — the graph still knows it exists but body and
+        snippets are stripped before returning to the agent."""
+        spec = self.ai_block_specs[root] if root is not None else self.ai_block_spec
+        return spec.match_file(rel_path)
+
+    def ai_blocked_logical(self, logical_rel: str) -> bool:
+        """Same check, but resolves `<repo>/...` prefixed paths against the
+        right root in multi-repo mode."""
+        for root, prefix in self.roots_with_prefix():
+            if prefix == "":
+                return self.is_ai_blocked(logical_rel, root=root)
+            if logical_rel.startswith(prefix):
+                return self.is_ai_blocked(logical_rel[len(prefix):], root=root)
+        return False
 
     def roots_with_prefix(self) -> list[tuple[Path, str]]:
         """Return [(absolute_root, logical_path_prefix)]. Prefix is empty when single-repo;

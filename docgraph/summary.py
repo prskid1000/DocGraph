@@ -99,6 +99,44 @@ def smart_body_sample(body: str) -> str:
     return body[:RAW_BODY_HEAD] + "\n…\n" + body[-RAW_BODY_TAIL:]
 
 
+CHUNK_MIN_BODY_CHARS = 1500   # below this, no sub-chunks created
+CHUNK_TARGET_CHARS = 700      # target size of each chunk
+CHUNK_OVERLAP_CHARS = 80      # overlap between adjacent chunks (preserves cross-chunk context)
+
+
+def chunk_body(body: str) -> list[str]:
+    """Split a long body into ~CHUNK_TARGET_CHARS chunks aligned to line
+    boundaries. Returns [] if the body is short enough that one embedding
+    is sufficient."""
+    if len(body) < CHUNK_MIN_BODY_CHARS:
+        return []
+    lines = body.splitlines(keepends=True)
+    chunks: list[str] = []
+    cur: list[str] = []
+    cur_len = 0
+    for ln in lines:
+        cur.append(ln)
+        cur_len += len(ln)
+        if cur_len >= CHUNK_TARGET_CHARS:
+            chunks.append("".join(cur))
+            # Overlap: rewind a bit so the next chunk starts in mid-context.
+            overlap_lines: list[str] = []
+            overlap_len = 0
+            for back in reversed(cur):
+                if overlap_len >= CHUNK_OVERLAP_CHARS:
+                    break
+                overlap_lines.insert(0, back)
+                overlap_len += len(back)
+            cur = list(overlap_lines)
+            cur_len = overlap_len
+    if cur and (not chunks or "".join(cur) != chunks[-1]):
+        tail = "".join(cur)
+        # Skip if tail is just the overlap of the last chunk (i.e. no new content)
+        if not chunks or tail.strip() != chunks[-1][-len(tail):].strip():
+            chunks.append(tail)
+    return [c for c in chunks if c.strip()]
+
+
 def build_embedding_text(
     name: str,
     qname: str,

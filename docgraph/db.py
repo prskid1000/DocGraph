@@ -66,6 +66,20 @@ NODE_DDL = [
         scope STRING,
         PRIMARY KEY (id)
     )""",
+    # Sub-function chunks. Long entity bodies get split into sub-chunks so
+    # semantic search has finer recall than one-vector-per-1000-line-class.
+    # parent_qname / parent_label / file kept on each chunk so incremental
+    # delete-by-file works the same way as for entities.
+    """CREATE NODE TABLE IF NOT EXISTS Chunk(
+        id INT64,
+        parent_qname STRING,
+        parent_label STRING,
+        file STRING,
+        idx INT64,
+        body STRING,
+        embedding DOUBLE[384],
+        PRIMARY KEY (id)
+    )""",
 ]
 
 # Edge tables — Kuzu requires explicit FROM/TO node tables. We declare the
@@ -89,6 +103,7 @@ EDGE_DDL = [
     "CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(FROM Function TO Function, FROM Class TO Class, score DOUBLE)",
     "CREATE REL TABLE IF NOT EXISTS CO_CHANGED_WITH(FROM File TO File, count INT64)",
     "CREATE REL TABLE IF NOT EXISTS TESTS(FROM Function TO Function, FROM Function TO Class)",
+    "CREATE REL TABLE IF NOT EXISTS CONTAINS_CHUNK(FROM Function TO Chunk, FROM Class TO Chunk)",
 ]
 
 

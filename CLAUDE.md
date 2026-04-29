@@ -28,9 +28,11 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/db.py` | Kuzu schema + bulk insert helpers. |
 | `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). |
 | `docgraph/rank.py` | NetworkX PageRank + `PersonalizedRanker` (query-time personalized PR with cached graph). |
-| `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher`. **All Cypher lives here or in `db.py`.** |
+| `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher` / `git_*` / `rules_for`. **All Cypher lives here or in `db.py`.** |
+| `docgraph/git_tools.py` | `git diff` / `blame` / `log` shell-outs, joined to graph entities. |
+| `docgraph/rules.py` | Parses `.cursor/rules/*.mdc` + `AGENTS.md` / `CLAUDE.md`; glob-matches per file. |
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. |
-| `docgraph/mcp_tools.py` | 10 MCP tools (6 base + 4 differentiators). Keep this surface tight. |
+| `docgraph/mcp_tools.py` | 14 MCP tools (6 base + 8 differentiators). Keep this surface tight. |
 | `docgraph/server.py` | FastAPI: web UI + JSON API. |
 | `docgraph/ui/index.html` | Single-page graph viewer. Canvas + Sigma.js (lazy-loaded from esm.sh, auto-engages > 2 k nodes). |
 
@@ -117,6 +119,10 @@ Differentiators (the wedge against Cursor / Greptile / Sourcegraph):
 - `impact_of(target, depth)` — blast radius of a file or symbol: callers + importers + co-changed files + tests.
 - `test_impact(target)` — tests that exercise this code via `TESTS` edges + reverse `CALLS*`.
 - `cypher(query, limit)` — read-only Cypher escape hatch. Rejects writes (CREATE/MERGE/SET/DELETE/...). Lets agents author their own graph queries.
+- `git_changes(ref)` — diff-aware retrieval. Working tree / `HEAD` / `main` / SHA. Returns changed files + entities + 1-hop callers — Cursor's `@Commit` joined to the graph in one call.
+- `git_blame(file, line_start, line_end?)` — Cursor Blame parity.
+- `git_recent(file?, limit)` — recent commits scoped to a file or repo.
+- `rules_for(file)` — Cursor-rules ecosystem compatibility: matches `.cursor/rules/*.mdc` by glob plus `AGENTS.md` / `CLAUDE.md` always-on.
 
 Don't add more without a strong reason. `search` accepts `focus_file` / `focus_symbol` for personalized PageRank — prefer threading those through over adding new tools.
 
@@ -127,6 +133,22 @@ Don't add more without a strong reason. `search` accepts `focus_file` / `focus_s
 ## Watch mode
 
 `docgraph watch` opens a writer connection for its lifetime — kill `serve` / `mcp` against the same DB first. Pre-debounce filter (`_WatchFilter`) drops ignored / unsupported-language paths *before* watchfiles emits them so `git checkout` of `node_modules` doesn't fire 5 k events.
+
+## Two-tier ignore
+
+Cursor parity:
+- `.cursorindexingignore` (or `.gitignore` / `.docgraphignore`) → file is **excluded from the index entirely**. The graph never sees it.
+- `.cursorignore` → file is **indexed but redacted**. Graph node still exists; `search`/`definition`/`api/file_content` mask `body`/`snippet`/content with `[redacted by .cursorignore]` so the agent can know "this exists" without reading it.
+
+`Config.is_ignored()` checks tier 1; `Config.is_ai_blocked()` and `Config.ai_blocked_logical()` check tier 2. Multi-repo callers use `ai_blocked_logical()` to handle prefixed paths.
+
+## Sub-function chunking
+
+`summary.chunk_body()` splits an entity body > 1500 chars into ~700-char overlapping chunks aligned to line boundaries. Stored as separate `Chunk` nodes (`parent_qname`, `parent_label`, `file`, `idx`, `embedding`) with `CONTAINS_CHUNK` edges from the parent.
+
+`Retriever._chunk_max_sims()` runs the query embedding against ALL chunk vectors once per search call and pools by parent_qname. The score for a parent entity = `max(entity_sim, best_chunk_sim)`. Cheap because there are typically <500 chunks per repo and one matmul handles them all.
+
+Incremental delete: `_delete_files_from_db()` includes a `MATCH (n:Chunk) WHERE n.file IN $files DETACH DELETE n` step before file nodes go.
 
 ## UI engines
 

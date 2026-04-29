@@ -23,7 +23,7 @@ def make_mcp(cfg: Config) -> FastMCP:
     mcp: FastMCP = FastMCP(name="docgraph")
     db = GraphDB(cfg.db_path, read_only=True)
     embedder = Embedder(cfg.embedding_model)
-    retriever = Retriever(db, embedder)
+    retriever = Retriever(db, embedder, cfg=cfg)
 
     @mcp.tool()
     def search(
@@ -92,6 +92,32 @@ def make_mcp(cfg: Config) -> FastMCP:
         TESTS edges with transitive CALLS reverse traversal from test
         functions."""
         return retriever.test_impact(target, limit=limit)
+
+    @mcp.tool()
+    def git_changes(ref: str | None = None) -> dict:
+        """Files + entities touched by a git diff, plus 1-hop callers of the
+        changed functions. ref: None (working tree), 'HEAD' (last commit),
+        'main' (branch vs main), or a commit SHA. Use this to scope a code
+        review, debug 'what did I break?', or surface PR context."""
+        return retriever.git_changes(ref=ref)
+
+    @mcp.tool()
+    def git_blame(file: str, line_start: int = 1, line_end: int | None = None) -> list[dict]:
+        """`git blame` for a file or line range. Returns commit + author +
+        date per line. Mirrors Cursor Blame."""
+        return retriever.git_blame(file, line_start=line_start, line_end=line_end)
+
+    @mcp.tool()
+    def git_recent(file: str | None = None, limit: int = 20) -> list[dict]:
+        """Recent commits across the repo or scoped to one file."""
+        return retriever.git_recent(file=file, limit=limit)
+
+    @mcp.tool()
+    def rules_for(file: str) -> list[dict]:
+        """Auto-attach rules for `file`: matches .cursor/rules/*.mdc by glob,
+        plus AGENTS.md / CLAUDE.md as always-on. Compatible with the Cursor
+        Rules ecosystem — drop in existing .mdc files and they work here."""
+        return retriever.rules_for(file)
 
     @mcp.tool()
     def cypher(query: str, limit: int = 100) -> dict:

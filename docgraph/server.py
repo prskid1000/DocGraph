@@ -34,7 +34,7 @@ def make_app(cfg: Config) -> FastAPI:
 
     db = GraphDB(cfg.db_path, read_only=True)
     embedder = Embedder(cfg.embedding_model)
-    retriever = Retriever(db, embedder)
+    retriever = Retriever(db, embedder, cfg=cfg)
 
     # --- UI ---
     @app.get("/", response_class=HTMLResponse)
@@ -83,6 +83,22 @@ def make_app(cfg: Config) -> FastAPI:
     async def api_cypher(payload: dict):
         return retriever.cypher(payload.get("query", ""), limit=int(payload.get("limit", 100)))
 
+    @app.get("/api/git_changes")
+    async def api_git_changes(ref: str | None = None):
+        return retriever.git_changes(ref=ref)
+
+    @app.get("/api/git_blame")
+    async def api_git_blame(file: str, line_start: int = 1, line_end: int | None = None):
+        return retriever.git_blame(file, line_start=line_start, line_end=line_end)
+
+    @app.get("/api/git_recent")
+    async def api_git_recent(file: str | None = None, limit: int = 20):
+        return retriever.git_recent(file=file, limit=limit)
+
+    @app.get("/api/rules_for")
+    async def api_rules_for(file: str):
+        return retriever.rules_for(file)
+
     @app.get("/api/graph")
     async def api_graph(limit_nodes: int = 2000):
         return retriever.graph_dump(limit_nodes=limit_nodes)
@@ -111,6 +127,8 @@ def make_app(cfg: Config) -> FastAPI:
             raise HTTPException(403, "outside repo")
         if not full.exists():
             raise HTTPException(404)
+        if cfg.ai_blocked_logical(file):
+            return {"file": file, "content": "[redacted by .cursorignore]", "redacted": True}
         return {"file": file, "content": full.read_text(encoding="utf-8", errors="replace")}
 
     return app

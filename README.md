@@ -26,6 +26,10 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Watcher** — `docgraph watch` auto-reindexes on file changes (Rust `notify` under the hood).
 - **Multi-repo** — `--repo` (repeatable) merges several repos into one graph; cross-repo `IMPORTS` resolve naturally.
 - **WebGL graph** — Sigma.js auto-engages above 2 k nodes.
+- **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)` so any MCP client gets glob-matched auto-attach.
+- **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI.
+- **Diff-aware retrieval** — `git_changes` returns changed entities plus 1-hop callers in one call. Cursor's `@Commit` joined to the graph.
+- **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
 
 ## Performance
 
@@ -98,6 +102,10 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 | `impact_of(target, depth=3)` | Blast radius: transitive callers, importers, co-changed files, and tests for a file or symbol |
 | `test_impact(target)` | Tests that exercise `target` (file or symbol) via TESTS + reverse `CALLS*` |
 | `cypher(query, limit=100)` | Read-only Cypher escape hatch for power agents. Rejects writes, caps rows |
+| `git_changes(ref?)` | Diff-aware retrieval. `ref`: None (working tree), `HEAD`, `main` (branch vs main), `<sha>`. Returns files + entities + 1-hop callers. Mirrors Cursor `@Commit` / `@PR` / `@Recent Changes` |
+| `git_blame(file, line_start, line_end?)` | `git blame` per line. Mirrors Cursor Blame |
+| `git_recent(file?, limit=20)` | Recent commits, optionally scoped to a file |
+| `rules_for(file)` | Auto-attach rules for a file: matches `.cursor/rules/*.mdc` by glob, plus `AGENTS.md` / `CLAUDE.md` always-on. Drop in existing Cursor `.mdc` rules and they work here |
 
 ## Relationships extracted
 
@@ -166,7 +174,11 @@ Data lives at `<repo>/.docgraph/`:
 | `GET /api/neighborhood?name=...&limit=10` | |
 | `GET /api/graph?limit_nodes=2000` | All nodes + edges for the viewer |
 | `GET /api/stats` | Entity counts + table list |
-| `GET /api/file_content?file=...` | Source text for inspection (sandboxed to repo root) |
+| `GET /api/file_content?file=...` | Source text for inspection (sandboxed to repo root; redacts `.cursorignore`'d files) |
+| `GET /api/git_changes?ref=...` | Diff-aware retrieval |
+| `GET /api/git_blame?file=...&line_start=&line_end=` | `git blame` |
+| `GET /api/git_recent?file=...&limit=` | Recent commits |
+| `GET /api/rules_for?file=...` | Auto-attach rules matching the file |
 
 ## Comparison
 

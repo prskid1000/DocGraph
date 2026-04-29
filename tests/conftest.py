@@ -103,6 +103,58 @@ REPO_FILES: dict[str, str] = {
             from src.utils import slugify
             assert slugify("Hello World") == "hello-world"
         ''').strip(),
+    # A deliberately long function (>1500 chars body) so chunking kicks in.
+    "src/big.py": textwrap.dedent('''
+        """A module with a long function for chunking tests."""
+
+
+        def process_pipeline(records):
+            """Run a 5-stage data pipeline on the input records.
+
+            Stages: validate, normalize, enrich, transform, persist.
+            Each stage is documented inline below.
+            """
+            # ============= STAGE 1: validate =============
+            validated = []
+            for rec in records:
+                if not isinstance(rec, dict):
+                    continue
+                if "id" not in rec:
+                    continue
+                if not rec.get("name"):
+                    continue
+                validated.append(rec)
+            # ============= STAGE 2: normalize =============
+            normalized = []
+            for rec in validated:
+                rec = dict(rec)
+                rec["name"] = rec["name"].strip().lower()
+                rec.setdefault("tags", [])
+                rec["tags"] = [t.strip().lower() for t in rec["tags"]]
+                normalized.append(rec)
+            # ============= STAGE 3: enrich =============
+            enriched = []
+            for rec in normalized:
+                rec = dict(rec)
+                rec["enriched_at"] = "2024-01-01"
+                rec["region"] = rec.get("region", "global")
+                rec["score"] = sum(len(t) for t in rec["tags"])
+                enriched.append(rec)
+            # ============= STAGE 4: transform =============
+            transformed = []
+            for rec in enriched:
+                rec = dict(rec)
+                rec["display_name"] = rec["name"].title()
+                rec["category"] = "low" if rec["score"] < 5 else "high"
+                transformed.append(rec)
+            # ============= STAGE 5: persist =============
+            persisted = []
+            for rec in transformed:
+                # Pretend to write to a database here
+                rec["persisted"] = True
+                persisted.append(rec)
+            return persisted
+    ''').strip(),
 }
 
 
