@@ -12,28 +12,44 @@ docgraph mcp             # stdio MCP for Cursor / Claude Desktop
 
 ## Why
 
-Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a vector DB + a separate UI app) or a thin keyword search. DocGraph keeps everything in one Python package backed by one file:
+Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a vector DB + a separate UI app) or a thin keyword search. DocGraph keeps everything in one Python package backed by one file.
+
+### Architecture
 
 - **One file embedded DB** (Kuzu) — graph + vectors, no servers.
 - **165+ languages** out of the box via tree-sitter (just install more `tree-sitter-*` packages).
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
-- **Per-file delta updates** — sub-second on edits, 0ms on no-op runs.
-- **Live graph UI** — single HTML file, force-directed canvas, no npm build.
-- **MCP server** — 15 tools (6 base + 9 differentiators), stdio for editors or HTTP for web clients.
+- **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
+- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-docstrings` (you supply the local server).
+
+### Retrieval
+
+- **MCP server** — 15 tools (6 base + 9 differentiators). Two transports: `stdio` for editors (Cursor / Claude Desktop) and `http` for web clients (`docgraph mcp --transport http`).
 - **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). The "what else will my change break?" answer.
-- **Differentiator MCP tools** — `explore` (multi-hop), `impact_of` (blast radius), `test_impact` (which tests cover this?), and `cypher` (raw read-only graph query). No competitor exposes these.
-- **Personalized PageRank** — `search` ranks results by proximity to the file/symbol the agent is currently editing.
-- **Watcher** — `docgraph watch` auto-reindexes on file changes (Rust `notify` under the hood). With `--serve`, watcher + web UI run in one process and the browser auto-redraws on every reindex via Server-Sent Events.
-- **Multi-repo** — `--repo` (repeatable) merges several repos into one graph; cross-repo `IMPORTS` resolve naturally.
-- **WebGL graph** — Sigma.js auto-engages above 2 k nodes.
-- **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)` so any MCP client gets glob-matched auto-attach.
-- **Smart default ignores** — universal baseline (Cursor-parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs (`target/`, `build/`, `bin/`, `obj/`) only ignored when their marker file is detected.
-- **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI.
-- **Diff-aware retrieval** — `git_changes` returns changed entities plus 1-hop callers in one call. Cursor's `@Commit` joined to the graph.
-- **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
+- **Differentiator MCP tools** — `explore` (multi-hop BFS), `impact_of` (blast radius), `test_impact` (which tests cover this?), and `cypher` (raw read-only graph query — rejects `CREATE` / `MERGE` / `SET` / `DELETE` / `DROP` server-side, so agents can't accidentally mutate the graph).
+- **Personalized PageRank** — `search` accepts `focus_file` / `focus_symbol` and ranks results by proximity to the file or symbol the agent is currently editing.
 - **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (still local, still ONNX).
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
-- **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them.
+- **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
+- **Diff- and history-aware tools** — `git_changes` (changed entities + 1-hop callers — Cursor `@Commit` joined to the graph), `git_blame` (line-range blame — Cursor `@Blame` parity), `git_recent` (last N commits scoped to a file or repo).
+
+### Watcher + UI
+
+- **Live graph UI** — single HTML file, force-directed canvas, no npm build. Sigma.js WebGL engine auto-engages above 2 k nodes.
+- **Watcher** — `docgraph watch` auto-reindexes on file changes (Rust `notify` under the hood, debounced).
+- **Live UI auto-redraw** — `docgraph watch --serve` runs the watcher and the web server in **one process** so they share the Kuzu file lock. After every reindex the browser refreshes itself via Server-Sent Events at `/api/events` — no F5, no polling.
+- **ML-training-style progress bars** — every index phase (parse, embed entities, embed chunks, write nodes, build symbol table, resolve edges, `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, PageRank, persist) reports `% | M/N | elapsed | ETA`. Same bars in `docgraph docs add`.
+
+### Multi-repo + ignores
+
+- **Multi-repo** — `--repo` (repeatable) merges several repos into one graph; cross-repo `IMPORTS` resolve naturally. List persisted in `.docgraph/repos.json`.
+- **Smart default ignores** — universal baseline (Cursor-parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs (`target/`, `build/`, `bin/`, `obj/`) only ignored when their marker file is detected.
+- **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI. The HTTP API also sandboxes `/api/file_content` to the repo root (403 on traversal) and redacts `.cursorignore`'d files.
+- **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)` so any MCP client gets glob-matched auto-attach.
+
+### Optional augmentation
+
+- **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent (re-ingesting a URL replaces prior chunks).
 - **Optional LLM-augmented docstrings** — opt-in via `--llm-docstrings`; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). One-sentence summaries for entities lacking native docs lift retrieval recall on under-documented codebases. Cached by body hash so incrementals stay fast.
 
 ## Performance
