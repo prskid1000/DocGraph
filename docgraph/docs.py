@@ -15,10 +15,15 @@ import urllib.request
 from html.parser import HTMLParser
 from urllib.parse import urlparse
 
+from rich.console import Console
+
 from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder
+from docgraph.index import _bar
 from docgraph.summary import chunk_body
+
+_console = Console()
 
 log = logging.getLogger(__name__)
 
@@ -143,7 +148,8 @@ def chunk_doc(text: str) -> list[str]:
 def add_doc(cfg: Config, url: str) -> dict:
     """Fetch `url`, chunk, embed, write Doc rows. Replaces any existing Doc
     rows for the same source URL (so re-running is idempotent)."""
-    title, text = fetch_url(url)
+    with _console.status(f"[cyan]Fetching[/] {url}"):
+        title, text = fetch_url(url)
     if not text.strip():
         return {"url": url, "chunks": 0, "title": title, "error": "empty body"}
 
@@ -158,7 +164,13 @@ def add_doc(cfg: Config, url: str) -> dict:
 
     pieces = chunk_doc(text)
     embedder = Embedder(cfg.embedding_model)
-    vecs = embedder.embed(pieces, batch_size=cfg.embed_batch_size)
+    with _bar() as prog:
+        task = prog.add_task(f"Embedding doc chunks ({title or url})", total=len(pieces))
+        vecs = embedder.embed(
+            pieces,
+            batch_size=cfg.embed_batch_size,
+            on_progress=lambda n: prog.advance(task, n),
+        )
 
     # Continue id allocation past max(id) across all node tables
     max_id = 0

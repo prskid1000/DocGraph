@@ -25,10 +25,28 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Callable
 
+from rich.console import Console
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
-    TextColumn, TimeElapsedColumn,
+    TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn,
 )
+
+_console = Console()
+
+
+def _bar() -> Progress:
+    """ML-training-style progress bar: spinner + desc + bar + % + M/N + elapsed + ETA."""
+    return Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(bar_width=None),
+        TaskProgressColumn(),
+        MofNCompleteColumn(),
+        TextColumn("|"),
+        TimeElapsedColumn(),
+        TextColumn("|"),
+        TimeRemainingColumn(),
+    )
 
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB
@@ -198,9 +216,11 @@ class Indexer:
                 changed.append((path, rel))
 
         deleted_rels = [rel for rel in cache.keys() if rel not in on_disk_rel]
-        log.info(
-            f"{len(on_disk_rel)} files: {len(changed)} changed/added, "
-            f"{len(deleted_rels)} deleted, {len(unchanged_rels)} unchanged"
+        _console.print(
+            f"[cyan]Scanning[/]: {len(on_disk_rel)} files — "
+            f"[green]{len(changed)}[/] changed/added, "
+            f"[red]{len(deleted_rels)}[/] deleted, "
+            f"[dim]{len(unchanged_rels)}[/] unchanged"
         )
 
         # No changes: bail
@@ -232,14 +252,8 @@ class Indexer:
         parsed: dict[str, FileParse] = {}
         errors: list[str] = []
         if changed:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("[progress.description]{task.description}"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-            ) as prog:
-                ptask = prog.add_task("Parsing", total=len(changed))
+            with _bar() as prog:
+                ptask = prog.add_task("Parsing files", total=len(changed))
                 # parse worker receives (absolute_path, owning_root, logical_rel)
                 args_iter = []
                 roots = self.cfg.roots_with_prefix()
@@ -363,19 +377,13 @@ class Indexer:
 
         # ---- Step 5: embed new entities ----
         if new_embed_targets:
-            with Progress(
-                SpinnerColumn(),
-                TextColumn("Embedding"),
-                BarColumn(),
-                MofNCompleteColumn(),
-                TimeElapsedColumn(),
-            ) as prog:
-                etask = prog.add_task("Embedding", total=len(new_embed_targets))
+            with _bar() as prog:
+                etask = prog.add_task("Embedding entities", total=len(new_embed_targets))
                 vectors = self.embedder.embed(
                     [t[2] for t in new_embed_targets],
                     batch_size=self.cfg.embed_batch_size,
+                    on_progress=lambda n: prog.advance(etask, n),
                 )
-                prog.advance(etask, len(new_embed_targets))
             vec_by_id: dict[tuple[str, int], list[float]] = {}
             for (label, eid, _), vec in zip(new_embed_targets, vectors):
                 vec_by_id[(label, eid)] = vec
@@ -419,29 +427,37 @@ class Indexer:
         # Embed all chunks in one batch
         if chunk_rows:
             chunk_texts = [r["body"] for r in chunk_rows]
-            chunk_vecs = self.embedder.embed(chunk_texts, batch_size=self.cfg.embed_batch_size)
+            with _bar() as prog:
+                ctask = prog.add_task("Embedding chunks", total=len(chunk_texts))
+                chunk_vecs = self.embedder.embed(
+                    chunk_texts,
+                    batch_size=self.cfg.embed_batch_size,
+                    on_progress=lambda n: prog.advance(ctask, n),
+                )
             for r, v in zip(chunk_rows, chunk_vecs):
                 r["embedding"] = v
 
         # ---- Step 6: write new nodes ----
-        log.info(
-            f"Writing {len(file_rows)} files, {len(class_rows)} classes, "
+        with _console.status(
+            f"[cyan]Writing[/] {len(file_rows)} files, {len(class_rows)} classes, "
             f"{len(function_rows)} functions, {len(variable_rows)} variables, "
             f"{len(chunk_rows)} chunks"
-        )
-        self.db.insert_nodes("File", file_rows)
-        self.db.insert_nodes("Class", class_rows)
-        self.db.insert_nodes("Function", function_rows)
-        self.db.insert_nodes("Variable", variable_rows)
-        self.db.insert_nodes("Chunk", chunk_rows)
-        self.db.insert_edges("CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func)
-        self.db.insert_edges("CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class)
+        ):
+            self.db.insert_nodes("File", file_rows)
+            self.db.insert_nodes("Class", class_rows)
+            self.db.insert_nodes("Function", function_rows)
+            self.db.insert_nodes("Variable", variable_rows)
+            self.db.insert_nodes("Chunk", chunk_rows)
+            self.db.insert_edges("CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func)
+            self.db.insert_edges("CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class)
 
         # ---- Step 7: build full symbol table from DB ----
         # qname → (label, id); name → list[(label, id, file)]
         qname_index: dict[str, tuple[str, int]] = {}
         name_index: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
         file_index: dict[str, int] = {}
+        symtab_status = _console.status("[cyan]Building symbol table[/]")
+        symtab_status.start()
         for label in ("Function", "Class", "Variable"):
             for r in self.db.fetch_all(
                 f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, "
@@ -503,9 +519,13 @@ class Indexer:
                     pool = pref
             return pool[0]
 
+        symtab_status.stop()
+
         # ---- Step 8: re-resolve and write edges ----
         # Combine RawEdges from cache (covers both unchanged and just-parsed files).
         # For each edge, decide if it needs DB insertion.
+        edges_status = _console.status("[cyan]Resolving and writing edges[/]")
+        edges_status.start()
         contains_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         calls_rows: list[dict] = []
         inst_rows: list[dict] = []
@@ -639,6 +659,7 @@ class Indexer:
         self.db.insert_edges("DECORATED_BY", "Class", "Function", decorated_class_rows)
         self.db.insert_edges("IMPORTS", "File", "File", imports_file_rows)
         self.db.insert_edges("IMPORTS", "File", "Module", imports_module_rows)
+        edges_status.stop()
 
         # ---- Step 9: Tier 4 + PageRank (always recomputed; cheap and global) ----
         # Wipe and rebuild SIMILAR_TO and CO_CHANGED_WITH; PageRank too.
@@ -649,50 +670,56 @@ class Indexer:
         except Exception:
             pass
 
-        # Re-pull current Function/Class rows for similarity
-        log.info("Computing SIMILAR_TO edges...")
-        sim_rows = self.db.fetch_all(
-            "MATCH (n:Function) RETURN n.id AS id, n.embedding AS embedding"
-        )
-        self._write_similar_edges(sim_rows, "Function")
-        sim_rows = self.db.fetch_all(
-            "MATCH (n:Class) RETURN n.id AS id, n.embedding AS embedding"
-        )
-        self._write_similar_edges(sim_rows, "Class")
+        with _console.status("[cyan]Computing SIMILAR_TO edges (functions)[/]"):
+            sim_rows = self.db.fetch_all(
+                "MATCH (n:Function) RETURN n.id AS id, n.embedding AS embedding"
+            )
+            self._write_similar_edges(sim_rows, "Function")
+        with _console.status("[cyan]Computing SIMILAR_TO edges (classes)[/]"):
+            sim_rows = self.db.fetch_all(
+                "MATCH (n:Class) RETURN n.id AS id, n.embedding AS embedding"
+            )
+            self._write_similar_edges(sim_rows, "Class")
 
-        log.info("Computing CO_CHANGED_WITH from git history...")
-        # Refresh file_index post-insert
-        file_index = {
-            r["path"]: r["id"]
-            for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
-        }
-        self._write_co_changed(file_index)
+        with _console.status("[cyan]Computing CO_CHANGED_WITH from git history[/]"):
+            # Refresh file_index post-insert
+            file_index = {
+                r["path"]: r["id"]
+                for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
+            }
+            self._write_co_changed(file_index)
 
-        log.info("Linking TESTS edges...")
-        function_rows_db = self.db.fetch_all(
-            "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
-        )
-        # Build quick name index from DB
-        name_index2: dict[str, list[tuple[str, int]]] = defaultdict(list)
-        for r in self.db.fetch_all("MATCH (n:Function) RETURN n.id AS id, n.name AS name"):
-            name_index2[r["name"]].append(("Function", r["id"]))
-        for r in self.db.fetch_all("MATCH (n:Class) RETURN n.id AS id, n.name AS name"):
-            name_index2[r["name"]].append(("Class", r["id"]))
-        self._write_tests_edges(function_rows_db, name_index2)
+        with _console.status("[cyan]Linking TESTS edges[/]"):
+            function_rows_db = self.db.fetch_all(
+                "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
+            )
+            name_index2: dict[str, list[tuple[str, int]]] = defaultdict(list)
+            for r in self.db.fetch_all("MATCH (n:Function) RETURN n.id AS id, n.name AS name"):
+                name_index2[r["name"]].append(("Function", r["id"]))
+            for r in self.db.fetch_all("MATCH (n:Class) RETURN n.id AS id, n.name AS name"):
+                name_index2[r["name"]].append(("Class", r["id"]))
+            self._write_tests_edges(function_rows_db, name_index2)
 
-        log.info("Running PageRank...")
-        scores = compute_pagerank(self.db)
-        write_pagerank(self.db, scores)
+        with _console.status("[cyan]Running PageRank[/]"):
+            scores = compute_pagerank(self.db)
+            write_pagerank(self.db, scores)
 
         # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----
         # Cache entities should not carry _id (transient); strip.
-        for rel in cache:
-            for ent in cache[rel].get("entities", []):
-                if "extra" in ent and isinstance(ent["extra"], dict):
-                    ent["extra"].pop("_id", None)
-        save_cache(self.cfg, cache)
+        with _console.status("[cyan]Persisting cache[/]"):
+            for rel in cache:
+                for ent in cache[rel].get("entities", []):
+                    if "extra" in ent and isinstance(ent["extra"], dict):
+                        ent["extra"].pop("_id", None)
+            save_cache(self.cfg, cache)
 
         elapsed = time.perf_counter() - t0
+        total_entities = sum(len(c.get("entities", [])) for c in cache.values())
+        _console.print(
+            f"[green]Done[/] in {elapsed:.2f}s — "
+            f"{len(on_disk_rel)} files, {total_entities} entities, "
+            f"{len(parsed)} reparsed, {len(deleted_rels)} deleted, {len(errors)} errors"
+        )
         return {
             "files": len(on_disk_rel),
             "changed": len(parsed),

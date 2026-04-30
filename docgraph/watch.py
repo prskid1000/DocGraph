@@ -14,6 +14,7 @@ import logging
 import time
 from pathlib import Path
 
+from rich.console import Console
 from watchfiles import Change, watch
 
 from docgraph.config import Config, MAX_FILE_BYTES
@@ -21,6 +22,8 @@ from docgraph.db import GraphDB
 from docgraph.embed import Embedder
 from docgraph.index import Indexer
 from docgraph.parse import detect_language
+
+_console = Console()
 
 log = logging.getLogger(__name__)
 
@@ -65,15 +68,14 @@ def watch_repo(cfg: Config, debounce_ms: int = 500) -> None:
     embedder = Embedder(cfg.embedding_model)
     indexer = Indexer(cfg, db, embedder=embedder)
 
-    log.info(f"Initial incremental index of {cfg.repo_root}")
-    stats = indexer.index_all(incremental=True)
-    log.info(
-        f"  baseline: {stats['changed']} changed, {stats['deleted']} deleted, "
-        f"{stats['elapsed']:.2f}s"
-    )
+    _console.rule(f"[bold cyan]Baseline index[/] — {cfg.repo_root}")
+    indexer.index_all(incremental=True)
 
     roots = [str(r) for r, _ in cfg.roots_with_prefix()]
-    log.info(f"Watching {roots} (debounce={debounce_ms}ms). Ctrl-C to stop.")
+    _console.print(
+        f"[green]Watching[/] {len(roots)} root(s), debounce={debounce_ms}ms. "
+        "[dim]Ctrl-C to stop.[/]"
+    )
     try:
         for changes in watch(
             *roots,
@@ -84,19 +86,17 @@ def watch_repo(cfg: Config, debounce_ms: int = 500) -> None:
             relevant = [Path(p) for _, p in changes]
             if not relevant:
                 continue
-            t0 = time.perf_counter()
-            try:
-                stats = indexer.index_all(incremental=True)
-            except Exception as e:  # noqa: BLE001
-                log.error(f"Reindex failed: {e}")
-                continue
-            log.info(
-                f"reindex: {len(relevant)} fs events → "
-                f"{stats['changed']} changed, {stats['deleted']} deleted "
-                f"in {time.perf_counter() - t0:.2f}s"
+            _console.rule(
+                f"[bold cyan]Reindex[/] — {len(relevant)} fs event(s)",
+                style="cyan",
             )
+            try:
+                indexer.index_all(incremental=True)
+            except Exception as e:  # noqa: BLE001
+                _console.print(f"[red]Reindex failed:[/] {e}")
+                continue
     except KeyboardInterrupt:
-        log.info("watcher stopped")
+        _console.print("[yellow]watcher stopped[/]")
 
 
 class _WatchFilter:
