@@ -449,6 +449,10 @@ class Indexer:
 
         # ---- Step 5: embed new entities ----
         if new_embed_targets:
+            # Warm up the model BEFORE opening the progress bar so its
+            # "Loading embedding model" log line doesn't punch through the
+            # live display and strand a 0% bar above it.
+            self.embedder._ensure()
             with _bar() as prog:
                 etask = prog.add_task("Embedding entities", total=len(new_embed_targets))
                 vectors = self.embedder.embed(
