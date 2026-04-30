@@ -50,6 +50,21 @@ def index(
         None, "--repo", "-r",
         help="Additional repo root to include (repeatable). Stored in .docgraph/repos.json.",
     ),
+    llm_docstrings: bool = typer.Option(
+        False, "--llm-docstrings",
+        help="Generate docstrings for entities lacking one via a local LLM (off by default).",
+    ),
+    llm_port: int = typer.Option(
+        1235, "--llm-port", help="Local LLM server port (default: 1235).",
+    ),
+    llm_model: str = typer.Option(
+        "local-model", "--llm-model",
+        help="Model name to send to the LLM server (most local servers ignore this).",
+    ),
+    llm_format: str = typer.Option(
+        "openai", "--llm-format",
+        help="API format: 'openai' (Chat Completions) or 'anthropic' (Messages).",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Index a codebase. Incremental by default; pass --full to wipe and rebuild.
@@ -57,14 +72,32 @@ def index(
     Pass `--repo` (repeatable) to index multiple repos into one graph. The list
     is persisted; subsequent commands (watch, serve, mcp) will see all repos
     automatically.
+
+    LLM docstrings (opt-in): with `--llm-docstrings`, the indexer asks a local
+    LLM to write a one-sentence summary for each entity that has no native
+    docstring. Configure the endpoint via `--llm-port`, `--llm-model`,
+    `--llm-format` or the matching `DOCGRAPH_LLM_*` env vars. Generated
+    summaries are cached by body hash in `.docgraph/llm_docstrings.json` so
+    incrementals don't re-call the model.
     """
     _setup_logging(verbose)
     cfg = load_config(path, extra_roots=repo if repo else None)
+    # CLI flags win over env vars
+    if llm_docstrings:
+        cfg.llm_docstrings = True
+        cfg.llm_port = llm_port
+        cfg.llm_model = llm_model
+        cfg.llm_format = llm_format
     console.print(f"[cyan]Indexing[/cyan] {cfg.repo_root}")
     if cfg.extra_roots:
         for r in cfg.extra_roots:
             console.print(f"  + {r}")
     console.print(f"  workers: {cfg.workers}  db: {cfg.db_path}")
+    if cfg.llm_docstrings:
+        console.print(
+            f"  [yellow]LLM docstrings[/]: {cfg.llm_format} @ "
+            f"{cfg.llm_host}:{cfg.llm_port} (model={cfg.llm_model})"
+        )
     db = GraphDB(cfg.db_path, embedding_dim=384)
     db.init_schema()
     indexer = Indexer(cfg, db)

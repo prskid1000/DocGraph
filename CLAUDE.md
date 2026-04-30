@@ -33,6 +33,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/git_tools.py` | `git diff` / `blame` / `log` shell-outs, joined to graph entities. |
 | `docgraph/rules.py` | Parses `.cursor/rules/*.mdc` + `AGENTS.md` / `CLAUDE.md`; glob-matches per file. |
 | `docgraph/rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB); used when `search(rerank=True)`. |
+| `docgraph/llm.py` | Tiny urllib-based client for OpenAI- or Anthropic-compatible local servers. Used by `--llm-docstrings` to summarize entities lacking native docs. Off by default. |
 | `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. |
 | `docgraph/mcp_tools.py` | 15 MCP tools (6 base + 9 differentiators). Keep this surface tight. |
@@ -178,6 +179,15 @@ Incremental delete: `_delete_files_from_db()` includes a `MATCH (n:Chunk) WHERE 
 - `docs.add_doc(cfg, url)` — fetch URL with stdlib `urllib`, parse HTML via subclassed `HTMLParser` (no BS4 dep), chunk via `chunk_doc()`, embed, store `Doc` rows.
 - Idempotent: re-ingesting the same URL deletes prior chunks first.
 - `Retriever.search_docs(query, limit)` — pure cosine similarity over `Doc.embedding`. Separate from code search; agent picks which to call.
+
+## LLM-augmented docstrings (opt-in)
+
+- **Off by default.** Enable with `--llm-docstrings` on `docgraph index` or `DOCGRAPH_LLM_DOCSTRINGS=1`.
+- Talks to a local OpenAI- or Anthropic-compatible server (LM Studio, llama.cpp, vLLM, Ollama). Defaults: `localhost:1235`, model `local-model`, format `openai`.
+- Configurable via CLI flags (`--llm-port`, `--llm-model`, `--llm-format`) or env vars (`DOCGRAPH_LLM_*`). **No settings file** — these are the only knobs.
+- `Indexer._augment_llm_docstrings()` runs after parsing, before embedding. Targets entities of kind `function` / `method` / `class` / `interface` that lack a native docstring. Skips silently if the server is unreachable.
+- Cache: `.docgraph/llm_docstrings.json` keyed by `sha256(body)`. Survives across runs and across renames (rename-safe). Incrementals only call the LLM for body-changed entities.
+- Generated text is read back in `summary.build_embedding_text(..., llm_doc=...)` — used **only** when no native docstring is found, so we never override a real doc.
 
 ## UI engines
 

@@ -34,6 +34,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (still local, still ONNX).
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
 - **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them.
+- **Optional LLM-augmented docstrings** — opt-in via `--llm-docstrings`; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). One-sentence summaries for entities lacking native docs lift retrieval recall on under-documented codebases. Cached by body hash so incrementals stay fast.
 
 ## Performance
 
@@ -58,23 +59,113 @@ pip install docgraph
 
 Requires Python 3.10+. The first run downloads the embedding model (~30 MB BGE-small-en, ONNX).
 
-## CLI
+## CLI reference
 
-| Command | What it does |
-|---|---|
-| `docgraph index [path]` | Parallel index. Incremental by default; `--full` to wipe and rebuild. Pass `--repo PATH` (repeatable) for multi-repo. |
-| `docgraph watch [path]` | Auto-reindex on file changes (debounced; respects ignores) |
-| `docgraph serve [path]` | Start the web UI + JSON API on port 5500 |
-| `docgraph mcp [path]` | Run MCP server (stdio default; `--transport http` for HTTP) |
-| `docgraph stats [path]` | Print entity + edge counts |
-| `docgraph clear [path]` | Delete `.docgraph/` for the repo |
-| `docgraph install-mcp [path]` | Print the JSON snippet for Cursor / Claude Desktop |
-| `docgraph docs add <url>` | Fetch & ingest external documentation for `search_docs` |
-| `docgraph docs list` | Show ingested docs |
-| `docgraph docs remove <url>` | Remove a doc URL's chunks |
-| `docgraph version` | Print version |
+`path` argument defaults to the current directory; the repo root is auto-detected by walking up to find `.git`.
 
-`path` defaults to the current directory; the repo root is auto-detected by walking up to find `.git`.
+### `docgraph index [path]`
+
+Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--full`, `-f` | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
+| `--repo PATH`, `-r PATH` | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
+| `--llm-docstrings` | `false` | Generate one-sentence docstrings for entities lacking native docs via a local OpenAI/Anthropic-compatible LLM. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
+| `--llm-port INT` | `1235` | Local LLM server port (host is always `localhost`) |
+| `--llm-model STR` | `local-model` | Model name sent to the server (most local servers ignore this) |
+| `--llm-format STR` | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`) |
+| `--verbose`, `-v` | `false` | Verbose logs |
+
+### `docgraph watch [path]`
+
+Auto-reindex on file changes (Rust `notify` under the hood, debounced). Holds a writer lock — kill `serve` / `mcp` against the same DB first.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--debounce INT` | `500` | Debounce window in ms before reindex fires |
+| `--verbose`, `-v` | `false` | Verbose logs |
+
+### `docgraph serve [path]`
+
+Start the web UI + JSON API.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--host STR` | `127.0.0.1` (or `$DOCGRAPH_HOST`) | Bind address |
+| `--port INT` | `5500` (or `$DOCGRAPH_PORT`) | Bind port |
+| `--verbose`, `-v` | `false` | Verbose access logs |
+
+### `docgraph mcp [path]`
+
+Run the Model Context Protocol server.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--transport STR` | `stdio` | `stdio` (for Cursor / Claude Desktop) or `http` (for web clients) |
+| `--verbose`, `-v` | `false` | Verbose logs |
+
+### `docgraph stats [path]`
+
+Print entity + edge counts. No flags.
+
+### `docgraph clear [path]`
+
+Delete `.docgraph/` for the repo (DB + cache + repos list).
+
+| Flag | Default | Description |
+|---|---|---|
+| `--yes`, `-y` | `false` | Skip the confirmation prompt |
+
+### `docgraph install-mcp [path]`
+
+Print a JSON snippet ready to paste into Cursor / Claude Desktop's MCP config. No flags.
+
+### `docgraph docs add <url>`
+
+Fetch a URL, chunk + embed it, store as `Doc` nodes for `search_docs`. Idempotent: re-adding the same URL deletes prior chunks first.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--path PATH` | cwd | Repo whose `.docgraph/` to write the doc nodes into |
+
+### `docgraph docs list`
+
+Show ingested doc URLs and their chunk counts.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--path PATH` | cwd | Repo to query |
+
+### `docgraph docs remove <url>`
+
+Delete all chunks for a previously-ingested doc URL.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--path PATH` | cwd | Repo to operate on |
+
+### `docgraph version`
+
+Print version. No flags.
+
+### Environment variables
+
+| Var | Used by | Default |
+|---|---|---|
+| `DOCGRAPH_HOST` | `serve`, `mcp` (http) | `127.0.0.1` |
+| `DOCGRAPH_PORT` | `serve`, `mcp` (http) | `5500` |
+| `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
+| `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset (off). Set to `1`/`true` to enable. |
+| `DOCGRAPH_LLM_HOST` | `index` | `localhost` |
+| `DOCGRAPH_LLM_PORT` | `index` | `1235` |
+| `DOCGRAPH_LLM_MODEL` | `index` | `local-model` |
+| `DOCGRAPH_LLM_FORMAT` | `index` | `openai` |
+| `DOCGRAPH_LLM_API_KEY` | `index` | unset. If set, sent as `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic). |
+| `DOCGRAPH_LLM_MAX_TOKENS` | `index` | `150` |
+| `DOCGRAPH_LLM_TIMEOUT` | `index` | `30` (seconds) |
+
+CLI flags override env vars. Env vars set defaults that survive across invocations.
 
 ## MCP install (Cursor / Claude Desktop)
 

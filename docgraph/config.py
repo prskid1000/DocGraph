@@ -27,6 +27,12 @@ class Config:
     port: int = 5500
     similar_top_k: int = 5  # SIMILAR_TO edges per node
     co_change_window: int = 200  # last N commits scanned for CO_CHANGED_WITH
+    # LLM docstring augmentation (off by default — opt in via CLI or env var)
+    llm_docstrings: bool = False
+    llm_host: str = "localhost"
+    llm_port: int = 1235
+    llm_model: str = "local-model"
+    llm_format: str = "openai"  # "openai" | "anthropic"
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
     ai_block_specs: dict[Path, pathspec.PathSpec] = field(init=False)
@@ -141,4 +147,9 @@ def load_config(
         host=os.environ.get("DOCGRAPH_HOST", "127.0.0.1"),
         port=int(os.environ.get("DOCGRAPH_PORT", "5500")),
         embedding_model=os.environ.get("DOCGRAPH_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+        llm_docstrings=os.environ.get("DOCGRAPH_LLM_DOCSTRINGS", "").lower() in ("1", "true", "yes"),
+        llm_host=os.environ.get("DOCGRAPH_LLM_HOST", "localhost"),
+        llm_port=int(os.environ.get("DOCGRAPH_LLM_PORT", "1235")),
+        llm_model=os.environ.get("DOCGRAPH_LLM_MODEL", "local-model"),
+        llm_format=os.environ.get("DOCGRAPH_LLM_FORMAT", "openai"),
     )

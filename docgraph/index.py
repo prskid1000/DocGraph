@@ -167,6 +167,72 @@ class Indexer:
         return i
 
     # ---- DB delete ----
+    def _augment_llm_docstrings(self, parsed: dict) -> None:
+        """For entities lacking a native docstring, ask the local LLM to
+        write a one-sentence summary. Cached by body hash in
+        `.docgraph/llm_docstrings.json` so incrementals don't re-call.
+        Skipped silently if the LLM endpoint is unreachable."""
+        import hashlib
+        from concurrent.futures import ThreadPoolExecutor
+
+        from docgraph.llm import LLMClient, LLMConfig
+        from docgraph.summary import extract_docstring
+
+        cache_path = self.cfg.data_dir / "llm_docstrings.json"
+        cache: dict[str, str] = {}
+        if cache_path.exists():
+            try:
+                cache = json.loads(cache_path.read_text(encoding="utf-8"))
+            except Exception:
+                cache = {}
+
+        targets: list[tuple[object, str, object]] = []  # (entity, body_hash, fileparse)
+        for fp in parsed.values():
+            for ent in fp.entities:
+                if ent.kind not in ("function", "method", "class", "interface"):
+                    continue
+                if not ent.body:
+                    continue
+                if extract_docstring(ent.body, fp.language).strip():
+                    continue  # already has a native docstring
+                h = hashlib.sha256(ent.body.encode("utf-8", errors="replace")).hexdigest()
+                if h in cache:
+                    if isinstance(ent.extra, dict):
+                        ent.extra["llm_doc"] = cache[h]
+                    continue
+                targets.append((ent, h, fp))
+
+        if not targets:
+            return
+
+        client = LLMClient(LLMConfig(
+            host=self.cfg.llm_host,
+            port=self.cfg.llm_port,
+            model=self.cfg.llm_model,
+            format=self.cfg.llm_format,
+        ))
+
+        def _task(item):
+            ent, h, fp = item
+            text = client.summarize(ent.kind, ent.name, ent.body, fp.language)
+            return ent, h, text
+
+        n_workers = min(8, max(2, self.cfg.workers))
+        with _bar() as prog:
+            ptask = prog.add_task("LLM docstrings", total=len(targets))
+            with ThreadPoolExecutor(max_workers=n_workers) as ex:
+                for ent, h, text in ex.map(_task, targets):
+                    if text:
+                        if isinstance(ent.extra, dict):
+                            ent.extra["llm_doc"] = text
+                        cache[h] = text
+                    prog.advance(ptask)
+
+        try:
+            cache_path.write_text(json.dumps(cache), encoding="utf-8")
+        except Exception:
+            pass
+
     def _delete_files_from_db(self, files: list[str]) -> None:
         """DETACH DELETE all entities + the File node for each path."""
         if not files:
@@ -289,6 +355,10 @@ class Indexer:
                             "edges": result["edges"],
                         }
 
+        # ---- Step 3a: optional LLM docstring augmentation ----
+        if self.cfg.llm_docstrings and parsed:
+            self._augment_llm_docstrings(parsed)
+
         # ---- Step 3: seed ID allocator ----
         self._seed_ids_from_db()
 
@@ -335,6 +405,7 @@ class Indexer:
                         build_embedding_text(
                             ent.name, ent.qname, ent.signature, ent.body,
                             fp.language, ent.kind,
+                            llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
                         ),
                     ))
                 elif ent.kind in ("function", "method"):
@@ -363,6 +434,7 @@ class Indexer:
                         build_embedding_text(
                             ent.name, ent.qname, ent.signature, ent.body,
                             fp.language, ent.kind,
+                            llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
                         ),
                     ))
                 else:

@@ -144,14 +144,19 @@ def build_embedding_text(
     body: str,
     language: str,
     kind: str,
+    *,
+    llm_doc: str | None = None,
 ) -> str:
     """Compose the text fed to the embedding model.
 
     Order matters — embedding models weight earlier tokens more, so we lead
     with the human-readable signal (name + signature + docstring) before
-    falling back to raw code.
+    falling back to raw code. `llm_doc` is the optional LLM-generated
+    summary used when no native docstring exists.
     """
     docstring = extract_docstring(body, language)
+    if not docstring and llm_doc:
+        docstring = llm_doc.strip()
     parts: list[str] = []
     parts.append(f"{kind} {name}")
     if signature and signature != name:
