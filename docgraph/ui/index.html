@@ -651,9 +651,34 @@
       };
     }
 
+    // Live updates via SSE (active in `docgraph watch --serve` mode).
+    // Falls back silently when /api/events is unavailable or the EventSource
+    // API is blocked — the UI still works as a static viewer.
+    function setupLiveUpdates() {
+      if (typeof EventSource === "undefined") return;
+      let evt;
+      try {
+        evt = new EventSource("/api/events");
+      } catch (_) {
+        return;
+      }
+      evt.addEventListener("reindex_done", () => {
+        // Reload stats + graph, but debounce to coalesce rapid events.
+        clearTimeout(setupLiveUpdates._t);
+        setupLiveUpdates._t = setTimeout(() => {
+          loadStats();
+          loadGraph();
+        }, 150);
+      });
+      evt.onerror = () => {
+        // Browser auto-reconnects EventSource; nothing else to do.
+      };
+    }
+
     setupCanvas();
     setupSearch();
     setupControls();
+    setupLiveUpdates();
     loadStats();
     loadGraph().then(tick);
   </script>

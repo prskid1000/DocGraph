@@ -207,6 +207,47 @@ def test_file_content_rejects_traversal(client: TestClient):
 # --- .cursorignore redaction ------------------------------------------
 
 
+def test_sse_subscribers_list_exists(client: TestClient):
+    """`/api/events` is registered and `app.state.subscribers` is wired up
+    for the watcher to push into. We avoid actually consuming the stream
+    here because httpx TestClient doesn't play well with long-lived SSE
+    connections (its portal serializes the request)."""
+    routes = {r.path for r in client.app.router.routes if hasattr(r, "path")}
+    assert "/api/events" in routes
+    assert isinstance(client.app.state.subscribers, list)
+
+
+def test_broadcast_no_subscribers_safe():
+    """`broadcast` must be a no-op when no subscriber is listening — the
+    watcher calls it after every reindex regardless of whether the UI is
+    open."""
+    from fastapi import FastAPI
+
+    from docgraph.server import broadcast
+
+    fake = FastAPI()
+    fake.state.subscribers = []
+    # Should not raise
+    broadcast(fake, "reindex_done", {"ts": 1})
+
+
+def test_broadcast_enqueues_for_subscriber():
+    """When a queue is registered, broadcast pushes the event payload into it."""
+    import asyncio
+
+    from fastapi import FastAPI
+
+    from docgraph.server import broadcast
+
+    fake = FastAPI()
+    q: asyncio.Queue = asyncio.Queue()
+    fake.state.subscribers = [q]
+    broadcast(fake, "reindex_done", {"ts": 42})
+    assert q.qsize() == 1
+    payload = q.get_nowait()
+    assert payload == {"event": "reindex_done", "data": {"ts": 42}}
+
+
 def test_file_content_redacts_ai_blocked(tmp_path: Path):
     """Wholly isolated repo — verifies the redaction path in api_file_content."""
     (tmp_path / ".git").mkdir()

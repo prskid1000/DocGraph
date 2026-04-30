@@ -35,9 +35,9 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB); used when `search(rerank=True)`. |
 | `docgraph/llm.py` | Tiny urllib-based client for OpenAI- or Anthropic-compatible local servers. Used by `--llm-docstrings` to summarize entities lacking native docs. Off by default. |
 | `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
-| `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. |
+| `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. `watch_and_serve()` runs uvicorn + the watcher in one event loop and broadcasts SSE `reindex_done` on each cycle. |
 | `docgraph/mcp_tools.py` | 15 MCP tools (6 base + 9 differentiators). Keep this surface tight. |
-| `docgraph/server.py` | FastAPI: web UI + JSON API. |
+| `docgraph/server.py` | FastAPI: web UI + JSON API + SSE `/api/events`. `make_app(cfg, db=None)` accepts a pre-opened DB; `app.state.db_holder` is a swap-safe `(db, retriever)` wrapper used by `watch --serve`. |
 | `docgraph/ui/index.html` | Single-page graph viewer. Canvas + Sigma.js (lazy-loaded from esm.sh, auto-engages > 2 k nodes). |
 
 Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB), `<repo>/.docgraph/cache.json` (per-file `{hash, entities, edges}`), `<repo>/.docgraph/repos.json` (multi-repo list).
@@ -143,6 +143,18 @@ Don't add more without a strong reason. `search` accepts `focus_file` / `focus_s
 ## Watch mode
 
 `docgraph watch` opens a writer connection for its lifetime — kill `serve` / `mcp` against the same DB first. Pre-debounce filter (`_WatchFilter`) drops ignored / unsupported-language paths *before* watchfiles emits them so `git checkout` of `node_modules` doesn't fire 5 k events.
+
+`docgraph watch --serve` runs the watcher AND uvicorn in one asyncio loop (`watch.watch_and_serve`):
+
+1. Opens a writer DB → does a baseline incremental reindex → closes the writer.
+2. Reopens read-only and starts uvicorn. The API uses `app.state.db_holder` (a `threading.Lock`-guarded `(db, retriever)` pair) so handlers always see a consistent snapshot.
+3. On each `awatch` change batch:
+   a. Acquire the holder lock; close the read-only DB; open writer; swap into the holder.
+   b. Run `Indexer.index_all(incremental=True)` via `asyncio.to_thread()` so SSE keepalives keep flowing.
+   c. Acquire lock again; close writer; reopen read-only; swap back. (Required because Kuzu writer connections don't see their own writes via subsequent `fetch_all` queries — the close+reopen forces visibility.)
+   d. `server.broadcast(app, "reindex_done", {...})` pushes to every active SSE subscriber. UI re-fetches `/api/graph` + `/api/stats`.
+
+Single-process design avoids the Kuzu file-lock conflict that otherwise blocks `serve` from coexisting with `watch`.
 
 ## Ignore architecture
 

@@ -112,15 +112,29 @@ def index(
 def watch(
     path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
     debounce: int = typer.Option(500, "--debounce", help="Debounce window (ms) before reindex fires"),
+    serve: bool = typer.Option(
+        False, "--serve",
+        help="Also run the web UI + JSON API in the same process. The UI auto-redraws on each reindex via SSE.",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind address for --serve mode."),
+    port: int = typer.Option(5500, "--port", help="Bind port for --serve mode."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Watch the repo and incrementally reindex on file changes.
 
-    Holds a writer lock on the DB — kill any `docgraph serve` / `docgraph mcp`
-    processes against the same repo before starting.
+    Plain `watch` holds a writer lock — kill any `docgraph serve` / `docgraph mcp`
+    against the same repo first.
+
+    `watch --serve` runs the web UI + JSON API in the same process, so they share
+    a single DB lock. The browser stays in sync via Server-Sent Events at
+    `/api/events`; the graph re-renders automatically after each reindex.
     """
     _setup_logging(verbose)
     cfg = load_config(path)
+    if serve:
+        from docgraph.watch import watch_and_serve
+        asyncio.run(watch_and_serve(cfg, debounce_ms=debounce, host=host, port=port))
+        return
     console.print(f"[cyan]Watching[/cyan] {cfg.repo_root}  debounce={debounce}ms")
     from docgraph.watch import watch_repo
     watch_repo(cfg, debounce_ms=debounce)
