@@ -1,11 +1,14 @@
 """MCP tools.
 
 The original 6 tools (search, definition, references, call_graph, file_map,
-neighborhood) plus 4 differentiators that no other indexer exposes:
+neighborhood) plus 9 differentiators that no other indexer exposes:
 - explore: multi-hop graph walk from one or more seeds
 - impact_of: blast-radius of a file/symbol (callers + importers + co_changed + tests)
 - test_impact: which tests exercise this code (TESTS + reverse CALLS*)
 - cypher: read-only Cypher escape hatch for power agents
+- git_changes / git_blame / git_recent: diff-aware retrieval + Cursor blame parity
+- rules_for: glob-matches `.cursor/rules/*.mdc` + AGENTS.md / CLAUDE.md
+- search_docs: semantic search over `docgraph docs add <url>`-ingested external docs
 """
 from __future__ import annotations
 

@@ -4,7 +4,7 @@ This file captures the things you can't infer from the code in 10 seconds. Read 
 
 ## What this project is
 
-A local code knowledge graph backed by a single embedded Kuzu file. Indexes any repo with tree-sitter, embeds entities with fastembed, and exposes everything via 6 MCP tools and a single-page web UI.
+A local code knowledge graph backed by a single embedded Kuzu file. Indexes any repo with tree-sitter, embeds entities with fastembed, and exposes everything via 15 MCP tools and a single-page web UI.
 
 It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. The old code is preserved at tag `v1-legacy`. Do not resurrect any of those dependencies.
 
@@ -34,7 +34,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB); used when `search(rerank=True)`. |
 | `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. |
-| `docgraph/mcp_tools.py` | 14 MCP tools (6 base + 8 differentiators). Keep this surface tight. |
+| `docgraph/mcp_tools.py` | 15 MCP tools (6 base + 9 differentiators). Keep this surface tight. |
 | `docgraph/server.py` | FastAPI: web UI + JSON API. |
 | `docgraph/ui/index.html` | Single-page graph viewer. Canvas + Sigma.js (lazy-loaded from esm.sh, auto-engages > 2 k nodes). |
 
@@ -78,7 +78,7 @@ If you change the parse output shape, update the cache writer **and** the cache 
 ## Testing
 
 ```bash
-.venv/Scripts/python -m pytest                 # ~17s, 60 tests
+.venv/Scripts/python -m pytest                 # ~26s, 134 tests
 ```
 
 Tests in `tests/`:
@@ -87,6 +87,10 @@ Tests in `tests/`:
 - `test_retrieval.py` — original 6 retriever methods
 - `test_new_tools.py` — `explore`, `impact_of`, `test_impact`, `cypher` (incl. write-blocker tests), personalized PageRank
 - `test_multi_repo.py` — multi-root walker, cross-repo indexing, path roundtrip
+- `test_cursor_parity.py` — two-tier ignore (`.cursorindexingignore` / `.cursorignore`), `git_*` tools, `rules_for`, sub-function chunking
+- `test_round3.py` — cross-encoder reranker (mocked), scope-aware resolution, `@Docs` ingestion (mocked HTTP)
+- `test_api.py` — FastAPI HTTP layer (every `/api/*` route, sandboxing, `.cursorignore` redaction, cypher write-blocker via POST)
+- `test_mcp_server.py` — every MCP tool registered + invokable end-to-end through `FastMCP.call_tool`
 
 **Kuzu writer-visibility gotcha:** a `kuzu.Connection` opened with `read_only=False` doesn't see its own writes via subsequent `fetch_all` queries in the same process. The fixture closes the writer and reopens read-only after indexing. If you write a new test and reads come back empty, that's the cause.
 
@@ -111,7 +115,7 @@ diff /tmp/full_stats.txt /tmp/incremental_stats.txt
 
 If the diff is non-empty, your change broke incremental correctness.
 
-## MCP tool surface — 6 base + 4 differentiators
+## MCP tool surface — 6 base + 9 differentiators
 
 Base: `search`, `definition`, `references`, `call_graph`, `file_map`, `neighborhood`.
 

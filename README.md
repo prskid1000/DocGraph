@@ -19,7 +19,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0ms on no-op runs.
 - **Live graph UI** — single HTML file, force-directed canvas, no npm build.
-- **MCP server** — 6 tight tools, stdio for editors or HTTP for web clients.
+- **MCP server** — 15 tools (6 base + 9 differentiators), stdio for editors or HTTP for web clients.
 - **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). The "what else will my change break?" answer.
 - **Differentiator MCP tools** — `explore` (multi-hop), `impact_of` (blast radius), `test_impact` (which tests cover this?), and `cypher` (raw read-only graph query). No competitor exposes these.
 - **Personalized PageRank** — `search` ranks results by proximity to the file/symbol the agent is currently editing.
@@ -150,7 +150,7 @@ docgraph/
   embed.py        # fastembed wrapper (BGE-small ONNX, 384-dim)
   rank.py         # PageRank over call + reference + inheritance graph
   retrieve.py     # hybrid retrieval (vector cosine + name boost + PageRank)
-  mcp_tools.py    # 6 MCP tools wrapping the retriever
+  mcp_tools.py    # 15 MCP tools wrapping the retriever
   server.py       # FastAPI: web UI + JSON API
   ui/index.html   # single-page force-directed canvas viewer (zero deps)
 ```
@@ -187,6 +187,11 @@ Data lives at `<repo>/.docgraph/`:
 | `GET /api/git_blame?file=...&line_start=&line_end=` | `git blame` |
 | `GET /api/git_recent?file=...&limit=` | Recent commits |
 | `GET /api/rules_for?file=...` | Auto-attach rules matching the file |
+| `GET /api/search_docs?q=...&limit=` | Semantic search over ingested external docs |
+| `GET /api/explore?seeds=a,b&hops=&limit=` | Multi-hop subgraph from seeds |
+| `GET /api/impact_of?target=...&depth=&limit=` | Blast radius |
+| `GET /api/test_impact?target=...&limit=` | Tests covering target |
+| `POST /api/cypher` (`{query, limit}`) | Read-only Cypher |
 
 ## Comparison
 
@@ -199,7 +204,7 @@ Data lives at `<repo>/.docgraph/`:
 | `SIMILAR_TO` edge | ✅ | (implicit) | ❌ | implicit |
 | `CO_CHANGED_WITH` edge | ✅ | ❌ | ❌ | ❌ |
 | `TESTS` edge | ✅ | ❌ | ❌ | ❌ |
-| MCP tools | 6 | 7 | 14 | n/a |
+| MCP tools | 15 | 7 | 14 | n/a |
 | Install | `pipx install` | manual | manual | proprietary IDE |
 
 ## Multi-repo
@@ -216,10 +221,10 @@ In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/s
 
 ```bash
 pip install pytest
-pytest                   # ~17s (one-time embedder load + 60 tests)
+pytest                   # ~26s (one-time embedder load + 134 tests)
 ```
 
-Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (including the cypher write-blocker), multi-repo walking, watch filter logic, and the embedding-text builder.
+Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, and the embedding-text builder.
 
 ## Roadmap
 
