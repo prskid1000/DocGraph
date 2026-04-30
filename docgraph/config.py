@@ -73,13 +73,13 @@ class Config:
                 p = root / fname
                 if p.exists():
                     index_patterns.extend(p.read_text(encoding="utf-8", errors="ignore").splitlines())
-            self.ignore_specs[root] = pathspec.PathSpec.from_lines("gitwildmatch", index_patterns)
+            self.ignore_specs[root] = pathspec.PathSpec.from_lines("gitignore", index_patterns)
 
             ai_block_patterns: list[str] = []
             ci = root / ".cursorignore"
             if ci.exists():
                 ai_block_patterns.extend(ci.read_text(encoding="utf-8", errors="ignore").splitlines())
-            self.ai_block_specs[root] = pathspec.PathSpec.from_lines("gitwildmatch", ai_block_patterns)
+            self.ai_block_specs[root] = pathspec.PathSpec.from_lines("gitignore", ai_block_patterns)
         self.ignore_spec = self.ignore_specs[self.repo_root]
         self.ai_block_spec = self.ai_block_specs[self.repo_root]
 

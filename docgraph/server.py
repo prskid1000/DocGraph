@@ -4,16 +4,11 @@ For stdio MCP (Cursor / Claude Desktop), use `docgraph mcp` instead.
 """
 from __future__ import annotations
 
-import asyncio
-import json
 import logging
 from pathlib import Path
 
-import orjson
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import HTMLResponse, ORJSONResponse
-from fastapi.staticfiles import StaticFiles
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import HTMLResponse
 
 from docgraph.config import Config
 from docgraph.db import GraphDB
@@ -28,7 +23,6 @@ UI_DIR = Path(__file__).parent / "ui"
 def make_app(cfg: Config) -> FastAPI:
     app = FastAPI(
         title="DocGraph",
-        default_response_class=ORJSONResponse,
         version="2.0.0",
     )
 

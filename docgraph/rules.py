@@ -131,7 +131,7 @@ def rules_for(cfg: Config, file_path: str) -> list[dict]:
     for r in rules:
         matched = r.always_apply
         if not matched and r.globs:
-            spec = pathspec.PathSpec.from_lines("gitwildmatch", r.globs)
+            spec = pathspec.PathSpec.from_lines("gitignore", r.globs)
             matched = spec.match_file(file_path)
         if matched:
             out.append({
