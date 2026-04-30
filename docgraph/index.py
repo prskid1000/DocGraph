@@ -50,7 +50,7 @@ def _bar() -> Progress:
 
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder
+from docgraph.embed import Embedder, GPU_PROVIDERS
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
 from docgraph.summary import build_embedding_text, chunk_body
@@ -58,6 +58,10 @@ from docgraph.summary import build_embedding_text, chunk_body
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, int, int], None] | None
+
+
+def _gpu_providers() -> list[str]:
+    return list(GPU_PROVIDERS)
 
 
 # --- Walker ---------------------------------------------------------------
@@ -144,7 +148,10 @@ class Indexer:
     def __init__(self, cfg: Config, db: GraphDB, embedder: Embedder | None = None):
         self.cfg = cfg
         self.db = db
-        self.embedder = embedder or Embedder(cfg.embedding_model)
+        self.embedder = embedder or Embedder(
+            cfg.embedding_model,
+            providers=_gpu_providers() if cfg.gpu else None,
+        )
         self._next_id = 1
 
     # ---- ID allocation ----

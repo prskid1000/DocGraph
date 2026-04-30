@@ -59,7 +59,11 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
 
     if db is None:
         db = GraphDB(cfg.db_path, read_only=True)
-    embedder = Embedder(cfg.embedding_model)
+    from docgraph.embed import GPU_PROVIDERS
+    embedder = Embedder(
+        cfg.embedding_model,
+        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+    )
     retriever = Retriever(db, embedder, cfg=cfg)
     holder = DBHolder(db, retriever)
     app.state.db_holder = holder

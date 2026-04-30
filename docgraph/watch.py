@@ -25,7 +25,7 @@ from watchfiles import Change, awatch, watch
 
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder
+from docgraph.embed import Embedder, GPU_PROVIDERS
 from docgraph.index import Indexer
 from docgraph.parse import detect_language
 
@@ -71,7 +71,10 @@ def watch_repo(cfg: Config, debounce_ms: int = 500) -> None:
     """Block forever, reindexing on changes. Ctrl-C to stop."""
     db = GraphDB(cfg.db_path, embedding_dim=384)
     db.init_schema()
-    embedder = Embedder(cfg.embedding_model)
+    embedder = Embedder(
+        cfg.embedding_model,
+        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+    )
     indexer = Indexer(cfg, db, embedder=embedder)
 
     _console.rule(f"[bold cyan]Baseline index[/] — {cfg.repo_root}")
@@ -121,7 +124,7 @@ async def watch_and_serve(
     """
     import uvicorn
 
-    from docgraph.embed import Embedder
+    from docgraph.embed import Embedder, GPU_PROVIDERS
     from docgraph.retrieve import Retriever
     from docgraph.server import broadcast, make_app
 
@@ -129,7 +132,10 @@ async def watch_and_serve(
     # replaced with a read-only handle that the API will share.
     writer_db = GraphDB(cfg.db_path, embedding_dim=384)
     writer_db.init_schema()
-    embedder = Embedder(cfg.embedding_model)
+    embedder = Embedder(
+        cfg.embedding_model,
+        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+    )
     indexer = Indexer(cfg, writer_db, embedder=embedder)
 
     _console.rule(f"[bold cyan]Baseline index[/] — {cfg.repo_root}")

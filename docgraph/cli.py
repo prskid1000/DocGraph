@@ -65,6 +65,12 @@ def index(
         "openai", "--llm-format",
         help="API format: 'openai' (Chat Completions) or 'anthropic' (Messages).",
     ),
+    gpu: bool = typer.Option(
+        False, "--gpu",
+        help="Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML). "
+             "Requires `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows) "
+             "to be installed; falls back to CPU if unavailable.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Index a codebase. Incremental by default; pass --full to wipe and rebuild.
@@ -79,6 +85,11 @@ def index(
     `--llm-format` or the matching `DOCGRAPH_LLM_*` env vars. Generated
     summaries are cached by body hash in `.docgraph/llm_docstrings.json` so
     incrementals don't re-call the model.
+
+    GPU (opt-in): with `--gpu`, embeddings run on the GPU via ONNX Runtime.
+    No torch dependency — install `onnxruntime-gpu` (NVIDIA / CUDA),
+    `onnxruntime-directml` (Windows / any GPU), or `onnxruntime-silicon`
+    (Apple Silicon) to light it up. Silently falls back to CPU otherwise.
     """
     _setup_logging(verbose)
     cfg = load_config(path, extra_roots=repo if repo else None)
@@ -88,11 +99,15 @@ def index(
         cfg.llm_port = llm_port
         cfg.llm_model = llm_model
         cfg.llm_format = llm_format
+    if gpu:
+        cfg.gpu = True
     console.print(f"[cyan]Indexing[/cyan] {cfg.repo_root}")
     if cfg.extra_roots:
         for r in cfg.extra_roots:
             console.print(f"  + {r}")
     console.print(f"  workers: {cfg.workers}  db: {cfg.db_path}")
+    if cfg.gpu:
+        console.print("  [magenta]GPU[/]: ONNX Runtime providers (CUDA/DirectML/CoreML/CPU)")
     if cfg.llm_docstrings:
         console.print(
             f"  [yellow]LLM docstrings[/]: {cfg.llm_format} @ "

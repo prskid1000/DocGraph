@@ -8,17 +8,65 @@ from fastembed import TextEmbedding
 
 log = logging.getLogger(__name__)
 
+# ONNX Runtime execution providers tried (in order) when GPU is requested.
+# ORT picks the first one that's actually installed; CPU is the final
+# fallback so an unsupported box still works. Adding `onnxruntime-gpu`
+# (CUDA / TensorRT) or `onnxruntime-directml` (Windows GPU) lights up the
+# corresponding entries — base `onnxruntime` only knows CPU.
+GPU_PROVIDERS: list[str] = [
+    "CUDAExecutionProvider",       # NVIDIA via onnxruntime-gpu
+    "DmlExecutionProvider",        # Windows DirectML via onnxruntime-directml
+    "CoreMLExecutionProvider",     # macOS via onnxruntime-silicon
+    "ROCMExecutionProvider",       # AMD Linux
+    "CPUExecutionProvider",        # always-available fallback
+]
+
 
 class Embedder:
-    def __init__(self, model_name: str = "BAAI/bge-small-en-v1.5"):
+    def __init__(
+        self,
+        model_name: str = "BAAI/bge-small-en-v1.5",
+        providers: list[str] | None = None,
+    ):
         self.model_name = model_name
+        # When None, fastembed picks its default (CPU). When given, the list
+        # is passed straight through to the underlying onnxruntime session.
+        self.providers = providers
         self._model: TextEmbedding | None = None
 
     def _ensure(self) -> TextEmbedding:
         if self._model is None:
-            log.info(f"Loading embedding model {self.model_name}...")
-            self._model = TextEmbedding(model_name=self.model_name)
+            if self.providers:
+                log.info(
+                    f"Loading embedding model {self.model_name} with providers={self.providers}..."
+                )
+                try:
+                    self._model = TextEmbedding(
+                        model_name=self.model_name, providers=self.providers
+                    )
+                    self._log_active_provider()
+                except Exception as e:  # pragma: no cover - depends on installed ORT
+                    log.warning(
+                        f"GPU init failed ({e}); falling back to CPU. "
+                        f"Install `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows) for GPU."
+                    )
+                    self._model = TextEmbedding(model_name=self.model_name)
+            else:
+                log.info(f"Loading embedding model {self.model_name}...")
+                self._model = TextEmbedding(model_name=self.model_name)
         return self._model
+
+    def _log_active_provider(self) -> None:
+        """Best-effort introspection of which ORT provider actually got selected.
+        fastembed doesn't expose this directly so we dig through the model."""
+        try:
+            inner = getattr(self._model, "model", None) or getattr(self._model, "_model", None)
+            sess = getattr(inner, "model", None) if inner is not None else None
+            if sess is not None and hasattr(sess, "get_providers"):
+                active = sess.get_providers()
+                log.info(f"ONNX Runtime active providers: {active}")
+        except Exception:
+            pass
 
     def embed(
         self,

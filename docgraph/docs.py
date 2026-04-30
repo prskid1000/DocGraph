@@ -19,7 +19,7 @@ from rich.console import Console
 
 from docgraph.config import Config
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder
+from docgraph.embed import Embedder, GPU_PROVIDERS
 from docgraph.index import _bar
 from docgraph.summary import chunk_body
 
@@ -163,7 +163,10 @@ def add_doc(cfg: Config, url: str) -> dict:
         pass
 
     pieces = chunk_doc(text)
-    embedder = Embedder(cfg.embedding_model)
+    embedder = Embedder(
+        cfg.embedding_model,
+        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+    )
     with _bar() as prog:
         task = prog.add_task(f"Embedding doc chunks ({title or url})", total=len(pieces))
         vecs = embedder.embed(

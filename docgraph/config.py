@@ -22,6 +22,11 @@ class Config:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384
     embed_batch_size: int = 256
+    # GPU acceleration for embeddings (and reranker). Off by default; when
+    # True, the Embedder asks ONNX Runtime to use CUDA / DirectML / CoreML
+    # before falling back to CPU. Requires `onnxruntime-gpu` or
+    # `onnxruntime-directml` to be installed.
+    gpu: bool = False
     workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 4) - 1))
     host: str = "127.0.0.1"
     port: int = 5500
@@ -147,6 +152,7 @@ def load_config(
         host=os.environ.get("DOCGRAPH_HOST", "127.0.0.1"),
         port=int(os.environ.get("DOCGRAPH_PORT", "5500")),
         embedding_model=os.environ.get("DOCGRAPH_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+        gpu=os.environ.get("DOCGRAPH_GPU", "").lower() in ("1", "true", "yes"),
         llm_docstrings=os.environ.get("DOCGRAPH_LLM_DOCSTRINGS", "").lower() in ("1", "true", "yes"),
         llm_host=os.environ.get("DOCGRAPH_LLM_HOST", "localhost"),
         llm_port=int(os.environ.get("DOCGRAPH_LLM_PORT", "1235")),

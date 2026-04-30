@@ -18,14 +18,17 @@ from fastmcp import FastMCP
 
 from docgraph.config import Config
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder
+from docgraph.embed import Embedder, GPU_PROVIDERS
 from docgraph.retrieve import Retriever
 
 
 def make_mcp(cfg: Config) -> FastMCP:
     mcp: FastMCP = FastMCP(name="docgraph")
     db = GraphDB(cfg.db_path, read_only=True)
-    embedder = Embedder(cfg.embedding_model)
+    embedder = Embedder(
+        cfg.embedding_model,
+        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+    )
     retriever = Retriever(db, embedder, cfg=cfg)
 
     @mcp.tool()

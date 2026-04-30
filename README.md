@@ -20,6 +20,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **165+ languages** out of the box via tree-sitter (just install more `tree-sitter-*` packages).
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
+- **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML for a multi-x speedup on large repos. Still no torch dep — just `pip install onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows). Falls back to CPU silently if no GPU runtime is installed.
 - **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-docstrings` (you supply the local server).
 
 ### Retrieval
@@ -75,6 +76,16 @@ pip install docgraph
 
 Requires Python 3.10+. The first run downloads the embedding model (~30 MB BGE-small-en, ONNX).
 
+**Optional GPU acceleration** — install one of these alongside `docgraph` to enable `--gpu` (no torch dep, all ONNX):
+
+```bash
+pip install onnxruntime-gpu          # NVIDIA / CUDA (Linux, Windows)
+pip install onnxruntime-directml     # Windows / any GPU (DirectX 12)
+pip install onnxruntime-silicon      # Apple Silicon (CoreML)
+```
+
+DocGraph picks whichever provider is installed automatically; without one it stays on CPU.
+
 ## CLI reference
 
 `path` argument defaults to the current directory; the repo root is auto-detected by walking up to find `.git`.
@@ -91,6 +102,7 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | `--llm-port INT` | `1235` | Local LLM server port (host is always `localhost`) |
 | `--llm-model STR` | `local-model` | Model name sent to the server (most local servers ignore this) |
 | `--llm-format STR` | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`) |
+| `--gpu` | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
 | `--verbose`, `-v` | `false` | Verbose logs |
 
 ### `docgraph watch [path]`
@@ -175,6 +187,7 @@ Print version. No flags.
 | `DOCGRAPH_HOST` | `serve`, `mcp` (http) | `127.0.0.1` |
 | `DOCGRAPH_PORT` | `serve`, `mcp` (http) | `5500` |
 | `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
+| `DOCGRAPH_GPU` | `index`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. |
 | `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset (off). Set to `1`/`true` to enable. |
 | `DOCGRAPH_LLM_HOST` | `index` | `localhost` |
 | `DOCGRAPH_LLM_PORT` | `index` | `1235` |

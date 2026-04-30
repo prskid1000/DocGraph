@@ -13,7 +13,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 - **One Python package, one process, one DB file.** No new top-level dirs, no separate frontend builds, no microservices.
 - **Kuzu is the only data store.** Don't add SQLite, ChromaDB, Neo4j, Redis, etc.
 - **No npm.** The web UI is one HTML file at `docgraph/ui/index.html`. No build step.
-- **No torch dependency.** Embeddings go through `fastembed` (ONNX). Adding sentence-transformers/torch would 4× the install size.
+- **No torch dependency.** Embeddings go through `fastembed` (ONNX). Adding sentence-transformers/torch would 4× the install size. GPU support uses ONNX Runtime providers (`CUDAExecutionProvider` / `DmlExecutionProvider` / `CoreMLExecutionProvider`) — not torch CUDA. Users opt in by `pip install onnxruntime-gpu` (or `-directml` / `-silicon`); we never depend on those.
 - **Per-language processor classes are forbidden.** All language support comes from `parse.py::LANGUAGES` + `TAGS_QUERIES`. Adding a language = pip install `tree-sitter-<x>` and add two dict entries.
 
 ## File map
@@ -27,7 +27,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
 | `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
 | `docgraph/db.py` | Kuzu schema + bulk insert helpers. |
-| `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). |
+| `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). `Embedder(providers=...)` passes ORT providers through; `GPU_PROVIDERS` is the default GPU stack (CUDA → DirectML → CoreML → ROCm → CPU). |
 | `docgraph/rank.py` | NetworkX PageRank + `PersonalizedRanker` (query-time personalized PR with cached graph). |
 | `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher` / `git_*` / `rules_for`. **All Cypher lives here or in `db.py`.** |
 | `docgraph/git_tools.py` | `git diff` / `blame` / `log` shell-outs, joined to graph entities. |
@@ -200,6 +200,14 @@ Incremental delete: `_delete_files_from_db()` includes a `MATCH (n:Chunk) WHERE 
 - `Indexer._augment_llm_docstrings()` runs after parsing, before embedding. Targets entities of kind `function` / `method` / `class` / `interface` that lack a native docstring. Skips silently if the server is unreachable.
 - Cache: `.docgraph/llm_docstrings.json` keyed by `sha256(body)`. Survives across runs and across renames (rename-safe). Incrementals only call the LLM for body-changed entities.
 - Generated text is read back in `summary.build_embedding_text(..., llm_doc=...)` — used **only** when no native docstring is found, so we never override a real doc.
+
+## GPU embeddings (opt-in)
+
+- **Off by default.** Enable with `--gpu` on `docgraph index` or `DOCGRAPH_GPU=1`.
+- Routed through ONNX Runtime, **not torch**. We pass `providers=GPU_PROVIDERS` (CUDA → DirectML → CoreML → ROCm → CPU) into `TextEmbedding(...)` and ORT picks the first one whose package is installed. Users opt in by `pip install onnxruntime-gpu` / `onnxruntime-directml` / `onnxruntime-silicon`. We do **not** depend on those packages — the install stays slim.
+- `Embedder._ensure()` wraps the GPU init in try/except: if loading with providers fails (wrong CUDA version, missing DLL, etc.), it logs a warning and reopens the model on CPU. Never fails the index run.
+- `cfg.gpu` is forwarded to every `Embedder(...)` site: `Indexer`, `make_app`, `make_mcp`, `watch_repo`, `watch_and_serve`, `docs.add_doc`. So `--gpu` on `index` doesn't help live search unless the same flag is set when launching `serve` / `mcp` — env var `DOCGRAPH_GPU=1` is the cleanest way to make it sticky across processes.
+- The reranker (`rerank.py`) doesn't read `cfg.gpu` — fastembed's cross-encoder picks providers from its default. Could be wired through later if the 33 MB Jina model becomes a bottleneck.
 
 ## UI engines
 
