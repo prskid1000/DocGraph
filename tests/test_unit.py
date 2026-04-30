@@ -179,3 +179,141 @@ def test_watch_filter_respects_ignore(tmp_path: Path):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text("x=1")
     assert _is_relevant(cfg, p) is False
+
+
+# --- Ecosystem autodetect (docgraph.ignores) --------------------------
+
+
+def test_universal_ignores_applied_without_markers(tmp_path: Path):
+    cfg = load_config(tmp_path)
+    assert cfg.detected_ecosystems[tmp_path.resolve()] == []
+    # Universal patterns still active
+    assert cfg.is_ignored(".git/HEAD")
+    assert cfg.is_ignored("foo.png")
+    assert cfg.is_ignored("yarn.lock")
+    assert cfg.is_ignored(".env")
+    assert cfg.is_ignored(".env.production")
+    assert cfg.is_ignored(".idea/workspace.xml")
+    assert cfg.is_ignored(".DS_Store")
+
+
+def test_node_autodetect(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"name": "x"}')
+    cfg = load_config(tmp_path)
+    assert "node" in cfg.detected_ecosystems[tmp_path.resolve()]
+    assert cfg.is_ignored("node_modules/foo/bar.js")
+    assert cfg.is_ignored(".next/cache/foo")
+    assert cfg.is_ignored(".turbo/run.json")
+    assert cfg.is_ignored("dist/bundle.js")
+
+
+def test_angular_autodetect_pulls_node_too(tmp_path: Path):
+    (tmp_path / "angular.json").write_text("{}")
+    (tmp_path / "package.json").write_text('{"name": "ng"}')
+    cfg = load_config(tmp_path)
+    eco = cfg.detected_ecosystems[tmp_path.resolve()]
+    assert "angular" in eco
+    assert "node" in eco
+    assert cfg.is_ignored(".angular/cache/foo")
+    assert cfg.is_ignored("out-tsc/foo.js")
+    assert cfg.is_ignored("node_modules/x")
+
+
+def test_python_autodetect(tmp_path: Path):
+    (tmp_path / "pyproject.toml").write_text("[project]\nname='x'\n")
+    cfg = load_config(tmp_path)
+    assert "python" in cfg.detected_ecosystems[tmp_path.resolve()]
+    assert cfg.is_ignored("__pycache__/foo.pyc")
+    assert cfg.is_ignored(".venv/lib/x.py")
+    assert cfg.is_ignored(".ruff_cache/foo")
+    assert cfg.is_ignored(".mypy_cache/foo")
+
+
+def test_maven_java_autodetect(tmp_path: Path):
+    (tmp_path / "pom.xml").write_text("<project/>")
+    cfg = load_config(tmp_path)
+    eco = cfg.detected_ecosystems[tmp_path.resolve()]
+    assert "maven" in eco
+    assert "java" in eco
+    assert cfg.is_ignored("target/classes/Foo.class")
+    assert cfg.is_ignored(".mvn/wrapper/maven-wrapper.jar")
+    assert cfg.is_ignored("Main.class")
+
+
+def test_gradle_autodetect_picks_build(tmp_path: Path):
+    (tmp_path / "build.gradle").write_text("")
+    cfg = load_config(tmp_path)
+    eco = cfg.detected_ecosystems[tmp_path.resolve()]
+    assert "gradle" in eco
+    assert "java" in eco
+    assert cfg.is_ignored(".gradle/caches/foo")
+    assert cfg.is_ignored("app/build/output.jar")
+
+
+def test_rust_autodetect(tmp_path: Path):
+    (tmp_path / "Cargo.toml").write_text("[package]\nname='x'\n")
+    cfg = load_config(tmp_path)
+    assert "rust" in cfg.detected_ecosystems[tmp_path.resolve()]
+    assert cfg.is_ignored("target/debug/foo")
+
+
+def test_dotnet_glob_marker(tmp_path: Path):
+    (tmp_path / "App.csproj").write_text("<Project/>")
+    cfg = load_config(tmp_path)
+    assert "dotnet" in cfg.detected_ecosystems[tmp_path.resolve()]
+    assert cfg.is_ignored("bin/Debug/App.dll")
+    assert cfg.is_ignored("obj/Debug/foo")
+
+
+def test_user_gitignore_layered_on_top(tmp_path: Path):
+    (tmp_path / "package.json").write_text('{"name":"x"}')
+    (tmp_path / ".gitignore").write_text("custom_dir/\n")
+    cfg = load_config(tmp_path)
+    assert cfg.is_ignored("node_modules/foo")  # autodetect
+    assert cfg.is_ignored("custom_dir/x.js")    # user .gitignore
+
+
+def test_universal_covers_data_science_and_misc(tmp_path: Path):
+    """Jupyter / MLflow / wandb / R / Haskell / Zig / Scala-tooling — all
+    universal because the dir names are unambiguous."""
+    cfg = load_config(tmp_path)
+    assert cfg.is_ignored(".ipynb_checkpoints/Untitled.ipynb")
+    assert cfg.is_ignored("mlruns/0/abc/meta.yaml")
+    assert cfg.is_ignored("wandb/run-20260101/files/foo")
+    assert cfg.is_ignored("lightning_logs/version_0/events.out")
+    assert cfg.is_ignored(".dvc/cache/00/abc")
+    assert cfg.is_ignored(".Rproj.user/foo")
+    assert cfg.is_ignored(".Rhistory")
+    assert cfg.is_ignored(".stack-work/install/foo")
+    assert cfg.is_ignored("dist-newstyle/build/foo")
+    assert cfg.is_ignored("zig-cache/o/abc")
+    assert cfg.is_ignored("zig-out/bin/app")
+    assert cfg.is_ignored(".metals/readonly")
+    assert cfg.is_ignored(".bloop/foo")
+
+
+def test_scala_autodetect(tmp_path: Path):
+    (tmp_path / "build.sbt").write_text('name := "x"\n')
+    cfg = load_config(tmp_path)
+    assert "scala" in cfg.detected_ecosystems[tmp_path.resolve()]
+    assert cfg.is_ignored("target/scala-2.13/foo.class")
+    assert cfg.is_ignored("project/target/foo")
+
+
+def test_unknown_repo_universal_only(tmp_path: Path):
+    """Plain text repo with no markers: still gets universal patterns
+    (unambiguously-named dep dirs + binaries), but NOT ambiguous build dirs."""
+    (tmp_path / "README.txt").write_text("hi")
+    cfg = load_config(tmp_path)
+    assert cfg.detected_ecosystems[tmp_path.resolve()] == []
+    # Unambiguous dep dirs always ignored (Cursor parity)
+    assert cfg.is_ignored("node_modules/foo")
+    assert cfg.is_ignored("__pycache__/foo")
+    assert cfg.is_ignored(".venv/lib/x.py")
+    assert cfg.is_ignored(".gradle/caches/foo")
+    # Binaries always ignored
+    assert cfg.is_ignored("logo.png")
+    # Ambiguous build dirs NOT ignored without ecosystem detection
+    assert not cfg.is_ignored("target/foo.txt")
+    assert not cfg.is_ignored("bin/foo.txt")
+    assert not cfg.is_ignored("obj/foo.txt")

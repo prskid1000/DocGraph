@@ -21,7 +21,8 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | File | Purpose |
 |---|---|
 | `docgraph/cli.py` | Typer entry. Add subcommands here. |
-| `docgraph/config.py` | Auto-detects repo root, respects `.gitignore` + `.docgraphignore`. Multi-root via `extra_roots`; persisted in `.docgraph/repos.json`. |
+| `docgraph/config.py` | Auto-detects repo root + ecosystems, respects `.gitignore` + `.docgraphignore`. Multi-root via `extra_roots`; persisted in `.docgraph/repos.json`. |
+| `docgraph/ignores.py` | Universal ignore patterns + per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Swift / Ruby / Dart / Elixir / Scala / PHP / Terraform / Unity / Go). Universal layer also covers Jupyter / MLflow / wandb / DVC / Haskell / Zig / R / Scala tooling. Inline string lists, no template files. |
 | `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. |
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
 | `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
@@ -142,13 +143,17 @@ Don't add more without a strong reason. `search` accepts `focus_file` / `focus_s
 
 `docgraph watch` opens a writer connection for its lifetime — kill `serve` / `mcp` against the same DB first. Pre-debounce filter (`_WatchFilter`) drops ignored / unsupported-language paths *before* watchfiles emits them so `git checkout` of `node_modules` doesn't fire 5 k events.
 
-## Two-tier ignore
+## Ignore architecture
 
-Cursor parity:
-- `.cursorindexingignore` (or `.gitignore` / `.docgraphignore`) → file is **excluded from the index entirely**. The graph never sees it.
-- `.cursorignore` → file is **indexed but redacted**. Graph node still exists; `search`/`definition`/`api/file_content` mask `body`/`snippet`/content with `[redacted by .cursorignore]` so the agent can know "this exists" without reading it.
+Three layers, in order of precedence:
 
-`Config.is_ignored()` checks tier 1; `Config.is_ai_blocked()` and `Config.ai_blocked_logical()` check tier 2. Multi-repo callers use `ai_blocked_logical()` to handle prefixed paths.
+1. **Universal baseline** (`ignores.py::UNIVERSAL`) — always-on patterns that match Cursor's built-in defaults: VCS dirs, OS junk, lockfiles, env files, binaries/media, plus unambiguously-named dep/cache dirs (`node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, `.angular/`, `.tox/`, `.pytest_cache/`, etc.). Applied regardless of project type.
+2. **Ecosystem autodetect** (`ignores.py::TEMPLATES` + `_DETECTORS`) — `Config.__post_init__` globs each root for marker files (`package.json`, `pom.xml`, `Cargo.toml`, `*.csproj`, `angular.json`, ...) and unions in the matching template. Templates contain *ambiguously-named* build dirs (`target/`, `build/`, `dist/`, `out/`, `bin/`, `obj/`) that we only want to ignore when the corresponding ecosystem is detected. Detected keys are stored on `cfg.detected_ecosystems[root]`.
+3. **User files** — `.gitignore` / `.docgraphignore` / `.cursorindexingignore` (excluded from the index) and `.cursorignore` (indexed but redacted). All layered on top of 1+2.
+
+`Config.is_ignored()` covers tiers 1+2+user-exclude; `Config.is_ai_blocked()` / `ai_blocked_logical()` cover the AI-block tier. Multi-repo callers use `ai_blocked_logical()` to handle prefixed paths.
+
+Adding a new ecosystem: add an entry to `TEMPLATES` and a row to `_DETECTORS` in `ignores.py`. Detection is `Path.glob`-based — `*.csproj` works as a marker.
 
 ## Sub-function chunking
 

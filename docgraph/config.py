@@ -7,34 +7,7 @@ from pathlib import Path
 
 import pathspec
 
-DEFAULT_IGNORES = [
-    ".git/",
-    ".docgraph/",
-    "node_modules/",
-    ".venv/",
-    "venv/",
-    "__pycache__/",
-    "*.pyc",
-    "dist/",
-    "build/",
-    "target/",
-    ".next/",
-    ".cache/",
-    "*.min.js",
-    "*.min.css",
-    "*.lock",
-    "package-lock.json",
-    "yarn.lock",
-    "*.svg",
-    "*.png",
-    "*.jpg",
-    "*.jpeg",
-    "*.gif",
-    "*.pdf",
-    "*.zip",
-    "*.tar*",
-    "*.log",
-]
+from docgraph.ignores import assemble_ignores
 
 MAX_FILE_BYTES = 1_500_000  # 1.5 MB; skip larger files
 
@@ -58,17 +31,20 @@ class Config:
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
     ai_block_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ai_block_spec: pathspec.PathSpec = field(init=False)
+    detected_ecosystems: dict[Path, list[str]] = field(init=False)
 
     def __post_init__(self) -> None:
-        # Two-tier ignore (Cursor parity):
-        #   - INDEX-EXCLUDE patterns: skip during walk entirely. Sources:
-        #       DEFAULT_IGNORES, .gitignore, .docgraphignore, .cursorindexingignore
-        #   - AI-BLOCK patterns: file is indexed (graph still includes File node)
-        #       but search/definition results are masked. Source: .cursorignore
+        # Three-tier ignore:
+        #   - UNIVERSAL + autodetected ecosystem templates (docgraph.ignores)
+        #   - User INDEX-EXCLUDE: .gitignore, .docgraphignore, .cursorindexingignore
+        #   - AI-BLOCK (.cursorignore): file is indexed, but search/definition
+        #     results are masked. Graph still includes the File node.
         self.ignore_specs = {}
         self.ai_block_specs = {}
+        self.detected_ecosystems = {}
         for root in [self.repo_root, *self.extra_roots]:
-            index_patterns = list(DEFAULT_IGNORES)
+            index_patterns, detected = assemble_ignores(root)
+            self.detected_ecosystems[root] = detected
             for fname in (".gitignore", ".docgraphignore", ".cursorindexingignore"):
                 p = root / fname
                 if p.exists():

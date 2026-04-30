@@ -27,6 +27,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Multi-repo** — `--repo` (repeatable) merges several repos into one graph; cross-repo `IMPORTS` resolve naturally.
 - **WebGL graph** — Sigma.js auto-engages above 2 k nodes.
 - **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)` so any MCP client gets glob-matched auto-attach.
+- **Smart default ignores** — universal baseline (Cursor-parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs (`target/`, `build/`, `bin/`, `obj/`) only ignored when their marker file is detected.
 - **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI.
 - **Diff-aware retrieval** — `git_changes` returns changed entities plus 1-hop callers in one call. Cursor's `@Commit` joined to the graph.
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
