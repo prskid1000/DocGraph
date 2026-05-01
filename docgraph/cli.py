@@ -71,6 +71,11 @@ def index(
              "Requires `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows) "
              "to be installed; falls back to CPU if unavailable.",
     ),
+    embed_batch_size: int | None = typer.Option(
+        None, "--embed-batch-size",
+        help="Batch size for embedding (default: 256). Lower it (e.g. 32) if "
+             "you hit GPU device-hung errors with --gpu / DirectML.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Index a codebase. Incremental by default; pass --full to wipe and rebuild.
@@ -101,6 +106,12 @@ def index(
         cfg.llm_format = llm_format
     if gpu:
         cfg.gpu = True
+        # DirectML can hang the GPU at the default batch size of 256 on
+        # consumer cards. Auto-pick a safer default unless the user overrode it.
+        if embed_batch_size is None:
+            embed_batch_size = 32
+    if embed_batch_size is not None:
+        cfg.embed_batch_size = embed_batch_size
     console.print(f"[cyan]Indexing[/cyan] {cfg.repo_root}")
     if cfg.extra_roots:
         for r in cfg.extra_roots:
