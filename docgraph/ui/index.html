@@ -862,17 +862,38 @@ function runCommunities(iters){
     }
 
     // ---------- Graph load ----------
-    async function loadGraph() {
+    // The UI carries two distinct dumps depending on detail level:
+    //   - "all"    → /api/graph?limit_nodes=50000   (top-K by PageRank)
+    //   - "levels" → /api/files                     (every File, no cap)
+    // Toggling the detail level fully rebuilds the canvas: positions reset,
+    // worker re-inits, lazy-expansion cache cleared. The previous merge-only
+    // approach left stale nodes from the other mode lingering around.
+    const ALL_NODES_CAP = 50000;
+    async function loadGraph(mode = lodMode) {
       $("#loading").style.display = "";
-      // Worker handles FA2 + grid; render batches and viewport-culls. Easily
-      // good for ~10k. We leave the door open up to 25k for huge codebases.
-      graph = await api("/api/graph?limit_nodes=10000");
+      $("#loading").textContent = mode === "levels" ? "Loading all files…" : "Loading graph…";
+      try {
+        graph = mode === "levels"
+          ? await api("/api/files")
+          : await api(`/api/graph?limit_nodes=${ALL_NODES_CAP}`);
+      } catch (e) {
+        $("#loading").textContent = `Failed: ${e}`;
+        return;
+      }
       $("#stat-nodes").textContent = graph.nodes.length;
       $("#stat-edges").textContent = graph.edges.length;
       $("#stat-edges-2").textContent = graph.edges.length;
+      // Reset all derived state — anything lazy-expanded under the old mode
+      // is no longer valid against the freshly-fetched dump.
+      _expanded.clear();
+      revealedSet = new Set();
+      selectedId = null;
+      hoverId = null;
+      neighborCache = { id: null, set: new Set() };
       buildLayout();
       computeVisible();
       $("#loading").style.display = "none";
+      $("#loading").textContent = "Loading graph…";
       fitOnFirstFrame = true;
       spawnWorker();
       postLayoutInit();
@@ -962,42 +983,16 @@ function runCommunities(iters){
       });
       $$("#lod-row .hop-chip").forEach(c => {
         c.onclick = async () => {
+          const next = c.dataset.lod;
+          if (next === lodMode) return;          // no-op if already active
           $$("#lod-row .hop-chip").forEach(x => x.classList.remove("active"));
           c.classList.add("active");
-          lodMode = c.dataset.lod;
-          revealedSet = new Set();   // reset expansion when switching modes
-          // Switching INTO Level 0 — lazy-fetch every File in the repo, no
-          // cap. The initial /api/graph dump is top-K by PR so on a 40k-file
-          // repo most files are missing. Level 0 mode is supposed to show
-          // ALL of them, so we fetch them on demand the first time.
-          if (lodMode === "levels") await ensureAllFilesLoaded();
-          computeVisible();
-          fitOnFirstFrame = true;    // re-fit so the new tier centers nicely
-          needsRender = true;
+          lodMode = next;
+          // Full clean rebuild — fetch the right endpoint and discard
+          // everything from the previous mode. See loadGraph() comments.
+          await loadGraph(lodMode);
         };
       });
-    }
-
-    let _allFilesLoaded = false;
-    async function ensureAllFilesLoaded() {
-      if (_allFilesLoaded) return;
-      _allFilesLoaded = true;
-      try {
-        $("#loading").style.display = "";
-        $("#loading").textContent = "Loading all files…";
-        const data = await api("/api/files");
-        if (data && data.nodes) {
-          mergeNeighbors(data.nodes, data.edges || []);
-          for (const n of data.nodes) level0Set.add(n.id);
-          postLayoutInit();
-          if (!layoutRunning) startLayout();
-        }
-      } catch (e) {
-        console.warn("ensureAllFilesLoaded failed:", e);
-      } finally {
-        $("#loading").style.display = "none";
-        $("#loading").textContent = "Loading graph…";
-      }
     }
 
     function computeVisible() {
