@@ -192,7 +192,21 @@ def serve(
     from docgraph.server import make_app
     app_obj = make_app(cfg)
     console.print(f"[green]Serving[/green] http://{cfg.host}:{cfg.port}/")
-    uvicorn.run(app_obj, host=cfg.host, port=cfg.port, log_level="info" if verbose else "warning")
+    # timeout_graceful_shutdown=1: when the user hits Ctrl+C, uvicorn waits at
+    # most 1s for in-flight requests to drain. Without this, the open SSE
+    # connection from the browser (/api/events) holds the loop forever and
+    # Ctrl+C feels frozen — pressing it again does nothing because the first
+    # SIGINT already started the never-ending graceful drain.
+    try:
+        uvicorn.run(
+            app_obj,
+            host=cfg.host,
+            port=cfg.port,
+            log_level="info" if verbose else "warning",
+            timeout_graceful_shutdown=1,
+        )
+    except KeyboardInterrupt:
+        pass
 
 
 @app.command()

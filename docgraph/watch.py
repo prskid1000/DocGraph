@@ -146,7 +146,12 @@ async def watch_and_serve(
     app = make_app(cfg, db=ro_db)
     app.state.loop = asyncio.get_running_loop()
 
-    config = uvicorn.Config(app, host=host, port=port, log_level="warning", lifespan="off")
+    config = uvicorn.Config(
+        app, host=host, port=port, log_level="warning", lifespan="off",
+        # Cap graceful shutdown so Ctrl+C doesn't hang on the open SSE stream
+        # the browser keeps to /api/events.
+        timeout_graceful_shutdown=1,
+    )
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())
 
