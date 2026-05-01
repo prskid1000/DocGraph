@@ -150,16 +150,36 @@ class GraphDB:
         finally:
             pass
 
-    def insert_nodes(self, table: str, rows: Iterable[dict]) -> int:
-        """Bulk insert via UNWIND. Faster than per-row CREATE."""
+    def insert_nodes(
+        self,
+        table: str,
+        rows: Iterable[dict],
+        batch_size: int = 5000,
+    ) -> int:
+        """Bulk insert via UNWIND, batched.
+
+        Splits the input into chunks of `batch_size` so Kuzu materializes one
+        slab at a time instead of the whole list. Caller can pass numpy
+        ndarrays as embedding values — we convert just-in-time per batch
+        (numpy float32 → Python list[float]) so the caller's row dicts can
+        keep the cheap numpy form throughout their lifetime.
+        """
         rows = list(rows)
         if not rows:
             return 0
         keys = list(rows[0].keys())
         cols = ", ".join(f"{k}: row.{k}" for k in keys)
         cypher = f"UNWIND $rows AS row CREATE (n:{table} {{{cols}}})"
-        self.execute(cypher, {"rows": rows})
-        return len(rows)
+        n = len(rows)
+        for i in range(0, n, batch_size):
+            slab = rows[i : i + batch_size]
+            for r in slab:
+                v = r.get("embedding")
+                if v is not None and not isinstance(v, list):
+                    # numpy / array-like → list[float] just for the wire call
+                    r["embedding"] = v.tolist() if hasattr(v, "tolist") else list(v)
+            self.execute(cypher, {"rows": slab})
+        return n
 
     def insert_edges(self, edge: str, from_table: str, to_table: str, rows: Iterable[dict]) -> int:
         """Bulk edge insert. rows: [{from_id, to_id, ...edge_props}]"""

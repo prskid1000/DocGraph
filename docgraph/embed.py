@@ -4,6 +4,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Iterable, Iterator
 
+import numpy as np
 from fastembed import TextEmbedding
 
 log = logging.getLogger(__name__)
@@ -98,24 +99,27 @@ class Embedder:
         texts: Iterable[str],
         batch_size: int = 256,
         on_progress: Callable[[int], None] | None = None,
-    ) -> list[list[float]]:
-        """Embed a list of texts. If `on_progress` is given, it's called with
-        the count of items completed each time fastembed yields a vector —
-        enables granular progress bars without forcing the caller to manage
-        batches themselves."""
+    ) -> np.ndarray:
+        """Embed a list of texts. Returns float32 ndarray of shape (N, dim).
+        Keeping vectors as numpy (~1.5 KB each) instead of Python list[float]
+        (~12 KB each) is an 8x memory cut, which matters when embedding
+        100k+ entities. If `on_progress` is given, it's called with the count
+        of items completed each time fastembed yields a vector."""
         model = self._ensure()
-        out: list[list[float]] = []
+        arrs: list[np.ndarray] = []
         for vec in model.embed(list(texts), batch_size=batch_size):
-            out.append(vec.tolist())
+            arrs.append(np.asarray(vec, dtype=np.float32))
             if on_progress is not None:
                 on_progress(1)
-        return out
+        if not arrs:
+            return np.zeros((0, self.dim), dtype=np.float32)
+        return np.stack(arrs)
 
-    def embed_iter(self, texts: Iterable[str], batch_size: int = 256) -> Iterator[list[float]]:
-        """Streaming variant: yield one vector at a time."""
+    def embed_iter(self, texts: Iterable[str], batch_size: int = 256) -> Iterator[np.ndarray]:
+        """Streaming variant: yield one float32 ndarray at a time."""
         model = self._ensure()
         for vec in model.embed(list(texts), batch_size=batch_size):
-            yield vec.tolist()
+            yield np.asarray(vec, dtype=np.float32)
 
     @property
     def dim(self) -> int:

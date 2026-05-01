@@ -17,7 +17,9 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import subprocess
+import threading
 import time
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
@@ -172,6 +174,72 @@ class Indexer:
         i = self._next_id
         self._next_id += 1
         return i
+
+    def _stream_embed_insert(
+        self,
+        label: str,
+        plan: list[tuple[dict, str]],
+        prog_label: str,
+        insert_batch: int = 5000,
+    ) -> None:
+        """Stream-embed and insert. plan: [(row_dict, embed_text), ...].
+
+        Memory contract: at any moment we hold the source `plan` plus at most
+        two batches of vectors (one being embedded, one in the writer queue).
+        Embedding text strings are dropped per-batch as they're consumed.
+
+        A daemon writer thread overlaps Kuzu I/O with the next batch's
+        embedding — this is the closest we get to true pipelining without
+        rewriting Kuzu's pybind. Bounded queue (maxsize=2) caps in-flight
+        batches so a slow writer can't let the embedder run away with RAM.
+        """
+        if not plan:
+            return
+        write_q: queue.Queue = queue.Queue(maxsize=2)
+        errors: list[BaseException] = []
+
+        def writer() -> None:
+            while True:
+                item = write_q.get()
+                try:
+                    if item is None:
+                        return
+                    self.db.insert_nodes(label, item, batch_size=insert_batch)
+                except BaseException as exc:  # noqa: BLE001 - propagate to main thread
+                    errors.append(exc)
+                    return
+                finally:
+                    write_q.task_done()
+
+        t = threading.Thread(target=writer, daemon=True, name=f"writer-{label}")
+        t.start()
+        try:
+            with _bar() as prog:
+                task = prog.add_task(prog_label, total=len(plan))
+                for i in range(0, len(plan), insert_batch):
+                    if errors:
+                        break
+                    batch = plan[i : i + insert_batch]
+                    texts = [t for _, t in batch]
+                    rows = [r for r, _ in batch]
+                    vecs = self.embedder.embed(
+                        texts,
+                        batch_size=self.cfg.embed_batch_size,
+                        on_progress=lambda n: prog.advance(task, n),
+                    )
+                    # Attach numpy slices (1.5 KB each) instead of list[float]
+                    # (12 KB each) — db.insert_nodes converts to list per
+                    # write batch just before the UNWIND call.
+                    for r, v in zip(rows, vecs):
+                        r["embedding"] = v
+                    write_q.put(rows)
+                    # Free the embedding text strings for this slab.
+                    del texts, vecs, batch
+        finally:
+            write_q.put(None)
+            t.join()
+        if errors:
+            raise errors[0]
 
     # ---- DB delete ----
     def _augment_llm_docstrings(self, parsed: dict) -> None:
@@ -370,13 +438,15 @@ class Indexer:
         self._seed_ids_from_db()
 
         # ---- Step 4: build node rows for newly-parsed files ----
+        # Streaming design: we collect (row, embed_text) plans per label and
+        # then embed-and-insert in batches via _stream_embed_insert(). This
+        # caps peak memory at ~one batch worth of vectors instead of holding
+        # all 200k+ embeddings live at once. No `[0.0] * dim` placeholders;
+        # numpy slices are attached just-in-time per batch.
         file_rows: list[dict] = []
-        class_rows: list[dict] = []
-        function_rows: list[dict] = []
         variable_rows: list[dict] = []
-        # qname → (label, id) for ALL entities (across cache, for edge resolution)
-        # plus tracking which are new for embedding
-        new_embed_targets: list[tuple[str, int, str]] = []  # (label, id, text) for embedding
+        class_plan: list[tuple[dict, str]] = []     # (row, embed_text)
+        function_plan: list[tuple[dict, str]] = []  # (row, embed_text)
 
         for rel, fp in parsed.items():
             fid = self._new_id()
@@ -394,7 +464,7 @@ class Indexer:
                 # (we'll rebuild the cache entity with ids below)
                 ent.extra["_id"] = eid
                 if ent.kind in ("class", "interface"):
-                    class_rows.append({
+                    row = {
                         "id": eid,
                         "name": ent.name,
                         "qname": ent.qname,
@@ -403,25 +473,21 @@ class Indexer:
                         "line_end": ent.line_end,
                         "body": ent.body,
                         "kind": ent.kind,
-                        "embedding": [0.0] * self.embedder.dim,
                         "pagerank": 0.0,
-                    })
-                    new_embed_targets.append((
-                        "Class",
-                        eid,
-                        build_embedding_text(
-                            ent.name, ent.qname, ent.signature, ent.body,
-                            fp.language, ent.kind,
-                            llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
-                        ),
-                    ))
+                    }
+                    text = build_embedding_text(
+                        ent.name, ent.qname, ent.signature, ent.body,
+                        fp.language, ent.kind,
+                        llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
+                    )
+                    class_plan.append((row, text))
                 elif ent.kind in ("function", "method"):
                     is_test = (
                         ent.name.startswith("test_") or
                         (ent.name.startswith("test") and len(ent.name) > 4 and ent.name[4:5].isupper()) or
                         "/test" in rel or "/tests/" in rel or "_test." in rel
                     )
-                    function_rows.append({
+                    row = {
                         "id": eid,
                         "name": ent.name,
                         "qname": ent.qname,
@@ -432,18 +498,14 @@ class Indexer:
                         "signature": ent.signature or ent.body.split("\n")[0][:200],
                         "is_method": ent.kind == "method",
                         "is_test": is_test,
-                        "embedding": [0.0] * self.embedder.dim,
                         "pagerank": 0.0,
-                    })
-                    new_embed_targets.append((
-                        "Function",
-                        eid,
-                        build_embedding_text(
-                            ent.name, ent.qname, ent.signature, ent.body,
-                            fp.language, ent.kind,
-                            llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
-                        ),
-                    ))
+                    }
+                    text = build_embedding_text(
+                        ent.name, ent.qname, ent.signature, ent.body,
+                        fp.language, ent.kind,
+                        llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
+                    )
+                    function_plan.append((row, text))
                 else:
                     variable_rows.append({
                         "id": eid,
@@ -454,32 +516,36 @@ class Indexer:
                         "scope": ent.extra.get("scope", "module") if isinstance(ent.extra, dict) else "module",
                     })
 
-        # ---- Step 5: embed new entities ----
-        if new_embed_targets:
-            # Warm up the model BEFORE opening the progress bar so its
-            # "Loading embedding model" log line doesn't punch through the
-            # live display and strand a 0% bar above it.
-            self.embedder._ensure()
-            with _bar() as prog:
-                etask = prog.add_task("Embedding entities", total=len(new_embed_targets))
-                vectors = self.embedder.embed(
-                    [t[2] for t in new_embed_targets],
-                    batch_size=self.cfg.embed_batch_size,
-                    on_progress=lambda n: prog.advance(etask, n),
-                )
-            vec_by_id: dict[tuple[str, int], list[float]] = {}
-            for (label, eid, _), vec in zip(new_embed_targets, vectors):
-                vec_by_id[(label, eid)] = vec
-            for r in class_rows:
-                r["embedding"] = vec_by_id.get(("Class", r["id"]), [0.0] * self.embedder.dim)
-            for r in function_rows:
-                r["embedding"] = vec_by_id.get(("Function", r["id"]), [0.0] * self.embedder.dim)
+        n_classes = len(class_plan)
+        n_functions = len(function_plan)
+        _console.print(
+            f"[cyan]Indexing[/] {len(file_rows)} files, {n_classes} classes, "
+            f"{n_functions} functions, {len(variable_rows)} variables"
+        )
 
-        # ---- Step 5b: build sub-chunks for long entities ----
-        chunk_rows: list[dict] = []
+        # ---- Step 5a: insert files + variables (no embeddings) ----
+        with _console.status(f"[cyan]Writing[/] files + variables"):
+            self.db.insert_nodes("File", file_rows)
+            self.db.insert_nodes("Variable", variable_rows)
+        del file_rows, variable_rows
+
+        # Warm up the embedder once before any progress bar opens, so the
+        # "Loading embedding model" log doesn't punch through the live display.
+        if class_plan or function_plan:
+            self.embedder._ensure()
+
+        # ---- Step 5b: stream embed + insert classes/functions ----
+        if class_plan:
+            self._stream_embed_insert("Class", class_plan, "Embedding entities (classes)")
+            class_plan.clear()
+        if function_plan:
+            self._stream_embed_insert("Function", function_plan, "Embedding entities (functions)")
+            function_plan.clear()
+
+        # ---- Step 5c: build chunk plan, then stream embed + insert ----
+        chunk_plan: list[tuple[dict, str]] = []
         chunk_contains_func: list[dict] = []
         chunk_contains_class: list[dict] = []
-        # Walk parsed entities + use the freshly-assigned ids stored on ent.extra
         for rel, fp in parsed.items():
             for ent in fp.entities:
                 eid = ent.extra.get("_id") if isinstance(ent.extra, dict) else None
@@ -493,46 +559,30 @@ class Indexer:
                 parent_label = "Class" if ent.kind in ("class", "interface") else "Function"
                 for idx, piece in enumerate(pieces):
                     cid = self._new_id()
-                    chunk_rows.append({
+                    body_truncated = piece[:6000]
+                    row = {
                         "id": cid,
                         "parent_qname": ent.qname,
                         "parent_label": parent_label,
                         "file": rel,
                         "idx": idx,
-                        "body": piece[:6000],
-                        "embedding": [0.0] * self.embedder.dim,
-                    })
+                        "body": body_truncated,
+                    }
+                    chunk_plan.append((row, body_truncated))
                     if parent_label == "Function":
                         chunk_contains_func.append({"from_id": eid, "to_id": cid})
                     else:
                         chunk_contains_class.append({"from_id": eid, "to_id": cid})
 
-        # Embed all chunks in one batch
-        if chunk_rows:
-            chunk_texts = [r["body"] for r in chunk_rows]
-            with _bar() as prog:
-                ctask = prog.add_task("Embedding chunks", total=len(chunk_texts))
-                chunk_vecs = self.embedder.embed(
-                    chunk_texts,
-                    batch_size=self.cfg.embed_batch_size,
-                    on_progress=lambda n: prog.advance(ctask, n),
-                )
-            for r, v in zip(chunk_rows, chunk_vecs):
-                r["embedding"] = v
+        if chunk_plan:
+            self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks")
+            chunk_plan.clear()
 
-        # ---- Step 6: write new nodes ----
-        with _console.status(
-            f"[cyan]Writing[/] {len(file_rows)} files, {len(class_rows)} classes, "
-            f"{len(function_rows)} functions, {len(variable_rows)} variables, "
-            f"{len(chunk_rows)} chunks"
-        ):
-            self.db.insert_nodes("File", file_rows)
-            self.db.insert_nodes("Class", class_rows)
-            self.db.insert_nodes("Function", function_rows)
-            self.db.insert_nodes("Variable", variable_rows)
-            self.db.insert_nodes("Chunk", chunk_rows)
+        # ---- Step 5d: CONTAINS_CHUNK edges ----
+        with _console.status("[cyan]Writing chunk edges[/]"):
             self.db.insert_edges("CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func)
             self.db.insert_edges("CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class)
+        del chunk_contains_func, chunk_contains_class
 
         # ---- Step 7: build full symbol table from DB ----
         # qname → (label, id); name → list[(label, id, file)]
