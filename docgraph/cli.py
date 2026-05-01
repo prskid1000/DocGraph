@@ -4,6 +4,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import signal
 import sys
 from pathlib import Path
 
@@ -17,6 +19,32 @@ from docgraph.config import find_repo_root, load_config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder
 from docgraph.index import Indexer
+
+
+def _install_hard_sigint() -> None:
+    """Force-exit on Ctrl+C, bypassing uvicorn's graceful shutdown.
+
+    On Windows, asyncio.add_signal_handler() is unimplemented, so uvicorn
+    can't reliably wake its event loop from a SIGINT received while blocked
+    in I/O — the user hits Ctrl+C and nothing happens. Even when uvicorn
+    *does* notice, it tries to drain in-flight requests, but the SSE stream
+    the browser holds open to /api/events never closes, so the drain hangs.
+
+    The fix: install a SIGINT handler that calls os._exit(0) directly. It
+    skips Python's normal teardown (atexit, finalizers), which means we
+    rely on Kuzu's read-only connection cleanup not being load-bearing —
+    and it isn't, since read-only connections don't write to the DB.
+    """
+    def _handler(signum, frame):  # noqa: ARG001
+        os._exit(0)
+    try:
+        signal.signal(signal.SIGINT, _handler)
+        if hasattr(signal, "SIGBREAK"):
+            # Windows-specific Ctrl+Break — also force-exit.
+            signal.signal(signal.SIGBREAK, _handler)
+    except (ValueError, OSError):
+        # Some embedded contexts can't install signal handlers; just skip.
+        pass
 
 app = typer.Typer(
     name="docgraph",
@@ -163,13 +191,17 @@ def watch(
     """
     _setup_logging(verbose)
     cfg = load_config(path)
-    if serve:
-        from docgraph.watch import watch_and_serve
-        asyncio.run(watch_and_serve(cfg, debounce_ms=debounce, host=host, port=port))
-        return
-    console.print(f"[cyan]Watching[/cyan] {cfg.repo_root}  debounce={debounce}ms")
-    from docgraph.watch import watch_repo
-    watch_repo(cfg, debounce_ms=debounce)
+    _install_hard_sigint()
+    try:
+        if serve:
+            from docgraph.watch import watch_and_serve
+            asyncio.run(watch_and_serve(cfg, debounce_ms=debounce, host=host, port=port))
+            return
+        console.print(f"[cyan]Watching[/cyan] {cfg.repo_root}  debounce={debounce}ms")
+        from docgraph.watch import watch_repo
+        watch_repo(cfg, debounce_ms=debounce)
+    except KeyboardInterrupt:
+        pass
 
 
 @app.command()
@@ -191,12 +223,12 @@ def serve(
         raise typer.Exit(1)
     from docgraph.server import make_app
     app_obj = make_app(cfg)
-    console.print(f"[green]Serving[/green] http://{cfg.host}:{cfg.port}/")
-    # timeout_graceful_shutdown=1: when the user hits Ctrl+C, uvicorn waits at
-    # most 1s for in-flight requests to drain. Without this, the open SSE
-    # connection from the browser (/api/events) holds the loop forever and
-    # Ctrl+C feels frozen — pressing it again does nothing because the first
-    # SIGINT already started the never-ending graceful drain.
+    console.print(f"[green]Serving[/green] http://{cfg.host}:{cfg.port}/  [dim](Ctrl+C to stop)[/]")
+    # See _install_hard_sigint(): the graceful-drain timeout is a fallback
+    # for non-Windows. On Windows it's the SIGINT handler that actually
+    # terminates the process — uvicorn's own signal plumbing doesn't fire
+    # reliably while the loop is blocked on I/O.
+    _install_hard_sigint()
     try:
         uvicorn.run(
             app_obj,
@@ -223,13 +255,17 @@ def mcp(
         raise typer.Exit(1)
     from docgraph.mcp_tools import make_mcp
     server = make_mcp(cfg)
-    if transport == "stdio":
-        server.run()
-    elif transport == "http":
-        server.run(transport="http", host=cfg.host, port=cfg.port)
-    else:
-        console.print(f"[red]Unknown transport {transport}[/red]", file=sys.stderr)
-        raise typer.Exit(2)
+    _install_hard_sigint()
+    try:
+        if transport == "stdio":
+            server.run()
+        elif transport == "http":
+            server.run(transport="http", host=cfg.host, port=cfg.port)
+        else:
+            console.print(f"[red]Unknown transport {transport}[/red]", file=sys.stderr)
+            raise typer.Exit(2)
+    except KeyboardInterrupt:
+        pass
 
 
 @app.command()
@@ -460,8 +496,12 @@ def daemon_start(
             console.print("[yellow]Daemon launched but lock not visible yet — check `docgraph daemon status`[/]")
         return
 
-    console.print(f"[cyan]Starting daemon[/] on 127.0.0.1:{port} (model={model}, gpu={gpu})")
-    rc = run_daemon(port=port, model_name=model, gpu=gpu)
+    console.print(f"[cyan]Starting daemon[/] on 127.0.0.1:{port} (model={model}, gpu={gpu})  [dim](Ctrl+C to stop)[/]")
+    _install_hard_sigint()
+    try:
+        rc = run_daemon(port=port, model_name=model, gpu=gpu)
+    except KeyboardInterrupt:
+        rc = 0
     raise typer.Exit(rc)
 
 
