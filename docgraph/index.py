@@ -384,6 +384,11 @@ class Indexer:
 
         # Full reindex path
         if not incremental:
+            # Release the Windows file lock before rmtree — Kuzu's connection
+            # holds the dir open and shutil.rmtree silently leaves a partial
+            # state, which then crashes the next Database() constructor with
+            # `invalid unordered_map<K, T> key`.
+            self.db.close()
             self.db.wipe(self.cfg.db_path)
             self.db = GraphDB(self.cfg.db_path, self.embedder.dim)
             self.db.init_schema()
@@ -621,17 +626,26 @@ class Indexer:
         qname_index: dict[str, tuple[str, int]] = {}
         name_index: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
         file_index: dict[str, int] = {}
-        symtab_status = _console.status("[cyan]Building symbol table[/]")
-        symtab_status.start()
-        for label in ("Function", "Class", "Variable"):
-            for r in self.db.fetch_all(
-                f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, "
-                f"n.qname AS qname, n.file AS file"
-            ):
-                qname_index[r["qname"]] = (label, r["id"])
-                name_index[r["name"]].append((label, r["id"], r["file"]))
-        for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path"):
-            file_index[r["path"]] = r["id"]
+        # Count first so the bar has a real total. Counts are cheap aggregates;
+        # the row scan below is what actually takes time on big repos.
+        counts: dict[str, int] = {}
+        for label in ("Function", "Class", "Variable", "File"):
+            rows = self.db.fetch_all(f"MATCH (n:{label}) RETURN count(n) AS c")
+            counts[label] = int(rows[0]["c"]) if rows else 0
+        symtab_total = sum(counts.values())
+        with _bar() as prog:
+            stask = prog.add_task("Building symbol table", total=symtab_total)
+            for label in ("Function", "Class", "Variable"):
+                for r in self.db.fetch_all(
+                    f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, "
+                    f"n.qname AS qname, n.file AS file"
+                ):
+                    qname_index[r["qname"]] = (label, r["id"])
+                    name_index[r["name"]].append((label, r["id"], r["file"]))
+                    prog.advance(stask)
+            for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path"):
+                file_index[r["path"]] = r["id"]
+                prog.advance(stask)
 
         # Scope-aware resolution: per-file set of files that file imports.
         # Built from the same fuzzy IMPORTS-target match we use for the edge
@@ -639,21 +653,46 @@ class Indexer:
         # same-named symbols in unrelated files. This is the best we can do
         # without a real LSP — in practice it kills most cross-file CALLS
         # hallucinations on overloads / generics / re-exports.
+        # Dedupe by target_path: many IMPORTS edges share the same target
+        # (e.g. "react", "os.path"). Resolve each unique target against
+        # file_index once, then fan out — cuts work from O(E × F) to
+        # O(T × F + E) where T ≪ E on real repos.
         file_imports: dict[str, set[str]] = defaultdict(set)
+        import_pairs: list[tuple[str, str]] = []  # (rel, target_path)
         for rel, file_data in cache.items():
             for raw in file_data.get("edges", []):
                 if raw.get("kind") != "IMPORTS":
                     continue
-                target_name = raw.get("target_name") or ""
-                target_path = target_name.replace(".", "/")
+                target_path = (raw.get("target_name") or "").replace(".", "/")
                 if not target_path:
                     continue
-                for path in file_index:
-                    if path == rel:
-                        continue
-                    if path.startswith(target_path) or target_path in path:
-                        file_imports[rel].add(path)
-                        break
+                import_pairs.append((rel, target_path))
+
+        unique_targets = {tp for _, tp in import_pairs}
+        file_paths_list = list(file_index.keys())
+        # Keep up to 2 matches per target so fan-out can skip self-matches
+        # without re-scanning (preserves the original loop's semantics).
+        target_matches: dict[str, list[str]] = {}
+        if unique_targets:
+            with _bar() as prog:
+                task = prog.add_task(
+                    "Resolving import scope", total=len(unique_targets)
+                )
+                for tp in unique_targets:
+                    matches: list[str] = []
+                    for path in file_paths_list:
+                        if path.startswith(tp) or tp in path:
+                            matches.append(path)
+                            if len(matches) >= 2:
+                                break
+                    target_matches[tp] = matches
+                    prog.advance(task)
+
+        for rel, tp in import_pairs:
+            for m in target_matches.get(tp, ()):
+                if m != rel:
+                    file_imports[rel].add(m)
+                    break
 
         def needs_insert(src_file: str, target_file: str | None) -> bool:
             """True if either endpoint was just (re)created."""
@@ -682,13 +721,9 @@ class Indexer:
                     pool = pref
             return pool[0]
 
-        symtab_status.stop()
-
         # ---- Step 8: re-resolve and write edges ----
         # Combine RawEdges from cache (covers both unchanged and just-parsed files).
         # For each edge, decide if it needs DB insertion.
-        edges_status = _console.status("[cyan]Resolving and writing edges[/]")
-        edges_status.start()
         contains_groups: dict[tuple[str, str], list[dict]] = defaultdict(list)
         calls_rows: list[dict] = []
         inst_rows: list[dict] = []
@@ -706,15 +741,35 @@ class Indexer:
         for r in self.db.fetch_all("MATCH (m:Module) RETURN m.id AS id, m.name AS name"):
             module_rows_by_name[r["name"]] = {"id": r["id"], "name": r["name"], "language": ""}
 
+        # Total work for the resolution bar: CONTAINS pass over changed-file
+        # entities + the full RawEdge pass over every file's cached edges.
+        n_resolve_contains = sum(
+            len(fd.get("entities", []))
+            for rel, fd in cache.items() if rel in changed_set
+        )
+        n_resolve_edges = sum(len(fd.get("edges", [])) for fd in cache.values())
+        n_resolve_total = n_resolve_contains + n_resolve_edges
+
+        prog_resolve = _bar() if n_resolve_total else None
+        if prog_resolve is not None:
+            prog_resolve.start()
+            rtask = prog_resolve.add_task("Resolving edges", total=n_resolve_total)
+        else:
+            rtask = None  # type: ignore[assignment]
+
         # CONTAINS edges from cached entities (only for changed files; unchanged are still in DB)
         for rel, file_data in cache.items():
             if rel not in changed_set:
                 continue
             fid = file_index.get(rel)
             if fid is None:
+                if prog_resolve is not None:
+                    prog_resolve.advance(rtask, len(file_data.get("entities", [])))
                 continue
             # qnames in this file
             for ent_dict in file_data["entities"]:
+                if prog_resolve is not None:
+                    prog_resolve.advance(rtask)
                 qname = ent_dict["qname"]
                 if qname not in qname_index:
                     continue
@@ -734,6 +789,8 @@ class Indexer:
         # Other edges from cached RawEdges
         for rel, file_data in cache.items():
             for raw in file_data.get("edges", []):
+                if prog_resolve is not None:
+                    prog_resolve.advance(rtask)
                 kind = raw["kind"]
                 src_qname = raw.get("src_qname")
                 target_name = raw.get("target_name")
@@ -890,7 +947,8 @@ class Indexer:
                         overrides_rows.append({"from_id": child_mid, "to_id": parent_mid})
 
         # Insert collected edges
-        edges_status.stop()
+        if prog_resolve is not None:
+            prog_resolve.stop()
         n_edges = (
             sum(len(r) for r in contains_groups.values())
             + len(calls_rows) + len(inst_rows) + len(inherits_rows)
@@ -940,12 +998,16 @@ class Indexer:
 
         # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----
         # Cache entities should not carry _id (transient); strip.
-        with _console.status("[cyan]Persisting cache[/]"):
+        n_cache_ents = sum(len(c.get("entities", [])) for c in cache.values())
+        with _bar() as prog:
+            task = prog.add_task("Persisting cache", total=n_cache_ents + 1)
             for rel in cache:
                 for ent in cache[rel].get("entities", []):
                     if "extra" in ent and isinstance(ent["extra"], dict):
                         ent["extra"].pop("_id", None)
+                    prog.advance(task)
             save_cache(self.cfg, cache)
+            prog.advance(task)
 
         elapsed = time.perf_counter() - t0
         total_entities = sum(len(c.get("entities", [])) for c in cache.values())
@@ -1007,26 +1069,46 @@ class Indexer:
                 self.db.execute("MATCH ()-[r:TESTS]->() DELETE r")
             except Exception:
                 pass
-            with _console.status("[cyan]Computing SIMILAR_TO edges (functions)[/]"):
+            for label, desc in (("Function", "functions"), ("Class", "classes")):
                 rows = self.db.fetch_all(
-                    "MATCH (n:Function) RETURN n.id AS id, n.embedding AS embedding"
+                    f"MATCH (n:{label}) RETURN n.id AS id, n.embedding AS embedding"
                 )
-                self._write_similar_edges(rows, "Function")
-            with _console.status("[cyan]Computing SIMILAR_TO edges (classes)[/]"):
-                rows = self.db.fetch_all(
-                    "MATCH (n:Class) RETURN n.id AS id, n.embedding AS embedding"
-                )
-                self._write_similar_edges(rows, "Class")
+                if len(rows) < 2:
+                    continue
+                with _bar() as prog:
+                    task = prog.add_task(
+                        f"SIMILAR_TO ({desc})", total=len(rows)
+                    )
+                    self._write_similar_edges(
+                        rows, label,
+                        on_progress=lambda n: prog.advance(task, n),
+                    )
         else:
             # Partial: only entities in dirty_files have changed embeddings.
             # Delete SIMILAR_TO incident to those entities, then recompute
             # outgoing top-K only for them. Other entities may keep stale
             # back-links to changed entities — accepted drift on incremental;
             # full reindex resets.
-            with _console.status("[cyan]Updating SIMILAR_TO (functions, partial)[/]"):
-                self._recompute_similar_partial("Function", dirty_files)
-            with _console.status("[cyan]Updating SIMILAR_TO (classes, partial)[/]"):
-                self._recompute_similar_partial("Class", dirty_files)
+            for label, desc in (("Function", "functions"), ("Class", "classes")):
+                # Pre-count dirty entities so we can size the bar honestly
+                if not dirty_files:
+                    continue
+                files_list = list(dirty_files)
+                cnt_rows = self.db.fetch_all(
+                    f"MATCH (n:{label}) WHERE n.file IN $files RETURN count(n) AS c",
+                    {"files": files_list},
+                )
+                total = int(cnt_rows[0]["c"]) if cnt_rows else 0
+                if total == 0:
+                    continue
+                with _bar() as prog:
+                    task = prog.add_task(
+                        f"SIMILAR_TO ({desc}, partial)", total=total
+                    )
+                    self._recompute_similar_partial(
+                        label, dirty_files,
+                        on_progress=lambda n: prog.advance(task, n),
+                    )
 
         # CO_CHANGED_WITH: skip if no git HEAD has moved since last run.
         last_heads = state.get("git_heads", {}) or {}
@@ -1041,37 +1123,76 @@ class Indexer:
             if last_heads.get(str(root)) != head:
                 any_head_changed = True
         if any_head_changed or full:
-            with _console.status("[cyan]Computing CO_CHANGED_WITH from git history[/]"):
-                file_index = {
-                    r["path"]: r["id"]
-                    for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
-                }
-                try:
-                    self.db.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
-                except Exception:
-                    pass
-                self._write_co_changed(file_index)
+            file_index = {
+                r["path"]: r["id"]
+                for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
+            }
+            try:
+                self.db.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
+            except Exception:
+                pass
+            total_commits = sum(
+                self._count_commits(root)
+                for root, _prefix in self.cfg.roots_with_prefix()
+            )
+            with _bar() as prog:
+                task = prog.add_task(
+                    "CO_CHANGED_WITH (git history)", total=max(total_commits, 1)
+                )
+                self._write_co_changed(
+                    file_index,
+                    on_progress=lambda n: prog.advance(task, n),
+                )
+                # Top up if rev-list count and parsed-commit count diverge so
+                # the bar still finishes cleanly.
+                if total_commits == 0:
+                    prog.advance(task, 1)
             state["git_heads"] = cur_heads
         else:
             _console.print("[dim]CO_CHANGED_WITH: git HEAD unchanged — skipped[/]")
 
         # TESTS: full or partial-by-changed-files
         if full:
-            with _console.status("[cyan]Linking TESTS edges[/]"):
-                function_rows_db = self.db.fetch_all(
-                    "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
-                )
-                self._write_tests_edges(function_rows_db, self._build_name_index())
+            function_rows_db = self.db.fetch_all(
+                "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
+            )
+            if function_rows_db:
+                with _bar() as prog:
+                    task = prog.add_task(
+                        "TESTS edges", total=len(function_rows_db)
+                    )
+                    self._write_tests_edges(
+                        function_rows_db, self._build_name_index(),
+                        on_progress=lambda n: prog.advance(task, n),
+                    )
         else:
-            with _console.status("[cyan]Updating TESTS (partial)[/]"):
-                self._recompute_tests_partial(dirty_files)
+            if dirty_files:
+                files_list = list(dirty_files)
+                cnt = self.db.fetch_all(
+                    "MATCH (n:Function) WHERE n.file IN $files AND n.is_test "
+                    "RETURN count(n) AS c",
+                    {"files": files_list},
+                )
+                total = int(cnt[0]["c"]) if cnt else 0
+                if total:
+                    with _bar() as prog:
+                        task = prog.add_task("TESTS edges (partial)", total=total)
+                        self._recompute_tests_partial(
+                            dirty_files,
+                            on_progress=lambda n: prog.advance(task, n),
+                        )
 
         # PageRank: gated by graph_dirty at the caller, so always run here.
         # Inherently global — every node's rank depends on the whole graph
         # topology, so partial recompute would be approximate. Keep full.
-        with _console.status("[cyan]Running PageRank[/]"):
+        # NetworkX exposes no per-iteration hook so the bar fills in two
+        # steps: 0% before compute_pagerank, 50% after, 100% after write.
+        with _bar() as prog:
+            task = prog.add_task("PageRank", total=2)
             scores = compute_pagerank(self.db)
+            prog.advance(task)
             write_pagerank(self.db, scores)
+            prog.advance(task)
 
     def _git_head(self, root: Path) -> str | None:
         try:
@@ -1090,7 +1211,12 @@ class Indexer:
             idx[r["name"]].append(("Class", r["id"]))
         return idx
 
-    def _recompute_similar_partial(self, label: str, dirty_files: set[str]) -> None:
+    def _recompute_similar_partial(
+        self,
+        label: str,
+        dirty_files: set[str],
+        on_progress: Callable[[int], None] | None = None,
+    ) -> None:
         if not dirty_files:
             return
         files_list = list(dirty_files)
@@ -1149,10 +1275,16 @@ class Indexer:
                     "to_id": ids[int(j)],
                     "score": score,
                 })
+            if on_progress is not None:
+                on_progress(1)
         if sim_edges:
             self.db.insert_edges("SIMILAR_TO", label, label, sim_edges)
 
-    def _recompute_tests_partial(self, dirty_files: set[str]) -> None:
+    def _recompute_tests_partial(
+        self,
+        dirty_files: set[str],
+        on_progress: Callable[[int], None] | None = None,
+    ) -> None:
         if not dirty_files:
             return
         files_list = list(dirty_files)
@@ -1177,10 +1309,18 @@ class Indexer:
         )
         if not test_rows:
             return
-        self._write_tests_edges(test_rows, self._build_name_index())
+        self._write_tests_edges(
+            test_rows, self._build_name_index(),
+            on_progress=on_progress,
+        )
 
     # ---- Tier 4 helpers ----
-    def _write_similar_edges(self, rows: list[dict], label: str) -> None:
+    def _write_similar_edges(
+        self,
+        rows: list[dict],
+        label: str,
+        on_progress: Callable[[int], None] | None = None,
+    ) -> None:
         if len(rows) < 2:
             return
         import numpy as np
@@ -1214,10 +1354,16 @@ class Indexer:
                         "to_id": ids[int(j)],
                         "score": score,
                     })
+            if on_progress is not None:
+                on_progress(end - start)
         if sim_edges:
             self.db.insert_edges("SIMILAR_TO", label, label, sim_edges)
 
-    def _write_co_changed(self, file_index: dict[str, int]) -> None:
+    def _write_co_changed(
+        self,
+        file_index: dict[str, int],
+        on_progress: Callable[[int], None] | None = None,
+    ) -> None:
         pair_count: dict[tuple[str, str], int] = defaultdict(int)
         for root, prefix in self.cfg.roots_with_prefix():
             try:
@@ -1247,6 +1393,8 @@ class Indexer:
                     for b in files[i + 1:]:
                         pair = tuple(sorted([a, b]))
                         pair_count[pair] += 1
+                if on_progress is not None:
+                    on_progress(1)
 
         rows = [
             {"from_id": file_index[a], "to_id": file_index[b], "count": c}
@@ -1255,14 +1403,28 @@ class Indexer:
         if rows:
             self.db.insert_edges("CO_CHANGED_WITH", "File", "File", rows)
 
+    def _count_commits(self, root: Path) -> int:
+        """Cheap: just count how many `--- ` separators are in the windowed log."""
+        try:
+            out = subprocess.check_output(
+                ["git", "rev-list", "--count", f"-{self.cfg.co_change_window}", "HEAD"],
+                cwd=root, text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+            return int(out) if out.isdigit() else 0
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return 0
+
     def _write_tests_edges(
         self,
         function_rows: list[dict],
         name_index: dict[str, list[tuple[str, int]]],
+        on_progress: Callable[[int], None] | None = None,
     ) -> None:
         rows_func: list[dict] = []
         rows_class: list[dict] = []
         for fr in function_rows:
+            if on_progress is not None:
+                on_progress(1)
             if not fr.get("is_test"):
                 continue
             stripped = fr["name"]
