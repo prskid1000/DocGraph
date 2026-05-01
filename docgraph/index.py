@@ -339,6 +339,9 @@ class Indexer:
     def index_all(self, incremental: bool = True, progress_cb: ProgressCb = None) -> dict:
         t0 = time.perf_counter()
         cache = load_cache(self.cfg) if incremental else {}
+        # If the cache was empty AND we're "incremental", treat the run as a
+        # full pass for Tier 4 purposes — there's no prior state to preserve.
+        cache_was_present = bool(cache)
         files_on_disk = walk_files(self.cfg)
         # logical_rel → absolute path
         on_disk_rel: dict[str, Path] = {rel: path for path, rel in files_on_disk}
@@ -794,48 +797,27 @@ class Indexer:
         self.db.insert_edges("IMPORTS", "File", "Module", imports_module_rows)
         edges_status.stop()
 
-        # ---- Step 9: Tier 4 + PageRank (always recomputed; cheap and global) ----
-        # Wipe and rebuild SIMILAR_TO and CO_CHANGED_WITH; PageRank too.
-        try:
-            self.db.execute("MATCH ()-[r:SIMILAR_TO]->() DELETE r")
-            self.db.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
-            self.db.execute("MATCH ()-[r:TESTS]->() DELETE r")
-        except Exception:
-            pass
+        # ---- Step 9: Tier 4 + PageRank (incremental-aware) ----
+        # Skip entirely on no-op runs (no parsed, no deleted) so a `docgraph
+        # index` against an unchanged repo doesn't rewrite ~M of edges +
+        # pagerank props. On partial-change incrementals, recompute only for
+        # entities in changed files; on full reindex, do the global pass.
+        graph_dirty = bool(parsed) or bool(deleted_rels)
+        full_recompute = (not incremental) or (not cache_was_present)
+        state = self._load_state()
 
-        with _console.status("[cyan]Computing SIMILAR_TO edges (functions)[/]"):
-            sim_rows = self.db.fetch_all(
-                "MATCH (n:Function) RETURN n.id AS id, n.embedding AS embedding"
+        if not graph_dirty and not full_recompute:
+            _console.print("[dim]Tier 4 + PageRank: no changes — skipped[/]")
+        else:
+            self._recompute_tier4(
+                changed_files=changed_set,
+                deleted_files=set(deleted_rels),
+                full=full_recompute,
+                state=state,
             )
-            self._write_similar_edges(sim_rows, "Function")
-        with _console.status("[cyan]Computing SIMILAR_TO edges (classes)[/]"):
-            sim_rows = self.db.fetch_all(
-                "MATCH (n:Class) RETURN n.id AS id, n.embedding AS embedding"
-            )
-            self._write_similar_edges(sim_rows, "Class")
 
-        with _console.status("[cyan]Computing CO_CHANGED_WITH from git history[/]"):
-            # Refresh file_index post-insert
-            file_index = {
-                r["path"]: r["id"]
-                for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
-            }
-            self._write_co_changed(file_index)
-
-        with _console.status("[cyan]Linking TESTS edges[/]"):
-            function_rows_db = self.db.fetch_all(
-                "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
-            )
-            name_index2: dict[str, list[tuple[str, int]]] = defaultdict(list)
-            for r in self.db.fetch_all("MATCH (n:Function) RETURN n.id AS id, n.name AS name"):
-                name_index2[r["name"]].append(("Function", r["id"]))
-            for r in self.db.fetch_all("MATCH (n:Class) RETURN n.id AS id, n.name AS name"):
-                name_index2[r["name"]].append(("Class", r["id"]))
-            self._write_tests_edges(function_rows_db, name_index2)
-
-        with _console.status("[cyan]Running PageRank[/]"):
-            scores = compute_pagerank(self.db)
-            write_pagerank(self.db, scores)
+        # Persist state (last-known git HEAD per root, etc.)
+        self._save_state(state)
 
         # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----
         # Cache entities should not carry _id (transient); strip.
@@ -861,6 +843,222 @@ class Indexer:
             "elapsed": elapsed,
             "errors": len(errors),
         }
+
+    # ---- Persistent state (separate from cache: smaller, global) ----
+    def _state_path(self) -> Path:
+        return self.cfg.cache_path.parent / "state.json"
+
+    def _load_state(self) -> dict:
+        p = self._state_path()
+        if not p.exists():
+            return {}
+        try:
+            return json.loads(p.read_text())
+        except Exception:
+            return {}
+
+    def _save_state(self, state: dict) -> None:
+        try:
+            self._state_path().write_text(json.dumps(state))
+        except Exception:
+            pass
+
+    # ---- Tier 4 driver ----
+    def _recompute_tier4(
+        self,
+        changed_files: set[str],
+        deleted_files: set[str],
+        full: bool,
+        state: dict,
+    ) -> None:
+        """Recompute Tier 4 edges + PageRank.
+
+        full=True: classic wipe + global recompute (used on `--full` or first
+        run with empty cache). full=False: only touch edges incident to
+        entities in changed_files / deleted_files. Saves the bulk of the
+        write traffic on small incrementals.
+        """
+        dirty_files = changed_files | deleted_files
+
+        if full:
+            # Existing wipe-and-rebuild path
+            try:
+                self.db.execute("MATCH ()-[r:SIMILAR_TO]->() DELETE r")
+                self.db.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
+                self.db.execute("MATCH ()-[r:TESTS]->() DELETE r")
+            except Exception:
+                pass
+            with _console.status("[cyan]Computing SIMILAR_TO edges (functions)[/]"):
+                rows = self.db.fetch_all(
+                    "MATCH (n:Function) RETURN n.id AS id, n.embedding AS embedding"
+                )
+                self._write_similar_edges(rows, "Function")
+            with _console.status("[cyan]Computing SIMILAR_TO edges (classes)[/]"):
+                rows = self.db.fetch_all(
+                    "MATCH (n:Class) RETURN n.id AS id, n.embedding AS embedding"
+                )
+                self._write_similar_edges(rows, "Class")
+        else:
+            # Partial: only entities in dirty_files have changed embeddings.
+            # Delete SIMILAR_TO incident to those entities, then recompute
+            # outgoing top-K only for them. Other entities may keep stale
+            # back-links to changed entities — accepted drift on incremental;
+            # full reindex resets.
+            with _console.status("[cyan]Updating SIMILAR_TO (functions, partial)[/]"):
+                self._recompute_similar_partial("Function", dirty_files)
+            with _console.status("[cyan]Updating SIMILAR_TO (classes, partial)[/]"):
+                self._recompute_similar_partial("Class", dirty_files)
+
+        # CO_CHANGED_WITH: skip if no git HEAD has moved since last run.
+        last_heads = state.get("git_heads", {}) or {}
+        cur_heads: dict[str, str] = {}
+        any_head_changed = False
+        for root, _prefix in self.cfg.roots_with_prefix():
+            head = self._git_head(root)
+            if head is None:
+                # Not a git repo (or git missing) — leave as-is, treat as static
+                continue
+            cur_heads[str(root)] = head
+            if last_heads.get(str(root)) != head:
+                any_head_changed = True
+        if any_head_changed or full:
+            with _console.status("[cyan]Computing CO_CHANGED_WITH from git history[/]"):
+                file_index = {
+                    r["path"]: r["id"]
+                    for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path")
+                }
+                try:
+                    self.db.execute("MATCH ()-[r:CO_CHANGED_WITH]->() DELETE r")
+                except Exception:
+                    pass
+                self._write_co_changed(file_index)
+            state["git_heads"] = cur_heads
+        else:
+            _console.print("[dim]CO_CHANGED_WITH: git HEAD unchanged — skipped[/]")
+
+        # TESTS: full or partial-by-changed-files
+        if full:
+            with _console.status("[cyan]Linking TESTS edges[/]"):
+                function_rows_db = self.db.fetch_all(
+                    "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
+                )
+                self._write_tests_edges(function_rows_db, self._build_name_index())
+        else:
+            with _console.status("[cyan]Updating TESTS (partial)[/]"):
+                self._recompute_tests_partial(dirty_files)
+
+        # PageRank: gated by graph_dirty at the caller, so always run here.
+        # Inherently global — every node's rank depends on the whole graph
+        # topology, so partial recompute would be approximate. Keep full.
+        with _console.status("[cyan]Running PageRank[/]"):
+            scores = compute_pagerank(self.db)
+            write_pagerank(self.db, scores)
+
+    def _git_head(self, root: Path) -> str | None:
+        try:
+            return subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=root, text=True, stderr=subprocess.DEVNULL,
+            ).strip()
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            return None
+
+    def _build_name_index(self) -> dict[str, list[tuple[str, int]]]:
+        idx: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        for r in self.db.fetch_all("MATCH (n:Function) RETURN n.id AS id, n.name AS name"):
+            idx[r["name"]].append(("Function", r["id"]))
+        for r in self.db.fetch_all("MATCH (n:Class) RETURN n.id AS id, n.name AS name"):
+            idx[r["name"]].append(("Class", r["id"]))
+        return idx
+
+    def _recompute_similar_partial(self, label: str, dirty_files: set[str]) -> None:
+        if not dirty_files:
+            return
+        files_list = list(dirty_files)
+        # Edges to delete: any SIMILAR_TO touching an entity in a dirty file
+        try:
+            self.db.execute(
+                f"MATCH (a:{label})-[r:SIMILAR_TO]->(b:{label}) "
+                f"WHERE a.file IN $files OR b.file IN $files DELETE r",
+                {"files": files_list},
+            )
+        except Exception:
+            pass
+        # Get the dirty entity IDs to recompute outgoing top-K for
+        dirty_id_rows = self.db.fetch_all(
+            f"MATCH (n:{label}) WHERE n.file IN $files RETURN n.id AS id",
+            {"files": files_list},
+        )
+        dirty_ids = {r["id"] for r in dirty_id_rows}
+        if not dirty_ids:
+            return
+        rows = self.db.fetch_all(
+            f"MATCH (n:{label}) RETURN n.id AS id, n.embedding AS embedding"
+        )
+        if len(rows) < 2:
+            return
+        import numpy as np
+        ids = [r["id"] for r in rows]
+        id_to_idx = {eid: i for i, eid in enumerate(ids)}
+        try:
+            mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
+        except Exception:
+            return
+        norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
+        mat = mat / norms
+        update_idxs = [id_to_idx[i] for i in dirty_ids if i in id_to_idx]
+        if not update_idxs:
+            return
+        sub = mat[update_idxs]
+        sims = sub @ mat.T
+        sim_edges: list[dict] = []
+        k = self.cfg.similar_top_k
+        n = len(ids)
+        top_k = min(k, n - 1)
+        if top_k <= 0:
+            return
+        for row_i, idx in enumerate(update_idxs):
+            row = sims[row_i].copy()
+            row[idx] = -1.0
+            top = np.argpartition(-row, top_k)[:top_k]
+            for j in top:
+                score = float(row[int(j)])
+                if score < 0.5:
+                    continue
+                sim_edges.append({
+                    "from_id": ids[idx],
+                    "to_id": ids[int(j)],
+                    "score": score,
+                })
+        if sim_edges:
+            self.db.insert_edges("SIMILAR_TO", label, label, sim_edges)
+
+    def _recompute_tests_partial(self, dirty_files: set[str]) -> None:
+        if not dirty_files:
+            return
+        files_list = list(dirty_files)
+        # Drop any TESTS edge incident to a changed file
+        for from_to in (
+            "(a:Function)-[r:TESTS]->(b:Function)",
+            "(a:Function)-[r:TESTS]->(b:Class)",
+        ):
+            try:
+                self.db.execute(
+                    f"MATCH {from_to} WHERE a.file IN $files OR b.file IN $files DELETE r",
+                    {"files": files_list},
+                )
+            except Exception:
+                pass
+        # Re-link tests in changed files. The tests-in-unchanged-files that
+        # may now point to changed entities are out of scope on incremental.
+        test_rows = self.db.fetch_all(
+            "MATCH (n:Function) WHERE n.file IN $files AND n.is_test "
+            "RETURN n.id AS id, n.name AS name, n.is_test AS is_test",
+            {"files": files_list},
+        )
+        if not test_rows:
+            return
+        self._write_tests_edges(test_rows, self._build_name_index())
 
     # ---- Tier 4 helpers ----
     def _write_similar_edges(self, rows: list[dict], label: str) -> None:
