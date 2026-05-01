@@ -961,16 +961,43 @@ function runCommunities(iters){
         };
       });
       $$("#lod-row .hop-chip").forEach(c => {
-        c.onclick = () => {
+        c.onclick = async () => {
           $$("#lod-row .hop-chip").forEach(x => x.classList.remove("active"));
           c.classList.add("active");
           lodMode = c.dataset.lod;
           revealedSet = new Set();   // reset expansion when switching modes
+          // Switching INTO Level 0 — lazy-fetch every File in the repo, no
+          // cap. The initial /api/graph dump is top-K by PR so on a 40k-file
+          // repo most files are missing. Level 0 mode is supposed to show
+          // ALL of them, so we fetch them on demand the first time.
+          if (lodMode === "levels") await ensureAllFilesLoaded();
           computeVisible();
           fitOnFirstFrame = true;    // re-fit so the new tier centers nicely
           needsRender = true;
         };
       });
+    }
+
+    let _allFilesLoaded = false;
+    async function ensureAllFilesLoaded() {
+      if (_allFilesLoaded) return;
+      _allFilesLoaded = true;
+      try {
+        $("#loading").style.display = "";
+        $("#loading").textContent = "Loading all files…";
+        const data = await api("/api/files");
+        if (data && data.nodes) {
+          mergeNeighbors(data.nodes, data.edges || []);
+          for (const n of data.nodes) level0Set.add(n.id);
+          postLayoutInit();
+          if (!layoutRunning) startLayout();
+        }
+      } catch (e) {
+        console.warn("ensureAllFilesLoaded failed:", e);
+      } finally {
+        $("#loading").style.display = "none";
+        $("#loading").textContent = "Loading graph…";
+      }
     }
 
     function computeVisible() {

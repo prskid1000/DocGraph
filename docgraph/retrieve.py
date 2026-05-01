@@ -832,51 +832,94 @@ class Retriever:
         out.sort(key=lambda x: x["score"], reverse=True)
         return out[:limit]
 
+    _ALL_GRAPH_EDGES = (
+        "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
+        "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",
+        "DECORATED_BY", "RETURNS", "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH",
+    )
+
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
-        # Files first — always keep ALL of them (no PR trim). Files are the
-        # structural skeleton the UI uses for level-0 / "click to expand" mode.
-        # Without this, when the repo has >limit_nodes high-PR Functions, every
-        # File gets squeezed out of the dump and the UI's level-0 set is empty.
-        file_rows = self.db.fetch_all(
-            "MATCH (n:File) RETURN n.id AS id, n.path AS name, n.path AS file, "
-            "coalesce(n.pagerank, 0.0) AS pagerank"
-        )
+        # Top-K by PageRank, proportional across labels. Functions get the
+        # biggest slice (most numerous + structurally interesting); Files,
+        # Classes, Variables share the rest. A 200k-symbol codebase still
+        # respects limit_nodes — no label can drown out the others.
+        # Shares: Function 50%, Class 20%, File 20%, Variable 10%.
+        budgets = {
+            "Function": max(1, limit_nodes // 2),
+            "Class":    max(1, limit_nodes // 5),
+            "File":     max(1, limit_nodes // 5),
+            "Variable": max(1, limit_nodes // 10),
+        }
         nodes: list[dict] = []
-        for r in file_rows:
-            r["kind"] = "File"
-            nodes.append(r)
-        # Then top-PR Functions / Classes / Variables, sharing the remaining budget.
-        remaining = max(0, limit_nodes - len(nodes))
-        per_label = max(1, remaining // 3) if remaining else 0
-        for label in ("Function", "Class", "Variable"):
-            if per_label <= 0:
-                break
+        for label, lim in budgets.items():
             try:
-                rows = self.db.fetch_all(
-                    f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.file AS file, "
-                    f"coalesce(n.pagerank, 0.0) AS pagerank ORDER BY pagerank DESC LIMIT {per_label}"
-                )
+                if label == "File":
+                    rows = self.db.fetch_all(
+                        f"MATCH (n:File) RETURN n.id AS id, n.path AS name, n.path AS file, "
+                        f"coalesce(n.pagerank, 0.0) AS pagerank "
+                        f"ORDER BY pagerank DESC LIMIT {lim}"
+                    )
+                else:
+                    rows = self.db.fetch_all(
+                        f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.file AS file, "
+                        f"coalesce(n.pagerank, 0.0) AS pagerank "
+                        f"ORDER BY pagerank DESC LIMIT {lim}"
+                    )
             except Exception:
                 rows = []
             for r in rows:
                 r["kind"] = label
                 nodes.append(r)
+        # Final trim by PR — high-PR symbols win regardless of label.
+        nodes.sort(key=lambda x: x.get("pagerank") or 0.0, reverse=True)
+        nodes = nodes[:limit_nodes]
         node_ids = {n["id"] for n in nodes}
 
         edges: list[dict] = []
-        # All edge types the UI's filter panel exposes. Without CONTAINS, files
-        # have no structural connection to their functions/classes — making the
-        # UI's "click File to expand" feature effectively a no-op.
-        for edge in (
-            "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
-            "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",
-            "DECORATED_BY", "RETURNS", "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH",
-        ):
+        # All edge types the UI's filter panel exposes. Without CONTAINS the
+        # File→Function "click to expand" relationship has no edges to walk.
+        for edge in self._ALL_GRAPH_EDGES:
             try:
                 rows = self.db.fetch_all(
                     f"MATCH (a)-[r:{edge}]->(b) RETURN a.id AS src, b.id AS dst"
                 )
                 for r in rows:
+                    if r["src"] in node_ids and r["dst"] in node_ids:
+                        r["kind"] = edge
+                        edges.append(r)
+            except Exception:
+                pass
+        return {"nodes": nodes, "edges": edges}
+
+    def files_dump(self) -> dict:
+        """All File nodes + inter-file edges. Uncapped — used by the UI's
+        Level-0 mode where the full file skeleton is intentional. Symbol
+        nodes inside each file come in via lazy expansion on click.
+
+        Edge set is restricted to file↔file relationships (IMPORTS, CO_CHANGED)
+        because that's all that's structurally meaningful between Files —
+        adding CALLS would cross node-kind boundaries and clutter the canvas.
+        """
+        try:
+            rows = self.db.fetch_all(
+                "MATCH (n:File) RETURN n.id AS id, n.path AS name, n.path AS file, "
+                "coalesce(n.pagerank, 0.0) AS pagerank"
+            )
+        except Exception:
+            rows = []
+        nodes: list[dict] = []
+        for r in rows:
+            r["kind"] = "File"
+            nodes.append(r)
+        node_ids = {n["id"] for n in nodes}
+
+        edges: list[dict] = []
+        for edge in ("IMPORTS", "CO_CHANGED_WITH"):
+            try:
+                erows = self.db.fetch_all(
+                    f"MATCH (a:File)-[r:{edge}]->(b:File) RETURN a.id AS src, b.id AS dst"
+                )
+                for r in erows:
                     if r["src"] in node_ids and r["dst"] in node_ids:
                         r["kind"] = edge
                         edges.append(r)
