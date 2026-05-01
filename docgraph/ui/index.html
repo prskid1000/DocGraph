@@ -1382,8 +1382,15 @@ function runCommunities(iters){
         ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
         logicalSize.w = rect.width;
         logicalSize.h = rect.height;
+        needsRender = true;
       };
       resize();
+      // ResizeObserver catches any host-size change — sidebar collapse, drag
+      // resize, browser zoom, devtools open. window.resize alone misses all
+      // the in-page layout changes since they don't notify the window.
+      if (typeof ResizeObserver !== "undefined") {
+        new ResizeObserver(() => resize()).observe(host);
+      }
       window.addEventListener("resize", () => { resize(); });
 
       let mouseDown = false, lastX = 0, lastY = 0, downAt = 0, moved = false;
