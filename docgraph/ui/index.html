@@ -1308,10 +1308,23 @@ function runCommunities(iters){
     }
 
     let needsRender = true;
+    let lastRenderAt = 0;
+    // While physics is settling we throttle render to ~12fps. Each render
+    // iterates all N nodes for the viewport cull (50k = ~2.5M iter/sec at
+    // 60fps RAF) — enough to make tab clicks and other UI events feel
+    // sluggish during the initial 3-5s settle. Once layoutRunning flips
+    // false the throttle releases and we paint at full RAF speed.
+    const SETTLE_RENDER_MS = 80;
     function tick() {
-      // Physics now runs in the worker; this loop only paints frames when
-      // something changed. The worker triggers needsRender via onWorkerMessage.
-      if (needsRender) { render(); needsRender = false; }
+      const now = performance.now();
+      if (needsRender) {
+        const throttled = layoutRunning && (now - lastRenderAt < SETTLE_RENDER_MS);
+        if (!throttled) {
+          render();
+          needsRender = false;
+          lastRenderAt = now;
+        }
+      }
       rafId = requestAnimationFrame(tick);
     }
 
@@ -1835,7 +1848,12 @@ function runCommunities(iters){
     function setupTabs() {
       $$(".tab[data-tab]").forEach(t => t.onclick = () => activateTab(t.dataset.tab));
       $("#tab-collapse").onclick = () => {
-        $("#left-pane").classList.toggle("collapsed");
+        const pane = $("#left-pane");
+        const willCollapse = !pane.classList.contains("collapsed");
+        pane.classList.toggle("collapsed");
+        // Clear any inline width set by the resize handle — otherwise it
+        // overrides the collapsed-class width:44px and the panel stays wide.
+        if (willCollapse) pane.style.width = "";
       };
     }
 
@@ -1943,6 +1961,11 @@ function runCommunities(iters){
         const origTrans = tgt.style.transition;
         handle.addEventListener("mousedown", (e) => {
           e.preventDefault();
+          // If the user collapsed the panel via the chevron and then started
+          // dragging, the collapsed-class width:44px rule fights with the
+          // inline width — content stays display:none while the panel grows.
+          // Clear the collapsed state so drag always uncollapses.
+          tgt.classList.remove("collapsed");
           handle.classList.add("dragging");
           document.body.classList.add("resizing");
           tgt.style.transition = "none";
