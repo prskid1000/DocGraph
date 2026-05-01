@@ -1,0 +1,56 @@
+# DocGraph runtime dependencies.
+# Source of truth is pyproject.toml; this file mirrors it for `pip install -r`.
+# Install editable instead with: pip install -e .
+
+# CLI / TUI
+typer>=0.12
+rich>=13.7
+
+# Graph DB
+kuzu>=0.7
+
+# Parsers
+tree-sitter>=0.25
+tree-sitter-python
+tree-sitter-javascript
+tree-sitter-typescript
+tree-sitter-java
+tree-sitter-go
+tree-sitter-rust
+tree-sitter-c
+tree-sitter-cpp
+tree-sitter-c-sharp
+tree-sitter-ruby
+tree-sitter-php
+tree-sitter-bash
+tree-sitter-html
+tree-sitter-css
+tree-sitter-json
+tree-sitter-yaml
+
+# Embeddings (ONNX-backed, no torch)
+fastembed>=0.4
+
+# MCP / HTTP
+fastmcp>=2.0
+fastapi>=0.115
+uvicorn[standard]>=0.32
+sse-starlette>=2.1
+
+# Indexing helpers
+pathspec>=0.12
+pyarrow>=18.0
+networkx>=3.3
+scipy>=1.13
+pydantic>=2.9
+orjson>=3.10
+watchfiles>=0.24
+
+onnxruntime-gpu
+
+# --- Optional GPU acceleration (uncomment ONE) ----------------------------
+# Enable with `docgraph index --gpu` or `DOCGRAPH_GPU=1`.
+# DocGraph never hard-depends on these; pick the one that matches your hardware.
+# onnxruntime-gpu        ; NVIDIA CUDA (Linux / Windows)
+# onnxruntime-directml   ; Any GPU on Windows (NVIDIA / AMD / Intel)
+# onnxruntime-silicon    ; Apple Silicon (CoreML)
