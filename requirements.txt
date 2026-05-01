@@ -46,7 +46,7 @@ pydantic>=2.9
 orjson>=3.10
 watchfiles>=0.24
 
-onnxruntime-gpu
+onnxruntime-directml
 
 # --- Optional GPU acceleration (uncomment ONE) ----------------------------
 # Enable with `docgraph index --gpu` or `DOCGRAPH_GPU=1`.
