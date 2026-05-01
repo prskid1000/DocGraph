@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from typing import Callable, Iterable, Iterator
 
 import numpy as np
@@ -22,6 +23,26 @@ GPU_PROVIDERS: list[str] = [
     "CPUExecutionProvider",        # always-available fallback
 ]
 
+# Process-wide model cache. Keyed on (model_name, sorted providers tuple) so
+# every Embedder() instance with the same config shares one loaded ONNX
+# session. The model itself is ~100 MB resident; in multi-repo + watch + test
+# scenarios we used to pay that for each Embedder. fastembed's session is
+# thread-safe for the embed() call so sharing across asyncio handlers /
+# the watch loop / Indexer is fine.
+_MODEL_CACHE: dict[tuple, TextEmbedding] = {}
+_MODEL_CACHE_LOCK = threading.Lock()
+
+
+def _cache_key(model_name: str, providers: list[str] | None) -> tuple:
+    return (model_name, tuple(providers) if providers else ())
+
+
+def clear_model_cache() -> None:
+    """Drop all cached embedding models. Tests may want this between
+    suites that flip GPU providers; production code should never need it."""
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE.clear()
+
 
 class Embedder:
     def __init__(
@@ -36,23 +57,40 @@ class Embedder:
         self._model: TextEmbedding | None = None
 
     def _ensure(self) -> TextEmbedding:
-        if self._model is None:
-            providers = self._available_providers(self.providers) if self.providers else None
+        if self._model is not None:
+            return self._model
+        # Process-wide cache: a second Embedder() with matching config skips
+        # the ~1s ONNX-session load and uses the existing in-memory model.
+        # We resolve providers up front so the cache key reflects what was
+        # actually selected, not what was requested (e.g. CUDA was requested
+        # but only CPU is installed → both keys end up as CPU).
+        providers = self._available_providers(self.providers) if self.providers else None
+        key = _cache_key(self.model_name, providers)
+        with _MODEL_CACHE_LOCK:
+            cached = _MODEL_CACHE.get(key)
+            if cached is not None:
+                self._model = cached
+                return cached
             if providers:
                 log.info(
                     f"Loading embedding model {self.model_name} with providers={providers}..."
                 )
                 try:
-                    self._model = TextEmbedding(
+                    model = TextEmbedding(
                         model_name=self.model_name, providers=providers
                     )
+                    self._model = model
                     self._log_active_provider()
                 except Exception as e:  # pragma: no cover - depends on installed ORT
                     log.warning(
                         f"GPU init failed ({e}); falling back to CPU. "
                         f"Install `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows) for GPU."
                     )
-                    self._model = TextEmbedding(model_name=self.model_name)
+                    model = TextEmbedding(model_name=self.model_name)
+                    self._model = model
+                    # Re-key under the CPU fallback so a second Embedder
+                    # asking for GPU also lands on the same loaded session.
+                    key = _cache_key(self.model_name, None)
             else:
                 if self.providers:
                     log.warning(
@@ -62,7 +100,9 @@ class Embedder:
                     )
                 else:
                     log.info(f"Loading embedding model {self.model_name}...")
-                self._model = TextEmbedding(model_name=self.model_name)
+                model = TextEmbedding(model_name=self.model_name)
+                self._model = model
+            _MODEL_CACHE[key] = self._model
         return self._model
 
     @staticmethod

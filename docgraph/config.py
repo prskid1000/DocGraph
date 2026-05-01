@@ -38,6 +38,7 @@ class Config:
     llm_port: int = 1235
     llm_model: str = "local-model"
     llm_format: str = "openai"  # "openai" | "anthropic"
+    llm_max_tokens: int = 150  # reasoning is disabled via reasoning_effort=none
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
     ai_block_specs: dict[Path, pathspec.PathSpec] = field(init=False)
@@ -153,9 +154,15 @@ def load_config(
         port=int(os.environ.get("DOCGRAPH_PORT", "5500")),
         embedding_model=os.environ.get("DOCGRAPH_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
         gpu=os.environ.get("DOCGRAPH_GPU", "").lower() in ("1", "true", "yes"),
-        llm_docstrings=os.environ.get("DOCGRAPH_LLM_DOCSTRINGS", "").lower() in ("1", "true", "yes"),
+        # Setting DOCGRAPH_LLM_MODEL is sufficient to enable; the boolean
+        # DOCGRAPH_LLM_DOCSTRINGS still works as an explicit override.
+        llm_docstrings=(
+            os.environ.get("DOCGRAPH_LLM_DOCSTRINGS", "").lower() in ("1", "true", "yes")
+            or bool(os.environ.get("DOCGRAPH_LLM_MODEL"))
+        ),
         llm_host=os.environ.get("DOCGRAPH_LLM_HOST", "localhost"),
         llm_port=int(os.environ.get("DOCGRAPH_LLM_PORT", "1235")),
         llm_model=os.environ.get("DOCGRAPH_LLM_MODEL", "local-model"),
         llm_format=os.environ.get("DOCGRAPH_LLM_FORMAT", "openai"),
+        llm_max_tokens=int(os.environ.get("DOCGRAPH_LLM_MAX_TOKENS", "150")),
     )

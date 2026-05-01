@@ -26,14 +26,14 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. |
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
 | `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
-| `docgraph/db.py` | Kuzu schema + bulk insert helpers. |
-| `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). `Embedder(providers=...)` passes ORT providers through; `GPU_PROVIDERS` is the default GPU stack (CUDA → DirectML → CoreML → ROCm → CPU). |
+| `docgraph/db.py` | Kuzu schema + bulk insert helpers. Edges go through `COPY FROM arrow (from='X', to='Y')` (pyarrow-staged) — 10-50× faster than the old MATCH+CREATE. Default `insert_edges` batch is 10k rows. The `_known_ids` cache filters dangling-endpoint rows before COPY (which hard-errors on missing PKs, vs. the old silent-drop). `close()` is explicit + `__del__` calls it — needed because Windows + Kuzu's COPY internals don't release the file lock on `del` alone. |
+| `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). `Embedder(providers=...)` passes ORT providers through; `GPU_PROVIDERS` is the default GPU stack (CUDA → DirectML → CoreML → ROCm → CPU). Process-wide `_MODEL_CACHE` (locked) keys on `(model_name, providers)` so multiple `Embedder()` instances share one loaded ONNX session — important for the test suite, multi-repo, and `watch --serve` reload paths. `clear_model_cache()` exposed for tests; production code never needs it. |
 | `docgraph/rank.py` | NetworkX PageRank + `PersonalizedRanker` (query-time personalized PR with cached graph). |
 | `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher` / `git_*` / `rules_for`. **All Cypher lives here or in `db.py`.** |
 | `docgraph/git_tools.py` | `git diff` / `blame` / `log` shell-outs, joined to graph entities. |
 | `docgraph/rules.py` | Parses `.cursor/rules/*.mdc` + `AGENTS.md` / `CLAUDE.md`; glob-matches per file. |
 | `docgraph/rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB); used when `search(rerank=True)`. |
-| `docgraph/llm.py` | Tiny urllib-based client for OpenAI- or Anthropic-compatible local servers. Used by `--llm-docstrings` to summarize entities lacking native docs. Off by default. |
+| `docgraph/llm.py` | Tiny urllib-based client for OpenAI- or Anthropic-compatible local servers. Used by `--llm-model <name>` to summarize entities lacking native docs. Off by default. Sends `reasoning_effort: "none"` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and a 150-token budget fits a one-sentence answer. |
 | `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. `watch_and_serve()` runs uvicorn + the watcher in one event loop and broadcasts SSE `reindex_done` on each cycle. |
 | `docgraph/mcp_tools.py` | 15 MCP tools (6 base + 9 differentiators). Keep this surface tight. |
@@ -50,8 +50,10 @@ Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB), `<repo>/.docgraph/cache.json`
 - Property name on `File` nodes is `path`, not `name`. On all other entity nodes it's `name`. Easy to confuse in `MATCH` clauses.
 - `REFERENCES_` (with trailing underscore) — `REFERENCES` is a reserved word in Kuzu.
 - Edge tables can declare multiple FROM/TO pairs in one statement (see `db.py::EDGE_DDL`); use that instead of separate edge tables per type-combination.
-- Bulk insert: `UNWIND $rows AS row CREATE (n:Label {col: row.col, ...})` is much faster than per-row CREATE. The helpers in `db.py::insert_nodes` / `insert_edges` already do this.
+- Bulk node insert: `UNWIND $rows AS row CREATE (n:Label {col: row.col, ...})` is much faster than per-row CREATE. `db.py::insert_nodes` does this in 5k-row batches.
+- Bulk edge insert: `db.py::insert_edges` uses `COPY <Edge> FROM arrow (from='<FromTable>', to='<ToTable>')` (pyarrow-staged Table). The `(from=, to=)` clause is required because rel tables can declare multiple `(FROM, TO)` pairs in one statement. COPY FROM hard-errors on a missing PK — `_known_ids[<table>]` filters dangling rows up front so we keep the old "best-effort, tolerant" semantics.
 - A reader connection (`read_only=True`) holds a lock that blocks writers. The MCP server and the web server both open read-only — kill them before running `docgraph index` or you'll get `"Could not set lock on file"`.
+- Always call `db.close()` (or let it go out of scope so `__del__` fires) before opening a fresh `read_only=True` connection. On Windows, COPY FROM holds extra internal references that survive a bare `del` — relying on GC alone leaves the file lock held.
 
 ## Tree-sitter API gotchas
 
@@ -80,12 +82,12 @@ If you change the parse output shape, update the cache writer **and** the cache 
 ## Testing
 
 ```bash
-.venv/Scripts/python -m pytest                 # ~26s, 134 tests
+.venv/Scripts/python -m pytest                 # ~40s, 167 tests
 ```
 
 Tests in `tests/`:
 - `test_unit.py` — config, summary/docstring extraction, watch filter, multi-root helpers (no embedder, fast)
-- `test_indexer.py` — full + incremental + delete cycles, idempotency
+- `test_indexer.py` — full + incremental + delete cycles, idempotency, **Variable extraction + CONTAINS + incremental delete**
 - `test_retrieval.py` — original 6 retriever methods
 - `test_new_tools.py` — `explore`, `impact_of`, `test_impact`, `cypher` (incl. write-blocker tests), personalized PageRank
 - `test_multi_repo.py` — multi-root walker, cross-repo indexing, path roundtrip
@@ -93,8 +95,12 @@ Tests in `tests/`:
 - `test_round3.py` — cross-encoder reranker (mocked), scope-aware resolution, `@Docs` ingestion (mocked HTTP)
 - `test_api.py` — FastAPI HTTP layer (every `/api/*` route, sandboxing, `.cursorignore` redaction, cypher write-blocker via POST)
 - `test_mcp_server.py` — every MCP tool registered + invokable end-to-end through `FastMCP.call_tool`
+- `test_llm.py` — LLM client unit tests (urllib mocked); covers OpenAI + Anthropic + auth headers + malformed-response fallback
+- `test_llm_live.py` — **Optional live integration.** Probes `localhost:1235/v1/models` for `qwen3.6-35b`; auto-skips if either is missing. Override host/port/model via `DOCGRAPH_LLM_TEST_*` env vars.
 
-**Kuzu writer-visibility gotcha:** a `kuzu.Connection` opened with `read_only=False` doesn't see its own writes via subsequent `fetch_all` queries in the same process. The fixture closes the writer and reopens read-only after indexing. If you write a new test and reads come back empty, that's the cause.
+**Kuzu writer-visibility gotcha:** a `kuzu.Connection` opened with `read_only=False` doesn't see its own writes via subsequent `fetch_all` queries in the same process. The conftest fixture (and `test_indexer._index_and_reopen_readonly`) close the writer and reopen read-only after indexing. If you write a new test and reads come back empty, that's the cause.
+
+**Full-reindex swap gotcha:** `Indexer.index_all(incremental=False)` does `self.db.wipe(...)` and **swaps `self.db` with a fresh `GraphDB(...)`** at `index.py:386-387`. The original `writer` reference handed to `Indexer(...)` is stale after a full reindex — close `indexer.db` (the active write-holder), not `writer`, before reopening read-only.
 
 You can also smoke test manually:
 
@@ -170,11 +176,15 @@ Adding a new ecosystem: add an entry to `TEMPLATES` and a row to `_DETECTORS` in
 
 ## Sub-function chunking
 
-`summary.chunk_body()` splits an entity body > 1500 chars into ~700-char overlapping chunks aligned to line boundaries. Stored as separate `Chunk` nodes (`parent_qname`, `parent_label`, `file`, `idx`, `embedding`) with `CONTAINS_CHUNK` edges from the parent.
+`summary.chunk_body(body, language=None)` splits an entity body > 1500 chars into chunks. With a `language` hint it consults `_SCOPE_BOUNDARY_PATTERNS` (regex per language for `def` / `function` / `fn` / `class` / `public` / `@decorator` / etc.) and prefers to cut at scope-boundary lines once the buffer crosses `CHUNK_TARGET_CHARS` (700). When the buffer hits the hard cap (`CHUNK_MAX_CHARS` = 1400) without finding a boundary, it falls back to a mid-body split with overlap to keep cross-chunk context.
 
-`Retriever._chunk_max_sims()` runs the query embedding against ALL chunk vectors once per search call and pools by parent_qname. The score for a parent entity = `max(entity_sim, best_chunk_sim)`. Cheap because there are typically <500 chunks per repo and one matmul handles them all.
+Important nuance: scope-aware flushes drop the overlap so the next chunk starts cleanly with the new method/function header. Mid-body (hard-cap) flushes keep overlap. Without a language hint, behavior degrades to the old line-based splitter.
+
+Stored as separate `Chunk` nodes (`parent_qname`, `parent_label`, `file`, `idx`, `embedding`) with `CONTAINS_CHUNK` edges from the parent. `Retriever._chunk_max_sims()` runs the query embedding against ALL chunk vectors once per search call and pools by parent_qname; the score for a parent entity = `max(entity_sim, best_chunk_sim)`. Cheap because there are typically <500 chunks per repo and one matmul handles them all.
 
 Incremental delete: `_delete_files_from_db()` includes a `MATCH (n:Chunk) WHERE n.file IN $files DETACH DELETE n` step before file nodes go.
+
+Adding a language: drop a regex into `_SCOPE_BOUNDARY_PATTERNS` keyed by the same language id used in `parse.py::LANGUAGES`. The pattern is matched against `lstrip()`'d lines, so don't anchor on indentation. Conservative is fine — false negatives just fall through to the line splitter.
 
 ## Scope-aware resolution
 
@@ -194,10 +204,11 @@ Incremental delete: `_delete_files_from_db()` includes a `MATCH (n:Chunk) WHERE 
 
 ## LLM-augmented docstrings (opt-in)
 
-- **Off by default.** Enable with `--llm-docstrings` on `docgraph index` or `DOCGRAPH_LLM_DOCSTRINGS=1`.
-- Talks to a local OpenAI- or Anthropic-compatible server (LM Studio, llama.cpp, vLLM, Ollama). Defaults: `localhost:1235`, model `local-model`, format `openai`.
-- Configurable via CLI flags (`--llm-port`, `--llm-model`, `--llm-format`) or env vars (`DOCGRAPH_LLM_*`). **No settings file** — these are the only knobs.
-- `Indexer._augment_llm_docstrings()` runs after parsing, before embedding. Targets entities of kind `function` / `method` / `class` / `interface` that lack a native docstring. Skips silently if the server is unreachable.
+- **Off by default.** Activate with `--llm-model <name>` on `docgraph index` (or set `DOCGRAPH_LLM_MODEL=<name>`). Setting just the model is enough — there is no separate `--llm-docstrings` flag; passing the model implies "turn it on." `DOCGRAPH_LLM_DOCSTRINGS=1` still works as an explicit toggle but is rarely needed.
+- Talks to a local OpenAI- or Anthropic-compatible server (LM Studio, llama.cpp, vLLM, Ollama). Endpoint defaults: `localhost:1235`, format `openai`.
+- Configurable via CLI flags (`--llm-port`, `--llm-format`, `--llm-max-tokens`) or env vars (`DOCGRAPH_LLM_*`). **No settings file** — these are the only knobs.
+- **Reasoning models:** every OpenAI-format request carries `reasoning_effort: "none"`. The telecode proxy at port 1235 maps that to per-model "no thinking" knobs (Qwen3: `enable_thinking=false` + `thinking_budget_tokens=0`; DeepSeek-R1: similar). Plain non-reasoning servers ignore the field. Without it, a 150-token budget comes back with empty `content` because reasoning eats it all. If you change the prompt or move to longer outputs, **don't drop this flag**.
+- `Indexer._augment_llm_docstrings()` runs after parsing, before embedding. Targets entities of kind `function` / `method` / `class` / `interface` that lack a native docstring. Skips silently if the server is unreachable. Default timeout is 60s per call; concurrency is `min(8, max(2, cfg.workers))`.
 - Cache: `.docgraph/llm_docstrings.json` keyed by `sha256(body)`. Survives across runs and across renames (rename-safe). Incrementals only call the LLM for body-changed entities.
 - Generated text is read back in `summary.build_embedding_text(..., llm_doc=...)` — used **only** when no native docstring is found, so we never override a real doc.
 
@@ -257,11 +268,14 @@ pkill -f docgraph                              # *nix
 - Using `tree-sitter-language-pack 1.6+` thinking it's the old Goldziher API — it isn't, it's a Rust rewrite that needs network downloads.
 - Inserting nodes with IDs starting at 1 on an incremental run → duplicate-PK error from Kuzu. Always `_seed_ids_from_db()` first.
 - Reading from a Kuzu writer connection right after writing → empty results. Reopen as `read_only=True`.
+- After `Indexer.index_all(incremental=False)`, the `GraphDB` you originally passed in is stale — `index_all` swaps `self.db` mid-run. Close `indexer.db`, not the original handle.
+- Relying on `del db; gc.collect()` to release the Kuzu file lock on Windows → flaky. Call `db.close()` explicitly. After COPY FROM in particular, internal Kuzu refs survive plain GC.
+- Sending a request to a reasoning-model endpoint without `reasoning_effort: "none"` → empty content because the model burned all 150 tokens on `reasoning_content`. Fix is the flag, not bumping max_tokens.
 
 ## Known limitations / next-up
 
 - No SCIP / LSP integration → `CALLS` is name-based and will mis-resolve TS / Java overloads. Roadmap.
 - LLM-generated docstrings (Greptile-style) require an opt-in API key path — not built yet.
-- Embedding model loads fresh per process (~1s cold). Pre-warming or caching across CLI invocations would help.
+- Embedding model loads fresh per **process** (~1s cold). In-process duplication is solved (see `embed.py::_MODEL_CACHE`); pre-warming a daemon across CLI invocations would help further.
 - `IMPORTS_SYMBOL` and `OVERRIDES` edges declared in the schema but not extracted by any tags query yet.
 - The watcher holds a writer lock for its lifetime — kill `serve` / `mcp` first.

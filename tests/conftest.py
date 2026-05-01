@@ -193,6 +193,11 @@ def indexed(repo_dir: Path):
     stats = indexer.index_all(incremental=False)
     assert stats["errors"] == 0, f"index errors: {stats}"
     # Release writer so a read-only connection can take over.
+    # On full reindex, `Indexer.index_all` swaps `self.db` with a fresh
+    # GraphDB after wipe — the active write-holder is `indexer.db`, not the
+    # original `writer` object.
+    indexer.db.close()
+    writer.close()
     del writer, indexer
     gc.collect()
     reader = GraphDB(cfg.db_path, read_only=True)

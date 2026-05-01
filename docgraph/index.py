@@ -214,14 +214,20 @@ class Indexer:
         t = threading.Thread(target=writer, daemon=True, name=f"writer-{label}")
         t.start()
         try:
+            total = len(plan)
             with _bar() as prog:
-                task = prog.add_task(prog_label, total=len(plan))
-                for i in range(0, len(plan), insert_batch):
+                task = prog.add_task(prog_label, total=total)
+                # Pop slabs off the front so already-consumed rows + body
+                # strings can be GC'd while later batches are still embedding.
+                # Caller's list is mutated; callers .clear() it anyway.
+                while plan:
                     if errors:
                         break
-                    batch = plan[i : i + insert_batch]
+                    batch = plan[:insert_batch]
+                    del plan[:insert_batch]
                     texts = [t for _, t in batch]
                     rows = [r for r, _ in batch]
+                    del batch
                     vecs = self.embedder.embed(
                         texts,
                         batch_size=self.cfg.embed_batch_size,
@@ -234,7 +240,7 @@ class Indexer:
                         r["embedding"] = v
                     write_q.put(rows)
                     # Free the embedding text strings for this slab.
-                    del texts, vecs, batch
+                    del texts, vecs
         finally:
             write_q.put(None)
             t.join()
@@ -285,6 +291,7 @@ class Indexer:
             port=self.cfg.llm_port,
             model=self.cfg.llm_model,
             format=self.cfg.llm_format,
+            max_tokens=self.cfg.llm_max_tokens,
         ))
 
         def _task(item):
@@ -527,9 +534,14 @@ class Indexer:
         )
 
         # ---- Step 5a: insert files + variables (no embeddings) ----
-        with _console.status(f"[cyan]Writing[/] files + variables"):
-            self.db.insert_nodes("File", file_rows)
-            self.db.insert_nodes("Variable", variable_rows)
+        if file_rows:
+            with _bar() as prog:
+                task = prog.add_task("Writing files", total=len(file_rows))
+                self.db.insert_nodes("File", file_rows, on_progress=lambda n: prog.advance(task, n))
+        if variable_rows:
+            with _bar() as prog:
+                task = prog.add_task("Writing variables", total=len(variable_rows))
+                self.db.insert_nodes("Variable", variable_rows, on_progress=lambda n: prog.advance(task, n))
         del file_rows, variable_rows
 
         # Warm up the embedder once before any progress bar opens, so the
@@ -556,7 +568,7 @@ class Indexer:
                     continue
                 if ent.kind not in ("function", "method", "class", "interface"):
                     continue
-                pieces = chunk_body(ent.body or "")
+                pieces = chunk_body(ent.body or "", language=fp.language)
                 if not pieces:
                     continue
                 parent_label = "Class" if ent.kind in ("class", "interface") else "Function"
@@ -582,10 +594,27 @@ class Indexer:
             chunk_plan.clear()
 
         # ---- Step 5d: CONTAINS_CHUNK edges ----
-        with _console.status("[cyan]Writing chunk edges[/]"):
-            self.db.insert_edges("CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func)
-            self.db.insert_edges("CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class)
+        n_chunk_edges = len(chunk_contains_func) + len(chunk_contains_class)
+        if n_chunk_edges:
+            with _bar() as prog:
+                task = prog.add_task("Writing chunk edges", total=n_chunk_edges)
+                self.db.insert_edges(
+                    "CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func,
+                    on_progress=lambda n: prog.advance(task, n),
+                )
+                self.db.insert_edges(
+                    "CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class,
+                    on_progress=lambda n: prog.advance(task, n),
+                )
         del chunk_contains_func, chunk_contains_class
+
+        # All entity bodies have been embedded + persisted; the rest of the
+        # pipeline reads from `cache` and the DB. Drop `parsed` so the entity
+        # body strings can be GC'd before symbol-table building loads its own
+        # working set.
+        changed_set = set(parsed.keys())
+        n_parsed = len(parsed)
+        parsed.clear()
 
         # ---- Step 7: build full symbol table from DB ----
         # qname → (label, id); name → list[(label, id, file)]
@@ -603,8 +632,6 @@ class Indexer:
                 name_index[r["name"]].append((label, r["id"], r["file"]))
         for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path"):
             file_index[r["path"]] = r["id"]
-
-        changed_set = set(parsed.keys())  # for "edge needs reinsertion?" check
 
         # Scope-aware resolution: per-file set of files that file imports.
         # Built from the same fuzzy IMPORTS-target match we use for the edge
@@ -786,23 +813,33 @@ class Indexer:
             self.db.insert_nodes("Module", new_modules)
 
         # Insert collected edges
-        for (fl, tl), rows in contains_groups.items():
-            self.db.insert_edges("CONTAINS", fl, tl, rows)
-        self.db.insert_edges("CALLS", "Function", "Function", calls_rows)
-        self.db.insert_edges("INSTANTIATES", "Function", "Class", inst_rows)
-        self.db.insert_edges("INHERITS", "Class", "Class", inherits_rows)
-        self.db.insert_edges("DECORATED_BY", "Function", "Function", decorated_func_rows)
-        self.db.insert_edges("DECORATED_BY", "Class", "Function", decorated_class_rows)
-        self.db.insert_edges("IMPORTS", "File", "File", imports_file_rows)
-        self.db.insert_edges("IMPORTS", "File", "Module", imports_module_rows)
         edges_status.stop()
+        n_edges = (
+            sum(len(r) for r in contains_groups.values())
+            + len(calls_rows) + len(inst_rows) + len(inherits_rows)
+            + len(decorated_func_rows) + len(decorated_class_rows)
+            + len(imports_file_rows) + len(imports_module_rows)
+        )
+        if n_edges:
+            with _bar() as prog:
+                task = prog.add_task("Writing graph edges", total=n_edges)
+                cb = lambda n: prog.advance(task, n)
+                for (fl, tl), rows in contains_groups.items():
+                    self.db.insert_edges("CONTAINS", fl, tl, rows, on_progress=cb)
+                self.db.insert_edges("CALLS", "Function", "Function", calls_rows, on_progress=cb)
+                self.db.insert_edges("INSTANTIATES", "Function", "Class", inst_rows, on_progress=cb)
+                self.db.insert_edges("INHERITS", "Class", "Class", inherits_rows, on_progress=cb)
+                self.db.insert_edges("DECORATED_BY", "Function", "Function", decorated_func_rows, on_progress=cb)
+                self.db.insert_edges("DECORATED_BY", "Class", "Function", decorated_class_rows, on_progress=cb)
+                self.db.insert_edges("IMPORTS", "File", "File", imports_file_rows, on_progress=cb)
+                self.db.insert_edges("IMPORTS", "File", "Module", imports_module_rows, on_progress=cb)
 
         # ---- Step 9: Tier 4 + PageRank (incremental-aware) ----
         # Skip entirely on no-op runs (no parsed, no deleted) so a `docgraph
         # index` against an unchanged repo doesn't rewrite ~M of edges +
         # pagerank props. On partial-change incrementals, recompute only for
         # entities in changed files; on full reindex, do the global pass.
-        graph_dirty = bool(parsed) or bool(deleted_rels)
+        graph_dirty = bool(changed_set) or bool(deleted_rels)
         full_recompute = (not incremental) or (not cache_was_present)
         state = self._load_state()
 
@@ -833,11 +870,11 @@ class Indexer:
         _console.print(
             f"[green]Done[/] in {elapsed:.2f}s — "
             f"{len(on_disk_rel)} files, {total_entities} entities, "
-            f"{len(parsed)} reparsed, {len(deleted_rels)} deleted, {len(errors)} errors"
+            f"{n_parsed} reparsed, {len(deleted_rels)} deleted, {len(errors)} errors"
         )
         return {
             "files": len(on_disk_rel),
-            "changed": len(parsed),
+            "changed": n_parsed,
             "deleted": len(deleted_rels),
             "entities": sum(len(c.get("entities", [])) for c in cache.values()),
             "elapsed": elapsed,

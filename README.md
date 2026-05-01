@@ -21,7 +21,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
 - **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML for a multi-x speedup on large repos. Still no torch dep — just `pip install onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows). Falls back to CPU silently if no GPU runtime is installed.
-- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-docstrings` (you supply the local server).
+- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-model <name>` (you supply the local server).
 
 ### Retrieval
 
@@ -51,7 +51,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 ### Optional augmentation
 
 - **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent (re-ingesting a URL replaces prior chunks).
-- **Optional LLM-augmented docstrings** — opt-in via `--llm-docstrings`; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). One-sentence summaries for entities lacking native docs lift retrieval recall on under-documented codebases. Cached by body hash so incrementals stay fast.
+- **Optional LLM-augmented docstrings** — opt-in via `--llm-model <name>`; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash so incrementals stay fast.
 
 ## Performance
 
@@ -98,10 +98,10 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 |---|---|---|
 | `--full`, `-f` | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
 | `--repo PATH`, `-r PATH` | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
-| `--llm-docstrings` | `false` | Generate one-sentence docstrings for entities lacking native docs via a local OpenAI/Anthropic-compatible LLM. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
-| `--llm-port INT` | `1235` | Local LLM server port (host is always `localhost`) |
-| `--llm-model STR` | `local-model` | Model name sent to the server (most local servers ignore this) |
-| `--llm-format STR` | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`) |
+| `--llm-model STR` | unset (off) | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
+| `--llm-port INT` | `1235` | Local LLM server port (host is always `localhost`). Ignored unless `--llm-model` is set. |
+| `--llm-format STR` | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`). Ignored unless `--llm-model` is set. |
+| `--llm-max-tokens INT` | `150` | Max tokens per LLM call. DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) fit a one-sentence answer in this budget; bump it for non-reasoning models if you want longer summaries. |
 | `--gpu` | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
 | `--verbose`, `-v` | `false` | Verbose logs |
 
@@ -188,14 +188,14 @@ Print version. No flags.
 | `DOCGRAPH_PORT` | `serve`, `mcp` (http) | `5500` |
 | `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
 | `DOCGRAPH_GPU` | `index`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. |
-| `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset (off). Set to `1`/`true` to enable. |
+| `DOCGRAPH_LLM_MODEL` | `index` | unset (off). **Activator** — setting this enables LLM-augmented docstrings (same as `--llm-model`). |
+| `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset. Set to `1`/`true` to enable explicitly (rarely needed; setting `DOCGRAPH_LLM_MODEL` is enough). |
 | `DOCGRAPH_LLM_HOST` | `index` | `localhost` |
 | `DOCGRAPH_LLM_PORT` | `index` | `1235` |
-| `DOCGRAPH_LLM_MODEL` | `index` | `local-model` |
 | `DOCGRAPH_LLM_FORMAT` | `index` | `openai` |
 | `DOCGRAPH_LLM_API_KEY` | `index` | unset. If set, sent as `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic). |
-| `DOCGRAPH_LLM_MAX_TOKENS` | `index` | `150` |
-| `DOCGRAPH_LLM_TIMEOUT` | `index` | `30` (seconds) |
+| `DOCGRAPH_LLM_MAX_TOKENS` | `index` | `150` (reasoning is disabled via `reasoning_effort=none`, so this fits a one-sentence summary on Qwen3 / DeepSeek-R1). |
+| `DOCGRAPH_LLM_TIMEOUT` | `index` | `60` (seconds) |
 
 CLI flags override env vars. Env vars set defaults that survive across invocations.
 
@@ -357,27 +357,18 @@ In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/s
 
 ```bash
 pip install pytest
-pytest                   # ~26s (one-time embedder load + 162 tests)
+pytest                   # ~36s (shared embedder cache + 174 tests)
 ```
 
-Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, and the embedding-text builder.
+Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, and Variable-node round-trip + delete cascade.
+
+Live LLM tests (`tests/test_llm_live.py`) auto-skip unless an OpenAI-compatible server is reachable at `localhost:1235` with `qwen3.6-35b` loaded. Override host/port/model via `DOCGRAPH_LLM_TEST_HOST` / `DOCGRAPH_LLM_TEST_PORT` / `DOCGRAPH_LLM_TEST_MODEL`.
 
 ## Roadmap
 
-Recently shipped (kept here for context):
-
-- ✅ **Optional LLM-generated docstrings** — `--llm-docstrings`, talks to any local OpenAI/Anthropic-compatible server (LM Studio, llama.cpp, vLLM, Ollama). Cached by body hash so incrementals don't re-call.
-- ✅ **Live UI auto-redraw on reindex** — `docgraph watch --serve` runs the watcher and the web UI in one process; the browser refreshes via Server-Sent Events at `/api/events` after each reindex.
-- ✅ **Per-ecosystem default ignores** — autodetect Node/Python/Maven/Gradle/Rust/.NET/etc. and apply curated ignore patterns; ML/data-science cache dirs (`.ipynb_checkpoints/`, `mlruns/`, `wandb/`, `.dvc/cache/`) baked in universally.
-- ✅ **ML-training-style progress bars** — every phase (parse, embed, write, similarity, PageRank, persist) reports % + M/N + elapsed + ETA.
-
-In flight / queued:
-
-- Precise (compiler-grade) symbol resolution via SCIP / LSP daemons (scope-aware-via-imports already covers the common case; LSP eliminates overload mis-resolution).
-- Pre-download / cache embedding model so cold start is sub-second instead of ~1 s.
-- Symbol-level imports (`IMPORTS_SYMBOL`) and method `OVERRIDES` edges — schema reserves them, parser hasn't extracted them yet.
-- Cross-repo embedding sharing — currently each repo holds its own copy of the same embedding model.
-- Per-language sub-function chunking that respects scope (today's chunker is line-based; smarter for very long classes).
+- **Precise (compiler-grade) symbol resolution via SCIP / LSP** — would eliminate the remaining overload / generic mis-resolution on TS / Java / Scala. Doesn't require a heavy stack: an SCIP-only path needs zero new pip deps (we'd shell out to per-language indexers like `scip-typescript` / `scip-java` and parse the protobuf), and the LSP-daemon path needs at most one lightweight client (`pylsp-jsonrpc` ~1 MB or a hand-rolled JSON-RPC over stdin/stdout). Either way, no torch, no Java runtime baked into our wheel — users opt in by installing the indexer they want.
+- **Pre-download / cache embedding model across CLI invocations** — fastembed already caches model files on disk and we share one ONNX session across `Embedder()` instances inside a process; what's left is persisting a small daemon between CLI calls to cut cold start to sub-second.
+- **Symbol-level imports (`IMPORTS_SYMBOL`) and method `OVERRIDES` edges** — schema reserves them, parser hasn't extracted them yet.
 
 ## License
 

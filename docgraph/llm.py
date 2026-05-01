@@ -28,8 +28,14 @@ log = logging.getLogger(__name__)
 DEFAULT_PORT = 1235
 DEFAULT_MODEL = "local-model"
 DEFAULT_FORMAT = "openai"
+# We send `reasoning_effort: "none"` on every call (see _call_openai), which
+# the telecode proxy resolves into the right "no thinking" knobs per model
+# family (enable_thinking=false / thinking_budget_tokens=0 for Qwen3, etc.)
+# Without that flag, reasoning models eat 500-2000 tokens before the answer
+# and a 150-token budget comes back with empty content. The flag makes 150
+# enough for a one-sentence docstring; bump it via env / CLI if needed.
 DEFAULT_MAX_TOKENS = 150
-DEFAULT_TIMEOUT_SECS = 30
+DEFAULT_TIMEOUT_SECS = 60
 
 
 _PROMPT = (
@@ -94,6 +100,13 @@ class LLMClient:
             "max_tokens": self.cfg.max_tokens,
             "temperature": 0.2,
             "stream": False,
+            # Disable chain-of-thought on reasoning models. The telecode proxy
+            # at :1235 maps this to per-model knobs (Qwen3: enable_thinking=
+            # false + thinking_budget_tokens=0; DeepSeek-R1: similar). Plain
+            # OpenAI / non-reasoning servers ignore the field. Without this
+            # flag a 150-token budget comes back with empty `content` because
+            # reasoning consumed it all.
+            "reasoning_effort": "none",
         }
         data = self._post(self.cfg.endpoint, payload)
         try:

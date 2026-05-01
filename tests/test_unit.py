@@ -9,6 +9,7 @@ import pytest
 from docgraph.config import Config, load_config
 from docgraph.summary import (
     build_embedding_text,
+    chunk_body,
     extract_docstring,
     smart_body_sample,
 )
@@ -317,3 +318,98 @@ def test_unknown_repo_universal_only(tmp_path: Path):
     assert not cfg.is_ignored("target/foo.txt")
     assert not cfg.is_ignored("bin/foo.txt")
     assert not cfg.is_ignored("obj/foo.txt")
+
+
+# --- summary.chunk_body — scope-aware ---------------------------------
+
+
+def _long_python_class(n_methods: int = 8, lines_per_method: int = 18) -> str:
+    """Build a synthetic class big enough to chunk, with predictable scope
+    boundaries we can assert on."""
+    out = ["class Big:\n", '    """A long class for chunking tests."""\n']
+    for i in range(n_methods):
+        out.append(f"    def method_{i}(self, arg):\n")
+        out.append(f"        # method {i} starts\n")
+        for j in range(lines_per_method - 2):
+            out.append(f"        x{j} = {j} + arg  # filler line\n")
+        out.append("\n")
+    return "".join(out)
+
+
+def test_chunk_body_below_threshold_returns_empty():
+    assert chunk_body("short body", language="python") == []
+
+
+def test_chunk_body_python_breaks_at_method_boundaries():
+    body = _long_python_class()
+    chunks = chunk_body(body, language="python")
+    assert len(chunks) >= 2
+    # No chunk should start mid-method (i.e. with `x0 = ...`). Allow leading
+    # blank/decorator/whitespace lines, then expect either def/class or the
+    # opening of the class body.
+    for c in chunks[1:]:  # first chunk legitimately starts with `class Big:`
+        first_meaningful = next((ln.strip() for ln in c.splitlines() if ln.strip()), "")
+        assert (
+            first_meaningful.startswith("def ")
+            or first_meaningful.startswith("class ")
+            or first_meaningful.startswith("@")
+            or first_meaningful.startswith("#")  # overlap from prior comment is OK
+        ), f"chunk starts mid-method: {first_meaningful!r}"
+
+
+def test_chunk_body_no_language_falls_back_to_line_split():
+    """Without a language hint, the chunker still produces chunks; it just
+    can't do scope-aware splits."""
+    body = _long_python_class()
+    chunks = chunk_body(body, language=None)
+    assert len(chunks) >= 2
+    # And total content covers the body (allowing for overlap dup).
+    joined = "".join(chunks)
+    assert "method_0" in joined and f"method_{7}" in joined
+
+
+def test_chunk_body_unknown_language_does_not_crash():
+    body = _long_python_class()
+    chunks = chunk_body(body, language="brainfuck")
+    assert len(chunks) >= 2
+
+
+def test_chunk_body_javascript_breaks_at_function_boundaries():
+    parts = ["class Foo {\n"]
+    for i in range(8):
+        parts.append(f"  method{i}(x) {{\n")
+        for j in range(15):
+            parts.append(f"    const v{j} = x + {j};  // filler\n")
+        parts.append("  }\n\n")
+    parts.append("}\n")
+    body = "".join(parts)
+    chunks = chunk_body(body, language="javascript")
+    assert len(chunks) >= 2
+
+
+# --- embed model cache -------------------------------------------------
+
+
+def test_embedder_cache_reuses_loaded_model():
+    """Two Embedder() instances with the same config share one ONNX session.
+    Loading the model a second time would take ~1s; the cache lookup is O(1)."""
+    from docgraph.embed import Embedder, clear_model_cache
+
+    clear_model_cache()
+    a = Embedder("BAAI/bge-small-en-v1.5")
+    model_a = a._ensure()
+    b = Embedder("BAAI/bge-small-en-v1.5")
+    model_b = b._ensure()
+    assert model_a is model_b, "expected shared ONNX session across Embedder() instances"
+
+
+def test_embedder_cache_isolates_different_models():
+    """Different model_name → distinct cache key; we don't accidentally
+    return a BGE-small session when caller asked for something else."""
+    from docgraph.embed import _MODEL_CACHE, _cache_key, clear_model_cache
+
+    clear_model_cache()
+    k1 = _cache_key("model-a", None)
+    k2 = _cache_key("model-b", None)
+    k3 = _cache_key("model-a", ["CUDAExecutionProvider"])
+    assert k1 != k2 and k1 != k3 and k2 != k3

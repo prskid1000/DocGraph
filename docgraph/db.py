@@ -7,9 +7,10 @@ from __future__ import annotations
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 import kuzu
+import pyarrow as pa
 
 # Node tables — all entities share an integer pk for fast joins; qname is the
 # stable human-readable identifier.
@@ -124,6 +125,11 @@ class GraphDB:
         self.embedding_dim = embedding_dim
         self.db = kuzu.Database(str(self.db_path), read_only=read_only)
         self.conn = kuzu.Connection(self.db)
+        # Per-node-table id sets, populated lazily on first edge insert. Used
+        # to filter dangling-endpoint rows before COPY FROM (which errors hard
+        # on unknown PKs, vs. the old MATCH+CREATE which silently dropped).
+        # `insert_nodes` extends the cache so freshly inserted nodes are seen.
+        self._known_ids: dict[str, set[int]] = {}
 
     def init_schema(self) -> None:
         for ddl in NODE_DDL + EDGE_DDL:
@@ -155,6 +161,7 @@ class GraphDB:
         table: str,
         rows: Iterable[dict],
         batch_size: int = 5000,
+        on_progress: "Callable[[int], None] | None" = None,
     ) -> int:
         """Bulk insert via UNWIND, batched.
 
@@ -171,6 +178,9 @@ class GraphDB:
         cols = ", ".join(f"{k}: row.{k}" for k in keys)
         cypher = f"UNWIND $rows AS row CREATE (n:{table} {{{cols}}})"
         n = len(rows)
+        # Extend the id cache if it's already populated for this table —
+        # otherwise leave it untouched and let `_ensure_known_ids` lazy-load.
+        cached = self._known_ids.get(table)
         for i in range(0, n, batch_size):
             slab = rows[i : i + batch_size]
             for r in slab:
@@ -179,28 +189,109 @@ class GraphDB:
                     # numpy / array-like → list[float] just for the wire call
                     r["embedding"] = v.tolist() if hasattr(v, "tolist") else list(v)
             self.execute(cypher, {"rows": slab})
+            if cached is not None:
+                for r in slab:
+                    cached.add(r["id"])
+            if on_progress is not None:
+                on_progress(len(slab))
         return n
 
-    def insert_edges(self, edge: str, from_table: str, to_table: str, rows: Iterable[dict]) -> int:
-        """Bulk edge insert. rows: [{from_id, to_id, ...edge_props}]"""
+    def _ensure_known_ids(self, table: str) -> set[int]:
+        """Lazy-load the set of existing primary-key ids for a node table.
+        Cached on the instance; mutated by `insert_nodes` after first load."""
+        ids = self._known_ids.get(table)
+        if ids is None:
+            ids = set()
+            for r in self.fetch_all(f"MATCH (n:{table}) RETURN n.id AS id"):
+                ids.add(r["id"])
+            self._known_ids[table] = ids
+        return ids
+
+    def insert_edges(
+        self,
+        edge: str,
+        from_table: str,
+        to_table: str,
+        rows: Iterable[dict],
+        batch_size: int = 10_000,
+        on_progress: "Callable[[int], None] | None" = None,
+    ) -> int:
+        """Bulk edge insert via Kuzu's COPY FROM (Arrow path).
+
+        batch_size=10_000 picks a sweet spot: small enough that the progress
+        bar ticks visibly on large repos (a 500k-edge insert gets 50 updates
+        instead of 5), large enough that the per-COPY setup overhead stays
+        amortized. Override via the kwarg if profiling says otherwise.
+
+        Stages each batch as a pyarrow Table with `from`, `to`, and any
+        edge-property columns, then issues:
+
+            COPY <edge> FROM <arrow_var> (from='<FromTable>', to='<ToTable>')
+
+        Kuzu's bulk loader uses the PK index for both endpoints — typically
+        10-50× faster than the per-row MATCH+CREATE pattern at scale. The
+        `(from=, to=)` clause is required because rel tables can declare
+        multiple `(FROM, TO)` pairs (see EDGE_DDL).
+
+        Dangling endpoints: the old MATCH+CREATE silently dropped rows whose
+        `from_id`/`to_id` didn't resolve. COPY FROM aborts the batch on a
+        missing PK, so we filter rows against `_known_ids[<table>]` before
+        staging — preserving the old "best-effort, tolerant" behavior.
+        """
         rows = list(rows)
         if not rows:
             return 0
-        extra_keys = [k for k in rows[0].keys() if k not in ("from_id", "to_id")]
-        prop_clause = ""
-        if extra_keys:
-            prop_clause = " {" + ", ".join(f"{k}: row.{k}" for k in extra_keys) + "}"
-        cypher = (
-            f"UNWIND $rows AS row "
-            f"MATCH (a:{from_table} {{id: row.from_id}}), (b:{to_table} {{id: row.to_id}}) "
-            f"CREATE (a)-[:{edge}{prop_clause}]->(b)"
-        )
-        self.execute(cypher, {"rows": rows})
-        return len(rows)
+
+        from_ids = self._ensure_known_ids(from_table)
+        to_ids = self._ensure_known_ids(to_table)
+        valid = [
+            r for r in rows
+            if r["from_id"] in from_ids and r["to_id"] in to_ids
+        ]
+        if not valid:
+            return 0
+
+        prop_keys = [k for k in valid[0].keys() if k not in ("from_id", "to_id")]
+        n = len(valid)
+        for i in range(0, n, batch_size):
+            slab = valid[i : i + batch_size]
+            cols: dict[str, list] = {
+                "from": [r["from_id"] for r in slab],
+                "to": [r["to_id"] for r in slab],
+            }
+            for k in prop_keys:
+                cols[k] = [r[k] for r in slab]
+            arrow = pa.table(cols)
+            self.execute(
+                f"COPY {edge} FROM arrow (from='{from_table}', to='{to_table}')"
+            )
+            if on_progress is not None:
+                on_progress(len(slab))
+        return n
 
     def close(self) -> None:
-        # kuzu.Connection has no explicit close; rely on GC.
-        pass
+        """Explicitly close the Kuzu connection + database. Required after
+        a write session so a subsequent `read_only=True` open can acquire
+        the file lock — GC isn't reliable on Windows + COPY FROM holds extra
+        internal references that survive a `del`."""
+        try:
+            if self.conn is not None and not self.conn.is_closed:
+                self.conn.close()
+        except Exception:
+            pass
+        try:
+            if self.db is not None and not self.db.is_closed:
+                self.db.close()
+        except Exception:
+            pass
+        self.conn = None
+        self.db = None
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     @staticmethod
     def wipe(db_path: Path) -> None:

@@ -50,20 +50,25 @@ def index(
         None, "--repo", "-r",
         help="Additional repo root to include (repeatable). Stored in .docgraph/repos.json.",
     ),
-    llm_docstrings: bool = typer.Option(
-        False, "--llm-docstrings",
-        help="Generate docstrings for entities lacking one via a local LLM (off by default).",
+    llm_model: str | None = typer.Option(
+        None, "--llm-model",
+        help="Enable LLM-augmented docstrings for entities missing one. "
+             "Pass the model name your local server expects (e.g. 'qwen3.6-35b', "
+             "'local-model'). Setting this turns the feature on; defaults below "
+             "(port 1235, openai format) apply unless overridden.",
     ),
     llm_port: int = typer.Option(
-        1235, "--llm-port", help="Local LLM server port (default: 1235).",
-    ),
-    llm_model: str = typer.Option(
-        "local-model", "--llm-model",
-        help="Model name to send to the LLM server (most local servers ignore this).",
+        1235, "--llm-port", help="Local LLM server port (default: 1235). Ignored unless --llm-model is set.",
     ),
     llm_format: str = typer.Option(
         "openai", "--llm-format",
-        help="API format: 'openai' (Chat Completions) or 'anthropic' (Messages).",
+        help="API format: 'openai' (Chat Completions) or 'anthropic' (Messages). Ignored unless --llm-model is set.",
+    ),
+    llm_max_tokens: int = typer.Option(
+        150, "--llm-max-tokens",
+        help="Max tokens per LLM call (default: 150). docgraph sends "
+             "`reasoning_effort=none` so reasoning models (Qwen3 / "
+             "DeepSeek-R1) skip thinking and fit in this budget.",
     ),
     gpu: bool = typer.Option(
         False, "--gpu",
@@ -84,12 +89,12 @@ def index(
     is persisted; subsequent commands (watch, serve, mcp) will see all repos
     automatically.
 
-    LLM docstrings (opt-in): with `--llm-docstrings`, the indexer asks a local
-    LLM to write a one-sentence summary for each entity that has no native
-    docstring. Configure the endpoint via `--llm-port`, `--llm-model`,
-    `--llm-format` or the matching `DOCGRAPH_LLM_*` env vars. Generated
-    summaries are cached by body hash in `.docgraph/llm_docstrings.json` so
-    incrementals don't re-call the model.
+    LLM docstrings (opt-in): pass `--llm-model <name>` to ask a local LLM to
+    write a one-sentence summary for each entity that has no native docstring.
+    Adjust the endpoint via `--llm-port` / `--llm-format` / `--llm-max-tokens`
+    or the matching `DOCGRAPH_LLM_*` env vars. Generated summaries are cached
+    by body hash in `.docgraph/llm_docstrings.json` so incrementals don't
+    re-call the model.
 
     GPU (opt-in): with `--gpu`, embeddings run on the GPU via ONNX Runtime.
     No torch dependency — install `onnxruntime-gpu` (NVIDIA / CUDA),
@@ -98,12 +103,13 @@ def index(
     """
     _setup_logging(verbose)
     cfg = load_config(path, extra_roots=repo if repo else None)
-    # CLI flags win over env vars
-    if llm_docstrings:
+    # CLI flags win over env vars. Setting --llm-model enables the feature.
+    if llm_model is not None:
         cfg.llm_docstrings = True
-        cfg.llm_port = llm_port
         cfg.llm_model = llm_model
+        cfg.llm_port = llm_port
         cfg.llm_format = llm_format
+        cfg.llm_max_tokens = llm_max_tokens
     if gpu:
         cfg.gpu = True
         # DirectML can hang the GPU at the default batch size of 256 on
