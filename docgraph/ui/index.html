@@ -1349,9 +1349,15 @@ function runCommunities(iters){
       neighborCache = { id: null, set: new Set() };
       const n = layoutById.get(id);
       const sym = name || (n && n.name);
-      // In 'levels' mode, every click reveals the clicked node + its 1-hop
-      // neighbors via any currently-enabled edge type. Successive clicks keep
-      // accumulating revealed nodes — drill-down by exploration.
+      // Lazy-fetch the real 1-hop neighborhood from the server and merge it
+      // into the loaded canvas. Without this, focus-depth and LOD expansion
+      // are bounded by whatever happened to fit in the initial graph dump —
+      // a node with 30 callers might show only 3 if 27 of them sit below the
+      // 10k PR cap. Fire-and-forget; render immediately on completion.
+      if (id != null) lazyExpandNeighbors(id);
+      // In 'levels' mode, also reveal the node + its currently-loaded 1-hop
+      // neighbors right away so the click is responsive even before the lazy
+      // fetch completes. The fetch fills in the missing nodes when it lands.
       if (lodMode === "levels" && id != null) {
         revealedSet.add(id);
         for (const e of graph.edges) {
@@ -1457,6 +1463,95 @@ function runCommunities(iters){
       }).catch(() => {});
     }
     let _selectToken = 0;
+
+    // ---------- Lazy neighborhood expansion ----------
+    // The initial /api/graph dump is capped (10k by default). When a user
+    // clicks a node, fetch its full 1-hop (or N-hop in focus mode) neighborhood
+    // from the server and merge any new nodes/edges into the in-memory graph.
+    // Already-fetched node IDs are cached so spam-clicking is cheap.
+    const _expanded = new Set();
+    async function lazyExpandNeighbors(id) {
+      // Honor focus depth — if the user is in 3-hops mode we want the actual
+      // 3-hop neighborhood, not just direct neighbors. Capped at 3 server-side
+      // for safety; deeper than that and the fetch is unbounded.
+      const hops = Math.max(1, Math.min(focusHops || 1, 3));
+      const cacheKey = `${id}:${hops}`;
+      if (_expanded.has(cacheKey)) return;
+      _expanded.add(cacheKey);
+      try {
+        const data = await api(`/api/node_neighbors?id=${encodeURIComponent(id)}&hops=${hops}`);
+        if (!data || !data.nodes) return;
+        const merged = mergeNeighbors(data.nodes, data.edges || []);
+        if (!merged.added) return;
+        // In 'levels' mode, every newly-arrived node from this expansion
+        // becomes "revealed" — same semantics as if the user had clicked
+        // each one in turn.
+        if (lodMode === "levels") {
+          for (const nd of data.nodes) revealedSet.add(nd.id);
+        }
+        // Re-init worker so the new nodes participate in physics, then
+        // recompute the visible set and request a paint.
+        postLayoutInit();
+        if (!layoutRunning) startLayout();
+        computeVisible();
+        needsRender = true;
+      } catch (e) {
+        // Network or DB failures shouldn't break the UI — just log and move on.
+        console.warn("lazy expand failed:", e);
+      }
+    }
+
+    // Merge incoming nodes/edges into the in-memory graph. Returns
+    // { added: <int> } so the caller knows whether to re-init the worker.
+    // New node positions seed near the existing center of the graph so they
+    // fall into the layout cleanly instead of flying in from far away.
+    function mergeNeighbors(nodes, edges) {
+      const existing = new Set(graph.nodes.map(n => n.id));
+      const existingEdges = new Set(
+        graph.edges.map(e => `${e.src}::${e.dst}::${e.kind}`)
+      );
+      // Compute an attachment point so new nodes don't spawn at (0,0).
+      let cx = 0, cy = 0, cn = 0;
+      for (const n of layout) { cx += n.x; cy += n.y; cn++; }
+      cx = cn ? cx / cn : 0; cy = cn ? cy / cn : 0;
+
+      let added = 0;
+      const maxPR = Math.max(0.0001, ...graph.nodes.map(n => n.pagerank || 0));
+      for (const n of nodes) {
+        if (existing.has(n.id)) continue;
+        existing.add(n.id);
+        graph.nodes.push(n);
+        const angle = Math.random() * Math.PI * 2;
+        const r0 = 30 + Math.random() * 60;
+        const layoutNode = {
+          id: n.id, name: n.name, kind: n.kind, file: n.file,
+          x: cx + Math.cos(angle) * r0,
+          y: cy + Math.sin(angle) * r0,
+          vx: 0, vy: 0,
+          r: 2.5 + Math.sqrt((n.pagerank || 0) / maxPR) * 12,
+          color: COLORS[n.kind] || "#888",
+          pagerank: n.pagerank || 0,
+        };
+        layout.push(layoutNode);
+        layoutById.set(n.id, layoutNode);
+        if (n.kind === "File") level0Set.add(n.id);
+        added++;
+      }
+      let edgesAdded = 0;
+      for (const e of edges) {
+        const key = `${e.src}::${e.dst}::${e.kind}`;
+        if (existingEdges.has(key)) continue;
+        existingEdges.add(key);
+        graph.edges.push(e);
+        edgesAdded++;
+      }
+      if (added || edgesAdded) {
+        $("#stat-nodes").textContent = graph.nodes.length;
+        $("#stat-edges").textContent = graph.edges.length;
+        $("#stat-edges-2").textContent = graph.edges.length;
+      }
+      return { added };
+    }
 
     function clearSelection() {
       selectedId = null;

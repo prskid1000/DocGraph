@@ -10,6 +10,7 @@ import re
 
 import numpy as np
 
+from docgraph.bm25 import BM25Index, rrf_fuse, tokenize
 from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder
@@ -26,6 +27,9 @@ class Retriever:
         self.cfg = cfg
         self._ranker: PersonalizedRanker | None = None
         self._reranker: Reranker | None = None
+        # Per-label BM25 indexes built on first use. Keyed by label so each
+        # search() call only touches the relevant corpus.
+        self._bm25: dict[str, tuple[BM25Index, list[int]]] = {}
 
     def _reranker_(self) -> Reranker:
         if self._reranker is None:
@@ -36,6 +40,25 @@ class Retriever:
         if self._ranker is None:
             self._ranker = PersonalizedRanker(self.db)
         return self._ranker
+
+    def _bm25_for(self, label: str, rows: list[dict]) -> tuple[BM25Index, list[int]] | None:
+        """Build (or fetch cached) BM25 index for a label's corpus. The index
+        scores `name + body` per row. We cache by label so the first search hit
+        pays the build cost (~tokenize + posting build) once."""
+        cached = self._bm25.get(label)
+        if cached is not None and len(cached[1]) == len(rows):
+            return cached
+        if not rows:
+            return None
+        docs: list[list[str]] = []
+        ids: list[int] = []
+        for r in rows:
+            text = f"{r.get('name','')} {r.get('qname','')} {r.get('body') or ''}"
+            docs.append(tokenize(text))
+            ids.append(r["id"])
+        idx = BM25Index(docs)
+        self._bm25[label] = (idx, ids)
+        return self._bm25[label]
 
     def _chunk_max_sims(self, qvec) -> dict[str, float]:
         """For each parent_qname, the best cosine similarity across its
@@ -97,6 +120,11 @@ class Retriever:
         # 500-line function still surfaces it.
         chunk_max = self._chunk_max_sims(self.embedder.embed([query])[0])
 
+        # Tokenize the query once for the BM25 leg; if every token is too short
+        # to clear BM25Index's min length, we silently skip the keyword fuse.
+        q_tokens = tokenize(query)
+        qlow = query.lower()
+
         for label in labels:
             rows = self.db.fetch_all(
                 f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.qname AS qname, "
@@ -110,18 +138,43 @@ class Retriever:
             qv = qv / (np.linalg.norm(qv) + 1e-9)
             mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
             sims = mat @ qv
-            qlow = query.lower()
-            for r, s in zip(rows, sims.tolist()):
+
+            # Best chunk sim per qname → take max(entity_sim, best_chunk_sim)
+            # so long-body entities don't lose recall when only a section matches.
+            best_sims = [max(float(s), chunk_max.get(r["qname"], -1.0))
+                         for r, s in zip(rows, sims.tolist())]
+
+            # BM25 keyword score over name+qname+body. Fused with vector via RRF
+            # (k=60, classic Cormack constant). If BM25 is empty (no tokens
+            # match), the fused rank degenerates back to pure vector — same
+            # behavior as before this change.
+            bm25_pair = self._bm25_for(label, rows)
+            bm25_scores: list[float] = []
+            if bm25_pair and q_tokens:
+                idx, _id_list = bm25_pair
+                bm25_scores = idx.score(q_tokens)
+            else:
+                bm25_scores = [0.0] * len(rows)
+
+            # Build rank lists (descending). Indices into `rows`.
+            n = len(rows)
+            vec_order = sorted(range(n), key=lambda i: best_sims[i], reverse=True)
+            kw_order = sorted(range(n), key=lambda i: bm25_scores[i], reverse=True)
+            # Drop trailing zero-BM25 entries — they shouldn't earn rank credit.
+            kw_order = [i for i in kw_order if bm25_scores[i] > 0.0]
+            fused = rrf_fuse(vec_order, kw_order)
+
+            for i, r in enumerate(rows):
                 name_boost = 0.3 if qlow in r["name"].lower() else 0.0
                 pr = r.get("pagerank") or 0.0
                 ppr_boost = ppr.get(r["id"], 0.0) if ppr else 0.0
-                # Use personalized PR when present; fall back to global.
                 rank_term = (ppr_boost * 0.5) if ppr else (pr * 0.1)
-                # Take max(entity_sim, best_chunk_sim) so long-body entities
-                # don't lose recall when only one section matches the query.
-                best_sim = max(s, chunk_max.get(r["qname"], -1.0))
-                score = best_sim + name_boost + rank_term
-                s = best_sim  # for the returned `score` field below
+                # Combine: vector best_sim (semantic anchor) + RRF fusion bonus
+                # + name match + PR. RRF scores are tiny (<0.05) — multiplied
+                # so a strong dual ranking wins ties between similarly-scored
+                # vector candidates without overwhelming a clear semantic match.
+                rrf_bonus = float(fused.get(i, 0.0)) * 8.0
+                score = best_sims[i] + name_boost + rank_term + rrf_bonus
                 _, snippet = self._redact(r["file"], None, (r["body"] or "")[:300])
                 results.append({
                     "label": label,
@@ -300,6 +353,90 @@ class Retriever:
         return out[:limit]
 
     # --- Multi-hop / impact / test_impact / cypher ---------------------
+
+    def node_neighbors(self, node_id: int, hops: int = 1) -> dict:
+        """Lazy-fetch a node's neighborhood for UI expansion. Returns the
+        node's 1..N-hop neighbors as `{nodes, edges}` in the same shape as
+        `graph_dump`, ready to be merged into an existing canvas.
+
+        Used by the UI's level-of-detail expansion and focus-depth lazy load,
+        so the graph never depends on what happened to fit in the initial
+        10k-node dump."""
+        hops = max(1, min(int(hops), 5))
+        # Locate the seed (it may be any label; just use raw id match).
+        try:
+            seed_rows = self.db.fetch_all(
+                "MATCH (n) WHERE n.id = $id "
+                "RETURN n.id AS id, label(n) AS kind, "
+                "coalesce(n.name, n.path) AS name, "
+                "coalesce(n.file, n.path) AS file, "
+                "coalesce(n.pagerank, 0.0) AS pagerank",
+                {"id": int(node_id)},
+            )
+        except Exception:
+            return {"nodes": [], "edges": []}
+        if not seed_rows:
+            return {"nodes": [], "edges": []}
+
+        seen_ids: set[int] = {int(node_id)}
+        edge_records: list[dict] = []
+        frontier: set[int] = {int(node_id)}
+
+        EDGE_TYPES = (
+            "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
+            "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",
+            "DECORATED_BY", "RETURNS", "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH",
+        )
+        for _ in range(hops):
+            if not frontier:
+                break
+            next_front: set[int] = set()
+            ids = list(frontier)
+            for edge in EDGE_TYPES:
+                try:
+                    rows = self.db.fetch_all(
+                        f"MATCH (a)-[r:{edge}]-(b) WHERE a.id IN $ids AND b.id IS NOT NULL "
+                        f"RETURN a.id AS src, b.id AS dst",
+                        {"ids": ids},
+                    )
+                except Exception:
+                    continue
+                for row in rows:
+                    src, dst = int(row["src"]), int(row["dst"])
+                    edge_records.append({"src": src, "dst": dst, "kind": edge})
+                    if dst not in seen_ids:
+                        next_front.add(dst)
+                        seen_ids.add(dst)
+                    if src not in seen_ids:
+                        next_front.add(src)
+                        seen_ids.add(src)
+            frontier = next_front
+
+        # Resolve all collected ids to node payloads. We re-coalesce because
+        # File uses `path` while everything else uses `name`/`file`.
+        all_ids = list(seen_ids)
+        try:
+            rows = self.db.fetch_all(
+                "MATCH (n) WHERE n.id IN $ids "
+                "RETURN n.id AS id, label(n) AS kind, "
+                "coalesce(n.name, n.path) AS name, "
+                "coalesce(n.file, n.path) AS file, "
+                "coalesce(n.pagerank, 0.0) AS pagerank",
+                {"ids": all_ids},
+            )
+        except Exception:
+            rows = []
+        nodes = [r for r in rows if r.get("name")]
+        # De-duplicate edges so the merge step doesn't double-draw lines.
+        seen_edge: set[tuple[int, int, str]] = set()
+        deduped: list[dict] = []
+        for e in edge_records:
+            key = (e["src"], e["dst"], e["kind"])
+            if key in seen_edge:
+                continue
+            seen_edge.add(key)
+            deduped.append(e)
+        return {"nodes": nodes, "edges": deduped}
 
     def explore(
         self,
@@ -696,32 +833,45 @@ class Retriever:
         return out[:limit]
 
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
+        # Files first — always keep ALL of them (no PR trim). Files are the
+        # structural skeleton the UI uses for level-0 / "click to expand" mode.
+        # Without this, when the repo has >limit_nodes high-PR Functions, every
+        # File gets squeezed out of the dump and the UI's level-0 set is empty.
+        file_rows = self.db.fetch_all(
+            "MATCH (n:File) RETURN n.id AS id, n.path AS name, n.path AS file, "
+            "coalesce(n.pagerank, 0.0) AS pagerank"
+        )
         nodes: list[dict] = []
-        # Functions and classes
-        for label in ("Function", "Class"):
-            rows = self.db.fetch_all(
-                f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.file AS file, "
-                f"coalesce(n.pagerank, 0.0) AS pagerank ORDER BY pagerank DESC LIMIT {limit_nodes}",
-            )
+        for r in file_rows:
+            r["kind"] = "File"
+            nodes.append(r)
+        # Then top-PR Functions / Classes / Variables, sharing the remaining budget.
+        remaining = max(0, limit_nodes - len(nodes))
+        per_label = max(1, remaining // 3) if remaining else 0
+        for label in ("Function", "Class", "Variable"):
+            if per_label <= 0:
+                break
+            try:
+                rows = self.db.fetch_all(
+                    f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.file AS file, "
+                    f"coalesce(n.pagerank, 0.0) AS pagerank ORDER BY pagerank DESC LIMIT {per_label}"
+                )
+            except Exception:
+                rows = []
             for r in rows:
                 r["kind"] = label
                 nodes.append(r)
-        # Files (use path as name)
-        rows = self.db.fetch_all(
-            f"MATCH (n:File) RETURN n.id AS id, n.path AS name, n.path AS file, "
-            f"coalesce(n.pagerank, 0.0) AS pagerank ORDER BY pagerank DESC LIMIT {limit_nodes}",
-        )
-        for r in rows:
-            r["kind"] = "File"
-            nodes.append(r)
-        # Trim to top N by pagerank
-        nodes.sort(key=lambda x: x.get("pagerank") or 0.0, reverse=True)
-        nodes = nodes[:limit_nodes]
         node_ids = {n["id"] for n in nodes}
 
         edges: list[dict] = []
-        for edge in ("CALLS", "INHERITS", "REFERENCES_", "IMPORTS",
-                     "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH", "INSTANTIATES"):
+        # All edge types the UI's filter panel exposes. Without CONTAINS, files
+        # have no structural connection to their functions/classes — making the
+        # UI's "click File to expand" feature effectively a no-op.
+        for edge in (
+            "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
+            "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",
+            "DECORATED_BY", "RETURNS", "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH",
+        ):
             try:
                 rows = self.db.fetch_all(
                     f"MATCH (a)-[r:{edge}]->(b) RETURN a.id AS src, b.id AS dst"

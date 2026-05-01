@@ -180,6 +180,10 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
     async def api_graph(limit_nodes: int = 10000):
         return _r().graph_dump(limit_nodes=limit_nodes)
 
+    @app.get("/api/node_neighbors")
+    async def api_node_neighbors(id: int, hops: int = 1):
+        return _r().node_neighbors(int(id), hops=hops)
+
     @app.get("/api/stats")
     async def api_stats():
         d = _db()
