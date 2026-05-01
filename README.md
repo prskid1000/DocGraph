@@ -101,47 +101,51 @@ DocGraph picks whichever provider is installed automatically; without one it sta
 
 Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 
+**All flags are optional.** Plain `docgraph index` with zero arguments works — flags only enable opt-in features (LLM docstrings, GPU embeddings, multi-repo) or alter defaults.
+
 | Flag | Default | Description |
 |---|---|---|
-| `--full`, `-f` | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
-| `--repo PATH`, `-r PATH` | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
-| `--llm-model STR` | unset (off) | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
-| `--llm-port INT` | `1235` | Local LLM server port (host is always `localhost`). Ignored unless `--llm-model` is set. |
-| `--llm-format STR` | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`). Ignored unless `--llm-model` is set. |
-| `--llm-max-tokens INT` | `150` | Max tokens per LLM call. DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) fit a one-sentence answer in this budget; bump it for non-reasoning models if you want longer summaries. |
-| `--gpu` | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
-| `--verbose`, `-v` | `false` | Verbose logs |
+| `--full`, `-f` *(optional)* | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
+| `--repo PATH`, `-r PATH` *(optional)* | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
+| `--llm-model STR` *(optional)* | unset (off) | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
+| `--llm-port INT` *(optional)* | `1235` | Local LLM server port (host is always `localhost`). Ignored unless `--llm-model` is set. |
+| `--llm-format STR` *(optional)* | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`). Ignored unless `--llm-model` is set. |
+| `--llm-max-tokens INT` *(optional)* | `150` | Max tokens per LLM call. DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) fit a one-sentence answer in this budget; bump it for non-reasoning models if you want longer summaries. |
+| `--gpu` *(optional)* | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
+| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 ### `docgraph watch [path]`
 
 Auto-reindex on file changes (Rust `notify` under the hood, debounced). Plain `watch` holds a writer lock — kill `serve` / `mcp` against the same DB first. With `--serve`, the watcher and the web UI run in **one process**, sharing the DB lock; the browser stays in sync via Server-Sent Events.
 
+**All flags are optional.**
+
 | Flag | Default | Description |
 |---|---|---|
-| `--debounce INT` | `500` | Debounce window in ms before reindex fires |
-| `--serve` | `false` | Also run the web UI + JSON API in the same process. UI auto-redraws after each reindex via `/api/events` SSE. |
-| `--host STR` | `127.0.0.1` | Bind address (only with `--serve`) |
-| `--port INT` | `5500` | Bind port (only with `--serve`) |
-| `--verbose`, `-v` | `false` | Verbose logs |
+| `--debounce INT` *(optional)* | `500` | Debounce window in ms before reindex fires |
+| `--serve` *(optional)* | `false` | Also run the web UI + JSON API in the same process. UI auto-redraws after each reindex via `/api/events` SSE. |
+| `--host STR` *(optional)* | `127.0.0.1` | Bind address (only with `--serve`) |
+| `--port INT` *(optional)* | `5500` | Bind port (only with `--serve`) |
+| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 ### `docgraph serve [path]`
 
-Start the web UI + JSON API.
+Start the web UI + JSON API. **All flags are optional.**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--host STR` | `127.0.0.1` (or `$DOCGRAPH_HOST`) | Bind address |
-| `--port INT` | `5500` (or `$DOCGRAPH_PORT`) | Bind port |
-| `--verbose`, `-v` | `false` | Verbose access logs |
+| `--host STR` *(optional)* | `127.0.0.1` (or `$DOCGRAPH_HOST`) | Bind address |
+| `--port INT` *(optional)* | `5500` (or `$DOCGRAPH_PORT`) | Bind port |
+| `--verbose`, `-v` *(optional)* | `false` | Verbose access logs |
 
 ### `docgraph mcp [path]`
 
-Run the Model Context Protocol server.
+Run the Model Context Protocol server. **All flags are optional.**
 
 | Flag | Default | Description |
 |---|---|---|
-| `--transport STR` | `stdio` | `stdio` (for Cursor / Claude Desktop) or `http` (for web clients) |
-| `--verbose`, `-v` | `false` | Verbose logs |
+| `--transport STR` *(optional)* | `stdio` | `stdio` (for Cursor / Claude Desktop) or `http` (for web clients) |
+| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 ### `docgraph stats [path]`
 
@@ -153,14 +157,16 @@ Generate (or rebuild) an LLM-grounded wiki for the indexed repo. For every top-l
 
 Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_*` env vars are honored too.
 
+**All flags are optional.** Like `docgraph index`'s LLM-docstring path, the only one you typically pass is `--llm-model` (most local servers reject unknown model names). Everything else has a working default.
+
 | Flag | Default | Description |
 |---|---|---|
-| `--module STR`, `-m STR` | unset (all) | Build only the named top-level module. |
-| `--llm-host STR` | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Host running the local LLM server. |
-| `--llm-port INT` | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. |
-| `--llm-model STR` | `local-model` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects (e.g. `qwen3.6-35b`). |
-| `--llm-format STR` | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
-| `--llm-max-tokens INT` | `600` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Higher than `index`'s 150 because wiki pages are longer. |
+| `--module STR`, `-m STR` *(optional)* | unset (all) | Build only the named top-level module. |
+| `--llm-host STR` *(optional)* | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Host running the local LLM server. |
+| `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. |
+| `--llm-model STR` *(optional)* | `local-model` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects (e.g. `qwen3.6-35b`). Pass this if your server requires a specific name. |
+| `--llm-format STR` *(optional)* | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
+| `--llm-max-tokens INT` *(optional)* | `600` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Higher than `index`'s 150 because wiki pages are longer. |
 
 API equivalents (used by the Web UI's "Build wiki" button):
 
@@ -176,19 +182,21 @@ Delete `.docgraph/` for the repo (DB + cache + repos list).
 
 | Flag | Default | Description |
 |---|---|---|
-| `--yes`, `-y` | `false` | Skip the confirmation prompt |
+| `--yes`, `-y` *(optional)* | `false` | Skip the confirmation prompt |
 
 ### `docgraph daemon start`
 
 Start the optional embedding daemon. Holds a single warm ONNX session in memory; other docgraph processes on this host route their embed calls through it via loopback TCP, cutting cold start to a TCP round trip. Foreground by default; pass `--detach` to background it. Lock file at `~/.docgraph/daemon.lock`.
 
+**All flags are optional.**
+
 | Flag | Default | Description |
 |---|---|---|
-| `--port INT` | `5577` | Loopback TCP port. 127.0.0.1 only — never exposed off-host. |
-| `--model STR` | `BAAI/bge-small-en-v1.5` | Embedding model. Must match what your repos were indexed with, or vectors won't be comparable. |
-| `--gpu` | `false` | Load the model on GPU via ONNX Runtime providers. Same opt-in install requirements as `docgraph index --gpu`. |
-| `--detach`, `-d` | `false` | Spawn a background process and return. POSIX: double-fork; Windows: `DETACHED_PROCESS`. |
-| `--verbose`, `-v` | `false` | Verbose logs |
+| `--port INT` *(optional)* | `5577` | Loopback TCP port. 127.0.0.1 only — never exposed off-host. |
+| `--model STR` *(optional)* | `BAAI/bge-small-en-v1.5` | Embedding model. Must match what your repos were indexed with, or vectors won't be comparable. |
+| `--gpu` *(optional)* | `false` | Load the model on GPU via ONNX Runtime providers. Same opt-in install requirements as `docgraph index --gpu`. |
+| `--detach`, `-d` *(optional)* | `false` | Spawn a background process and return. POSIX: double-fork; Windows: `DETACHED_PROCESS`. |
+| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 Embedder integration is automatic: if the daemon is running when an `Embedder.embed()` call is made, the call gets routed through it. If the daemon is down or the protocol fails, the embedder loads its own session as before — never fails the request.
 

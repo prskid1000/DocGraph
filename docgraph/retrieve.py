@@ -878,15 +878,20 @@ class Retriever:
         edges: list[dict] = []
         # All edge types the UI's filter panel exposes. Without CONTAINS the
         # File→Function "click to expand" relationship has no edges to walk.
+        # Filter at the DB level — pulling all edges then filtering in Python
+        # ships millions of rows for nothing on a 200k-function codebase.
+        ids_list = list(node_ids)
         for edge in self._ALL_GRAPH_EDGES:
             try:
                 rows = self.db.fetch_all(
-                    f"MATCH (a)-[r:{edge}]->(b) RETURN a.id AS src, b.id AS dst"
+                    f"MATCH (a)-[r:{edge}]->(b) "
+                    f"WHERE a.id IN $ids AND b.id IN $ids "
+                    f"RETURN a.id AS src, b.id AS dst",
+                    {"ids": ids_list},
                 )
                 for r in rows:
-                    if r["src"] in node_ids and r["dst"] in node_ids:
-                        r["kind"] = edge
-                        edges.append(r)
+                    r["kind"] = edge
+                    edges.append(r)
             except Exception:
                 pass
         return {"nodes": nodes, "edges": edges}
