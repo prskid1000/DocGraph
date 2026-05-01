@@ -340,16 +340,27 @@
       animation: lspin 0.8s linear infinite; flex-shrink: 0; }
     .skel-fail { color: var(--bad); font-size: 11px; padding: 6px 8px; }
 
-    /* In-input search button — replaces the auto-search debounce. */
+    /* In-input search button — replaces the auto-search debounce. The
+       absolute positioning is anchored to the input itself (via a wrapper
+       ".search-row" that's position:relative). Input padding-right makes
+       room for the button so the placeholder text never collides with it. */
     .search-bar .go-btn, .search-row .go-btn {
-      position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+      position: absolute; top: 50%; transform: translateY(-50%);
       background: var(--accent-2); color: #0b0e14; border: 0; border-radius: 6px;
-      padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
-      transition: filter .12s;
+      padding: 3px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
+      line-height: 1.5; transition: filter .12s; height: 22px;
     }
     .search-bar .go-btn:hover, .search-row .go-btn:hover { filter: brightness(1.15); }
+    /* Top search bar: input has padding-right:36px from the kbd era — bump
+       it for the new wider button, then anchor the button inside that. */
+    .search-bar { position: relative; }
+    .search-bar input { padding-right: 50px !important; }
+    .search-bar .go-btn { right: 6px; }
+    /* Sidebar search: .search-row has its own 12px outer padding, so the
+       button needs 12px + a small gap to sit flush against the input. */
     .search-row { position: relative; }
-    .search-row input { padding-right: 56px; }
+    .search-row input { padding-right: 50px; }
+    .search-row .go-btn { right: 16px; }
 
     /* Custom scrollbars */
     ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -650,7 +661,13 @@ self.onmessage=(ev)=>{
 function loop(){
   if(!running)return;
   step();frame++;
-  if(frame%2===0){
+  // Send positions to main thread less often when N is large so we don't
+  // starve the UI thread under a flood of cloned Float32Arrays. At 50k
+  // nodes a position payload is 400KB; at every-2-frame cadence (~30 Hz)
+  // that's ~12 MB/s of structured cloning + 50k iterations of x/y copy on
+  // the main thread per second — enough to drop tab clicks. Scale with N.
+  const interval=N>30000?12:N>10000?6:2;
+  if(frame%interval===0){
     const buf=new Float32Array(positions);
     self.postMessage({type:'positions',data:buf.buffer,frame:frame},[buf.buffer]);
   }
