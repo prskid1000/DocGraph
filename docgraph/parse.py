@@ -96,7 +96,12 @@ TAGS_QUERIES: dict[str, str] = {
 (call function: (identifier) @ref.call)
 (call function: (attribute attribute: (identifier) @ref.call))
 (import_statement name: (dotted_name) @import.module)
-(import_from_statement module_name: (dotted_name) @import.module)
+(import_from_statement
+  module_name: (dotted_name) @import.module
+  name: (dotted_name) @import.symbol)
+(import_from_statement
+  module_name: (dotted_name) @import.module
+  name: (aliased_import name: (dotted_name) @import.symbol))
 (module
   (expression_statement
     (assignment left: (identifier) @name)) @definition.variable)
@@ -113,6 +118,8 @@ TAGS_QUERIES: dict[str, str] = {
 (call_expression function: (member_expression property: (property_identifier) @ref.call))
 (new_expression constructor: (identifier) @ref.new)
 (import_statement source: (string) @import.module)
+(import_specifier name: (identifier) @import.symbol)
+(import_clause (identifier) @import.symbol)
 (program
   (lexical_declaration
     (variable_declarator name: (identifier) @name) @definition.variable))
@@ -133,6 +140,8 @@ TAGS_QUERIES: dict[str, str] = {
 (call_expression function: (member_expression property: (property_identifier) @ref.call))
 (new_expression constructor: (identifier) @ref.new)
 (import_statement source: (string) @import.module)
+(import_specifier name: (identifier) @import.symbol)
+(import_clause (identifier) @import.symbol)
 (program
   (lexical_declaration
     (variable_declarator name: (identifier) @name) @definition.variable))
@@ -294,6 +303,7 @@ class RawEdge:
     src_qname: str | None
     target_name: str
     line: int = 0
+    column: int = 0
     extra: dict = field(default_factory=dict)
 
 
@@ -466,12 +476,17 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
                 if (q, n.start_point.row + 1) in keep_qnames
             ]
 
-    # Re-scope methods inside classes
-    qname_remap: dict[str, str] = {}
+    # Re-scope methods inside classes. Key on node identity, not on the
+    # original qname string — two methods of the same name in different
+    # classes (e.g. Square.area and Circle.area) share the base qname
+    # `file::area` and the old per-qname remap collapsed both into one.
+    # entities[i] corresponds to defs[i] after the dedup pass above; the
+    # zip below relies on that ordering.
+    node_to_qname: dict[int, str] = {}
+    any_remap = False
     for d_node, qname, kind in defs:
         if kind in ("class", "interface"):
             continue
-        # Find smallest enclosing class
         enclosing_class = None
         for d2, q2, k2 in defs:
             if d2 is d_node:
@@ -482,14 +497,15 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
                 if enclosing_class is None or (d2.end_byte - d2.start_byte) < enclosing_class[1]:
                     enclosing_class = (q2, d2.end_byte - d2.start_byte)
         if enclosing_class:
-            new_q = f"{enclosing_class[0]}::{qname.split('::')[-1]}"
-            qname_remap[qname] = new_q
+            node_to_qname[id(d_node)] = f"{enclosing_class[0]}::{qname.split('::')[-1]}"
+            any_remap = True
 
-    if qname_remap:
-        for ent in entities:
-            if ent.qname in qname_remap:
-                ent.qname = qname_remap[ent.qname]
-        defs = [(n, qname_remap.get(q, q), k) for (n, q, k) in defs]
+    if any_remap:
+        for i, (d_node, _q, _k) in enumerate(defs):
+            new_q = node_to_qname.get(id(d_node))
+            if new_q and i < len(entities):
+                entities[i].qname = new_q
+        defs = [(n, node_to_qname.get(id(n), q), k) for (n, q, k) in defs]
 
     # Edges: refs
     for ref_cap, edge_kind in [("ref.call", "CALLS"), ("ref.new", "INSTANTIATES")]:
@@ -502,6 +518,7 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
                 src_qname=enc[0] if enc else None,
                 target_name=target,
                 line=r_node.start_point.row + 1,
+                column=r_node.start_point.column + 1,
             ))
 
     # Inheritance
@@ -534,6 +551,27 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
             src_file=rel,
             src_qname=None,
             target_name=mod,
+            line=i_node.start_point.row + 1,
+            column=i_node.start_point.column + 1,
+        ))
+
+    # Symbol-level imports — `from x import Y` (Python), `import {Y} from "x"` (JS/TS).
+    # We don't try to associate each symbol back to a specific module here;
+    # the index resolver matches the symbol name against any imported file's
+    # exported entities, falling back to a global lookup. Java's qualified
+    # imports (`import a.b.C;`) already terminate in the symbol name, so the
+    # last component of @import.module is the symbol — handled in index.py.
+    for s_node in caps.get("import.symbol", []):
+        sym = source[s_node.start_byte:s_node.end_byte].decode("utf-8", errors="replace").strip()
+        if not sym:
+            continue
+        raw_edges.append(RawEdge(
+            kind="IMPORTS_SYMBOL",
+            src_file=rel,
+            src_qname=None,
+            target_name=sym,
+            line=s_node.start_point.row + 1,
+            column=s_node.start_point.column + 1,
         ))
 
     return FileParse(

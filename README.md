@@ -21,6 +21,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
 - **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML for a multi-x speedup on large repos. Still no torch dep — just `pip install onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows). Falls back to CPU silently if no GPU runtime is installed.
+- **Optional cross-CLI embedding daemon** — `docgraph daemon start` keeps one warm ONNX session in memory; subsequent `index` / `mcp` / `serve` invocations route their embed calls through it via loopback TCP, cutting cold start to a TCP round trip. Off by default; `--detach` runs in the background.
 - **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-model <name>` (you supply the local server).
 
 ### Retrieval
@@ -31,6 +32,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Personalized PageRank** — `search` accepts `focus_file` / `focus_symbol` and ranks results by proximity to the file or symbol the agent is currently editing.
 - **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (still local, still ONNX).
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
+- **Symbol-level imports + method overrides** — `IMPORTS_SYMBOL` (file → exact Class / Function it imports, not just file → file) and `OVERRIDES` (child method → parent method via the inheritance closure) so agents can ask "who imports this class?" and "what does this method override?" precisely.
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
 - **Diff- and history-aware tools** — `git_changes` (changed entities + 1-hop callers — Cursor `@Commit` joined to the graph), `git_blame` (line-range blame — Cursor `@Blame` parity), `git_recent` (last N commits scoped to a file or repo).
 
@@ -148,6 +150,28 @@ Delete `.docgraph/` for the repo (DB + cache + repos list).
 |---|---|---|
 | `--yes`, `-y` | `false` | Skip the confirmation prompt |
 
+### `docgraph daemon start`
+
+Start the optional embedding daemon. Holds a single warm ONNX session in memory; other docgraph processes on this host route their embed calls through it via loopback TCP, cutting cold start to a TCP round trip. Foreground by default; pass `--detach` to background it. Lock file at `~/.docgraph/daemon.lock`.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--port INT` | `5577` | Loopback TCP port. 127.0.0.1 only — never exposed off-host. |
+| `--model STR` | `BAAI/bge-small-en-v1.5` | Embedding model. Must match what your repos were indexed with, or vectors won't be comparable. |
+| `--gpu` | `false` | Load the model on GPU via ONNX Runtime providers. Same opt-in install requirements as `docgraph index --gpu`. |
+| `--detach`, `-d` | `false` | Spawn a background process and return. POSIX: double-fork; Windows: `DETACHED_PROCESS`. |
+| `--verbose`, `-v` | `false` | Verbose logs |
+
+Embedder integration is automatic: if the daemon is running when an `Embedder.embed()` call is made, the call gets routed through it. If the daemon is down or the protocol fails, the embedder loads its own session as before — never fails the request.
+
+### `docgraph daemon stop`
+
+Stop the running daemon. Idempotent — no-op if nothing's running. No flags.
+
+### `docgraph daemon status`
+
+Print whether the daemon is running and its config (pid, port, model, gpu flag, start time). Exits non-zero if no daemon is running. No flags.
+
 ### `docgraph install-mcp [path]`
 
 Print a JSON snippet ready to paste into Cursor / Claude Desktop's MCP config. No flags.
@@ -188,6 +212,7 @@ Print version. No flags.
 | `DOCGRAPH_PORT` | `serve`, `mcp` (http) | `5500` |
 | `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
 | `DOCGRAPH_GPU` | `index`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. |
+| `~/.docgraph/daemon.lock` | (lock file, not env var) | Auto-managed by `docgraph daemon start` / `stop`. Contains `host`, `port`, `pid`, `model`, `gpu`, `started`. Other docgraph processes consult this to discover the running daemon. Stale locks are cleaned automatically. |
 | `DOCGRAPH_LLM_MODEL` | `index` | unset (off). **Activator** — setting this enables LLM-augmented docstrings (same as `--llm-model`). |
 | `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset. Set to `1`/`true` to enable explicitly (rarely needed; setting `DOCGRAPH_LLM_MODEL` is enough). |
 | `DOCGRAPH_LLM_HOST` | `index` | `localhost` |
@@ -243,9 +268,9 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 
 | Tier | Edges |
 |---|---|
-| **Structural** | `CONTAINS`, `IMPORTS`, `IMPORTS_SYMBOL` |
+| **Structural** | `CONTAINS`, `IMPORTS` (file → file or module), `IMPORTS_SYMBOL` (file → specific Class / Function imported by name, e.g. Python `from x import Y`, JS/TS `import {Y} from "x"`) |
 | **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_`, `RETURNS` |
-| **Type system** | `INHERITS`, `IMPLEMENTS`, `OVERRIDES`, `DECORATED_BY` |
+| **Type system** | `INHERITS`, `IMPLEMENTS`, `OVERRIDES` (child→parent method via inheritance closure), `DECORATED_BY` |
 | **Differentiators** | `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic name match) |
 
 Nodes: `File`, `Module`, `Class`, `Function`, `Variable`. Each `Function` and `Class` carries an embedding and a PageRank score.
@@ -357,18 +382,12 @@ In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/s
 
 ```bash
 pip install pytest
-pytest                   # ~36s (shared embedder cache + 174 tests)
+pytest                   # ~65s (shared embedder cache + 178 tests, incl. daemon)
 ```
 
 Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, and Variable-node round-trip + delete cascade.
 
 Live LLM tests (`tests/test_llm_live.py`) auto-skip unless an OpenAI-compatible server is reachable at `localhost:1235` with `qwen3.6-35b` loaded. Override host/port/model via `DOCGRAPH_LLM_TEST_HOST` / `DOCGRAPH_LLM_TEST_PORT` / `DOCGRAPH_LLM_TEST_MODEL`.
-
-## Roadmap
-
-- **Precise (compiler-grade) symbol resolution via SCIP / LSP** — would eliminate the remaining overload / generic mis-resolution on TS / Java / Scala. Doesn't require a heavy stack: an SCIP-only path needs zero new pip deps (we'd shell out to per-language indexers like `scip-typescript` / `scip-java` and parse the protobuf), and the LSP-daemon path needs at most one lightweight client (`pylsp-jsonrpc` ~1 MB or a hand-rolled JSON-RPC over stdin/stdout). Either way, no torch, no Java runtime baked into our wheel — users opt in by installing the indexer they want.
-- **Pre-download / cache embedding model across CLI invocations** — fastembed already caches model files on disk and we share one ONNX session across `Embedder()` instances inside a process; what's left is persisting a small daemon between CLI calls to cut cold start to sub-second.
-- **Symbol-level imports (`IMPORTS_SYMBOL`) and method `OVERRIDES` edges** — schema reserves them, parser hasn't extracted them yet.
 
 ## License
 

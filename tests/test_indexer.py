@@ -267,6 +267,71 @@ def test_variables_contained_by_file(var_repo: Path):
         gc.collect()
 
 
+def test_imports_symbol_edge(indexed):
+    """`from src.auth import Authenticator, TokenError` produces IMPORTS_SYMBOL
+    edges from api.py to the Class nodes it imports. This is finer than the
+    file-level IMPORTS edge — agents asking 'who depends on this class?' get
+    a precise answer instead of a file-fanout."""
+    _cfg, db, _e, _s = indexed
+    rows = db.fetch_all(
+        "MATCH (f:File)-[:IMPORTS_SYMBOL]->(c:Class) "
+        "WHERE f.path = $p RETURN c.name AS n",
+        {"p": "src/api.py"},
+    )
+    names = {r["n"] for r in rows}
+    assert {"Authenticator", "TokenError"} <= names, f"missing symbol imports, got {names}"
+
+
+def test_overrides_edge_extracted(tmp_path: Path):
+    """Methods that share a name with a method on an inherited class get
+    OVERRIDES edges from child→parent."""
+    repo = tmp_path / "ov"
+    repo.mkdir()
+    (repo / "shapes.py").write_text(
+        "class Shape:\n"
+        "    def area(self):\n"
+        "        return 0\n"
+        "    def describe(self):\n"
+        "        return 'shape'\n"
+        "\n"
+        "class Square(Shape):\n"
+        "    def area(self):\n"
+        "        return 4\n"
+        "\n"
+        "class Circle(Shape):\n"
+        "    def area(self):\n"
+        "        return 3.14\n"
+        "    def describe(self):\n"
+        "        return 'circle'\n",
+        encoding="utf-8",
+    )
+    import subprocess as sp
+    sp.run(["git", "init", "-q"], cwd=repo, check=False)
+    sp.run(["git", "config", "user.email", "t@t.t"], cwd=repo, check=False)
+    sp.run(["git", "config", "user.name", "t"], cwd=repo, check=False)
+    sp.run(["git", "add", "."], cwd=repo, check=False)
+    sp.run(["git", "commit", "-q", "-m", "i"], cwd=repo, check=False)
+
+    cfg, db, _embedder, _stats = _index_and_reopen_readonly(repo)
+    try:
+        rows = db.fetch_all(
+            "MATCH (child:Function)-[:OVERRIDES]->(parent:Function) "
+            "RETURN child.qname AS c, parent.qname AS p, child.name AS n"
+        )
+        pairs = {(r["c"], r["p"]) for r in rows}
+        names = {r["n"] for r in rows}
+        # Square.area → Shape.area, Circle.area → Shape.area, Circle.describe → Shape.describe
+        assert "area" in names and "describe" in names, f"missing override names: {names}"
+        # At least 3 override edges (Square.area, Circle.area, Circle.describe)
+        assert len(pairs) >= 3, f"expected >= 3 OVERRIDES, got {len(pairs)}: {pairs}"
+        # Square.area should override Shape.area, NOT a Square method
+        for child_q, parent_q in pairs:
+            assert "Shape::" in parent_q, f"OVERRIDES parent should be Shape, got {parent_q}"
+    finally:
+        db.close()
+        gc.collect()
+
+
 def test_variable_incremental_delete(var_repo: Path):
     """Removing a variable from a file → its Variable node is gone after reindex.
     Exercises _delete_files_from_db's Variable cascade."""

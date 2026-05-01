@@ -697,6 +697,9 @@ class Indexer:
         decorated_class_rows: list[dict] = []
         imports_file_rows: list[dict] = []
         imports_module_rows: list[dict] = []
+        imports_symbol_class_rows: list[dict] = []
+        imports_symbol_func_rows: list[dict] = []
+        overrides_rows: list[dict] = []
         module_rows_by_name: dict[str, dict] = {}
 
         # Pre-load existing modules so we don't duplicate
@@ -768,6 +771,28 @@ class Indexer:
                         imports_module_rows.append({"from_id": src_fid, "to_id": mid})
                     continue
 
+                if kind == "IMPORTS_SYMBOL":
+                    # Resolve the named symbol against the importing file's
+                    # imported-file scope first, then fall back to global
+                    # name match. Skip if the symbol name is too generic to
+                    # disambiguate (heuristic: same name appears in 5+ files).
+                    src_fid = file_index.get(src_file)
+                    if src_fid is None:
+                        continue
+                    if not target_name:
+                        continue
+                    target = resolve(target_name, src_file)
+                    if not target:
+                        continue
+                    tlabel, tid, tfile = target
+                    if tlabel == "Class":
+                        if needs_insert(src_file, tfile):
+                            imports_symbol_class_rows.append({"from_id": src_fid, "to_id": tid})
+                    elif tlabel == "Function":
+                        if needs_insert(src_file, tfile):
+                            imports_symbol_func_rows.append({"from_id": src_fid, "to_id": tid})
+                    continue
+
                 if not src_qname or src_qname not in qname_index:
                     continue
                 src_label, src_id = qname_index[src_qname]
@@ -812,6 +837,58 @@ class Indexer:
         if new_modules:
             self.db.insert_nodes("Module", new_modules)
 
+        # Build OVERRIDES from INHERITS edges + same-name methods. We walk the
+        # inheritance closure (so a grandchild override of a grandparent method
+        # is still recorded) and emit (child_method, parent_method) pairs where
+        # both classes have a method of the same name. Cheap: O(classes *
+        # methods) and runs once per index pass, no embeddings involved.
+        # Methods are derived from qname_index by spotting Function entities
+        # whose parent qname resolves to a Class — we can't read CONTAINS
+        # edges from the DB yet because those rows are still in `contains_groups`
+        # waiting to be written.
+        if inherits_rows:
+            class_methods: dict[int, dict[str, int]] = defaultdict(dict)
+            for qname, (qlabel, qeid) in qname_index.items():
+                if qlabel != "Function":
+                    continue
+                parts = qname.split("::")
+                if len(parts) < 3:
+                    continue
+                parent_q = "::".join(parts[:-1])
+                parent = qname_index.get(parent_q)
+                if not parent or parent[0] != "Class":
+                    continue
+                class_methods[parent[1]][parts[-1]] = qeid
+            # in-memory inheritance map: class_id → set(parent_class_ids)
+            parents: dict[int, set[int]] = defaultdict(set)
+            for ir in inherits_rows:
+                parents[ir["from_id"]].add(ir["to_id"])
+            # ancestors = transitive parents (avoids missing grand-overrides)
+            def ancestors(cid: int, seen: set[int]) -> set[int]:
+                out: set[int] = set()
+                stack = list(parents.get(cid, ()))
+                while stack:
+                    p = stack.pop()
+                    if p in seen:
+                        continue
+                    seen.add(p)
+                    out.add(p)
+                    stack.extend(parents.get(p, ()))
+                return out
+            seen_pairs: set[tuple[int, int]] = set()
+            for child_cid, methods in class_methods.items():
+                for parent_cid in ancestors(child_cid, set()):
+                    pmethods = class_methods.get(parent_cid, {})
+                    for mname, child_mid in methods.items():
+                        parent_mid = pmethods.get(mname)
+                        if parent_mid is None or parent_mid == child_mid:
+                            continue
+                        key = (child_mid, parent_mid)
+                        if key in seen_pairs:
+                            continue
+                        seen_pairs.add(key)
+                        overrides_rows.append({"from_id": child_mid, "to_id": parent_mid})
+
         # Insert collected edges
         edges_status.stop()
         n_edges = (
@@ -819,6 +896,8 @@ class Indexer:
             + len(calls_rows) + len(inst_rows) + len(inherits_rows)
             + len(decorated_func_rows) + len(decorated_class_rows)
             + len(imports_file_rows) + len(imports_module_rows)
+            + len(imports_symbol_class_rows) + len(imports_symbol_func_rows)
+            + len(overrides_rows)
         )
         if n_edges:
             with _bar() as prog:
@@ -833,6 +912,9 @@ class Indexer:
                 self.db.insert_edges("DECORATED_BY", "Class", "Function", decorated_class_rows, on_progress=cb)
                 self.db.insert_edges("IMPORTS", "File", "File", imports_file_rows, on_progress=cb)
                 self.db.insert_edges("IMPORTS", "File", "Module", imports_module_rows, on_progress=cb)
+                self.db.insert_edges("IMPORTS_SYMBOL", "File", "Class", imports_symbol_class_rows, on_progress=cb)
+                self.db.insert_edges("IMPORTS_SYMBOL", "File", "Function", imports_symbol_func_rows, on_progress=cb)
+                self.db.insert_edges("OVERRIDES", "Function", "Function", overrides_rows, on_progress=cb)
 
         # ---- Step 9: Tier 4 + PageRank (incremental-aware) ----
         # Skip entirely on no-op runs (no parsed, no deleted) so a `docgraph

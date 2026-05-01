@@ -144,10 +144,28 @@ class Embedder:
         Keeping vectors as numpy (~1.5 KB each) instead of Python list[float]
         (~12 KB each) is an 8x memory cut, which matters when embedding
         100k+ entities. If `on_progress` is given, it's called with the count
-        of items completed each time fastembed yields a vector."""
+        of items completed each time fastembed yields a vector.
+
+        Daemon path: if `docgraph daemon start` is running on this host, route
+        the embed call through it — the daemon holds a single warm ONNX session
+        across all CLI invocations, cutting cold-start to a TCP round trip. We
+        only use the daemon when no `on_progress` callback is set, since the
+        daemon returns one batch and progress hooks expect per-vector ticks.
+        Falls back transparently if the daemon is unreachable or replies
+        malformed; never fails the caller's request.
+        """
+        texts_list = list(texts)
+        if on_progress is None and texts_list:
+            try:
+                from docgraph import daemon as _daemon
+                via = _daemon.embed_via_daemon(texts_list)
+                if via is not None and via.shape[0] == len(texts_list):
+                    return via.astype(np.float32, copy=False)
+            except Exception:
+                pass
         model = self._ensure()
         arrs: list[np.ndarray] = []
-        for vec in model.embed(list(texts), batch_size=batch_size):
+        for vec in model.embed(texts_list, batch_size=batch_size):
             arrs.append(np.asarray(vec, dtype=np.float32))
             if on_progress is not None:
                 on_progress(1)

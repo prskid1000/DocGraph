@@ -10,7 +10,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 
 ## Hard rules
 
-- **One Python package, one process, one DB file.** No new top-level dirs, no separate frontend builds, no microservices.
+- **One Python package, one process, one DB file.** No new top-level dirs, no separate frontend builds, no microservices. (The optional embedding daemon at `docgraph daemon start` is a deliberate exception — opt-in, loopback-only, never required for any feature; the codepath always falls back to in-process embedding if the daemon is down.)
 - **Kuzu is the only data store.** Don't add SQLite, ChromaDB, Neo4j, Redis, etc.
 - **No npm.** The web UI is one HTML file at `docgraph/ui/index.html`. No build step.
 - **No torch dependency.** Embeddings go through `fastembed` (ONNX). Adding sentence-transformers/torch would 4× the install size. GPU support uses ONNX Runtime providers (`CUDAExecutionProvider` / `DmlExecutionProvider` / `CoreMLExecutionProvider`) — not torch CUDA. Users opt in by `pip install onnxruntime-gpu` (or `-directml` / `-silicon`); we never depend on those.
@@ -23,7 +23,8 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/cli.py` | Typer entry. Add subcommands here. |
 | `docgraph/config.py` | Auto-detects repo root + ecosystems, respects `.gitignore` + `.docgraphignore`. Multi-root via `extra_roots`; persisted in `.docgraph/repos.json`. |
 | `docgraph/ignores.py` | Universal ignore patterns + per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Swift / Ruby / Dart / Elixir / Scala / PHP / Terraform / Unity / Go). Universal layer also covers Jupyter / MLflow / wandb / DVC / Haskell / Zig / R / Scala tooling. Inline string lists, no template files. |
-| `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. |
+| `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. Method qname rescoping is keyed on `id(node)` not on the original qname string — methods sharing a base qname (`file::area` for both `Square.area` and `Circle.area`) used to collide and remap to one final qname. |
+| `docgraph/daemon.py` | Optional cross-CLI embedding daemon. Length-prefixed JSON on loopback TCP (default port 5577). `is_running()` checks the lock file at `~/.docgraph/daemon.lock` and pings the recorded port — stale locks (PID dead, port silent) are auto-cleared. `Embedder.embed()` consults `embed_via_daemon()` before loading its own ONNX session; daemon-side `_serve_one()` calls `embedder._ensure().embed(...)` directly to avoid recursing back through the wrapper. |
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
 | `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
 | `docgraph/db.py` | Kuzu schema + bulk insert helpers. Edges go through `COPY FROM arrow (from='X', to='Y')` (pyarrow-staged) — 10-50× faster than the old MATCH+CREATE. Default `insert_edges` batch is 10k rows. The `_known_ids` cache filters dangling-endpoint rows before COPY (which hard-errors on missing PKs, vs. the old silent-drop). `close()` is explicit + `__del__` calls it — needed because Windows + Kuzu's COPY internals don't release the file lock on `del` alone. |
@@ -82,7 +83,7 @@ If you change the parse output shape, update the cache writer **and** the cache 
 ## Testing
 
 ```bash
-.venv/Scripts/python -m pytest                 # ~40s, 167 tests
+.venv/Scripts/python -m pytest                 # ~65s, 178 tests (incl. daemon)
 ```
 
 Tests in `tests/`:
@@ -97,6 +98,7 @@ Tests in `tests/`:
 - `test_mcp_server.py` — every MCP tool registered + invokable end-to-end through `FastMCP.call_tool`
 - `test_llm.py` — LLM client unit tests (urllib mocked); covers OpenAI + Anthropic + auth headers + malformed-response fallback
 - `test_llm_live.py` — **Optional live integration.** Probes `localhost:1235/v1/models` for `qwen3.6-35b`; auto-skips if either is missing. Override host/port/model via `DOCGRAPH_LLM_TEST_*` env vars.
+- `test_daemon.py` — Embedding daemon: ping / embed roundtrip / stale-lock cleanup. Spins up `run_daemon` in a thread on a free port with a sandboxed `LOCK_PATH`, so it never touches the user's real `~/.docgraph/daemon.lock`.
 
 **Kuzu writer-visibility gotcha:** a `kuzu.Connection` opened with `read_only=False` doesn't see its own writes via subsequent `fetch_all` queries in the same process. The conftest fixture (and `test_indexer._index_and_reopen_readonly`) close the writer and reopen read-only after indexing. If you write a new test and reads come back empty, that's the cause.
 
@@ -263,6 +265,8 @@ pkill -f docgraph                              # *nix
 
 - Putting `∈` or other non-cp1252 chars in MCP tool docstrings → crashes the call on Windows.
 - Calling `type(r)` in Cypher → `function TYPE does not exist`.
+- The daemon's embed-handler must NOT call `Embedder.embed()` — that wrapper now checks for a running daemon and would route the request right back to itself, causing infinite recursion. Use `embedder._ensure().embed(...)` directly inside `daemon._serve_one`.
+- Per-qname method rescoping breaks when two classes have a method of the same name. Fixed by keying the remap on `id(def_node)`. If you re-touch parse.py's "Re-scope methods inside classes" block, keep the node-identity key — string-keying collapses overloads.
 - Forgetting that `File.path` is the name property (not `File.name`).
 - Re-running the indexer while `docgraph serve` / `docgraph mcp` / `docgraph watch` is running → DB lock error.
 - Using `tree-sitter-language-pack 1.6+` thinking it's the old Goldziher API — it isn't, it's a Rust rewrite that needs network downloads.
@@ -277,5 +281,6 @@ pkill -f docgraph                              # *nix
 - No SCIP / LSP integration → `CALLS` is name-based and will mis-resolve TS / Java overloads. Roadmap.
 - LLM-generated docstrings (Greptile-style) require an opt-in API key path — not built yet.
 - Embedding model loads fresh per **process** (~1s cold). In-process duplication is solved (see `embed.py::_MODEL_CACHE`); pre-warming a daemon across CLI invocations would help further.
-- `IMPORTS_SYMBOL` and `OVERRIDES` edges declared in the schema but not extracted by any tags query yet.
+- `IMPORTS_SYMBOL` is now extracted from `@import.symbol` captures in Python (`from x import Y`), JS (`import {Y} from "x"`), TS, and the JS default-import shape. Java's qualified imports (`import a.b.C;`) terminate in the symbol name — the resolver matches the final dotted segment against Class / Function names; no separate tag query needed.
+- `OVERRIDES` is derived in `index.py` from `INHERITS` + same-name methods via the inheritance closure (so a grandchild override of a grandparent method is also recorded). Cheap O(classes × methods); runs once per index pass with no embeddings touched.
 - The watcher holds a writer lock for its lifetime — kill `serve` / `mcp` first.

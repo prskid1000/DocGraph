@@ -319,6 +319,106 @@ def docs_remove(
     console.print(f"[green]Removed[/green] {n} chunks for {url}")
 
 
+daemon_app = typer.Typer(help="Manage the optional embedding daemon (faster cold start across CLI invocations).")
+app.add_typer(daemon_app, name="daemon")
+
+
+@daemon_app.command("start")
+def daemon_start(
+    port: int = typer.Option(5577, "--port", help="Loopback TCP port the daemon binds to."),
+    model: str = typer.Option(
+        "BAAI/bge-small-en-v1.5", "--model",
+        help="Embedding model name (must match what your repos were indexed with).",
+    ),
+    gpu: bool = typer.Option(
+        False, "--gpu",
+        help="Load the embedding model on GPU via ONNX Runtime providers (CUDA / DirectML / CoreML). "
+             "Requires `onnxruntime-gpu` / `onnxruntime-directml` / `onnxruntime-silicon` installed.",
+    ),
+    detach: bool = typer.Option(
+        False, "--detach", "-d",
+        help="Spawn the daemon in a background process and return. Default is to run in the foreground.",
+    ),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Start the embedding daemon. Other docgraph processes on this host
+    will route their embed calls through it, sharing one warm ONNX session.
+
+    Foreground (default): blocks. Ctrl+C exits cleanly. Useful for tmux/screen.
+    `--detach`: spawns a background process (Windows: DETACHED_PROCESS;
+    POSIX: double-fork) and returns. Lock file at ~/.docgraph/daemon.lock.
+    """
+    _setup_logging(verbose)
+    from docgraph.daemon import is_running, run_daemon, LOCK_PATH
+
+    info = is_running()
+    if info:
+        console.print(f"[yellow]Daemon already running[/]: pid={info.get('pid')} port={info.get('port')}")
+        raise typer.Exit(0)
+
+    if detach:
+        # Re-launch *this* command with --detach removed so the child runs
+        # in the foreground; the parent returns immediately.
+        import subprocess
+        cmd = [sys.executable, "-m", "docgraph.cli", "daemon", "start",
+               "--port", str(port), "--model", model]
+        if gpu:
+            cmd.append("--gpu")
+        if sys.platform.startswith("win"):
+            DETACHED = 0x00000008
+            CREATE_NEW_GROUP = 0x00000200
+            subprocess.Popen(cmd, creationflags=DETACHED | CREATE_NEW_GROUP, close_fds=True)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, close_fds=True)
+        # Wait briefly for the lock file to appear so users see status
+        # without re-running.
+        import time
+        for _ in range(50):
+            if LOCK_PATH.exists():
+                break
+            time.sleep(0.1)
+        info2 = is_running()
+        if info2:
+            console.print(f"[green]Daemon started[/] (detached): pid={info2.get('pid')} port={info2.get('port')}")
+        else:
+            console.print("[yellow]Daemon launched but lock not visible yet — check `docgraph daemon status`[/]")
+        return
+
+    console.print(f"[cyan]Starting daemon[/] on 127.0.0.1:{port} (model={model}, gpu={gpu})")
+    rc = run_daemon(port=port, model_name=model, gpu=gpu)
+    raise typer.Exit(rc)
+
+
+@daemon_app.command("stop")
+def daemon_stop() -> None:
+    """Stop the running daemon."""
+    from docgraph.daemon import stop_daemon, is_running
+    if not is_running():
+        console.print("[dim]No daemon running.[/]")
+        raise typer.Exit(0)
+    ok = stop_daemon()
+    if ok:
+        console.print("[green]Daemon stopped.[/]")
+    else:
+        console.print("[yellow]Stop request sent; lock file cleared.[/]")
+
+
+@daemon_app.command("status")
+def daemon_status() -> None:
+    """Print whether the daemon is running and its config."""
+    from docgraph.daemon import is_running
+    info = is_running()
+    if not info:
+        console.print("[dim]Daemon: not running.[/]")
+        raise typer.Exit(1)
+    table = Table(show_header=False, box=None)
+    for k in ("pid", "host", "port", "model", "gpu", "started"):
+        if k in info:
+            table.add_row(k, str(info[k]))
+    console.print("[green]Daemon: running[/]")
+    console.print(table)
+
+
 @app.command(name="install-mcp")
 def install_mcp(
     path: Path = typer.Argument(Path.cwd()),
