@@ -72,12 +72,30 @@
     .icon-btn:hover { background: var(--panel-2); border-color: var(--border); color: var(--fg); }
 
     /* ---------- Body ---------- */
-    .body { display: grid; grid-template-columns: auto 1fr 380px; min-height: 0; }
+    .body { display: grid; grid-template-columns: auto 1fr auto; min-height: 0; }
     .left {
       width: 320px; background: var(--panel); border-right: 1px solid var(--border);
       display: flex; flex-direction: column; min-height: 0; transition: width .15s;
+      position: relative;
     }
+    .right { width: 380px; position: relative; }
     .left.collapsed { width: 44px; }
+
+    /* Drag handle for resizable panels. 4px wide thumb that highlights on
+       hover; mouse events captured on mousedown to track drag. The transition
+       is intentionally absent during drag (set inline) so the panel follows
+       the cursor 1:1 instead of lagging behind. */
+    .resize-handle {
+      position: absolute; top: 0; bottom: 0; width: 6px; z-index: 6;
+      cursor: ew-resize; background: transparent; transition: background .12s;
+    }
+    .resize-handle:hover, .resize-handle.dragging {
+      background: rgba(192,132,252,0.4);
+    }
+    .resize-handle.right { right: -3px; }
+    .resize-handle.left  { left:  -3px; }
+    body.resizing { cursor: ew-resize !important; user-select: none !important; }
+    body.resizing * { cursor: ew-resize !important; user-select: none !important; }
     .left.collapsed .tab-content, .left.collapsed .tabs > .tab > span:not(.tab-icon) { display: none; }
     .left.collapsed .tabs { flex-direction: column; }
     .left.collapsed .tabs .tab { padding: 10px 0; justify-content: center; }
@@ -401,7 +419,7 @@
     <!-- ===== Body ===== -->
     <div class="body">
       <!-- LEFT pane: tabs -->
-      <aside class="left" id="left-pane">
+      <aside class="left" id="left-pane"><div class="resize-handle right" id="resize-left" title="Drag to resize"></div>
         <div class="tabs">
           <div class="tab active" data-tab="explorer">
             <span class="tab-icon">
@@ -537,7 +555,7 @@
         </div>
 
         <!-- Code Inspector (slide-in) -->
-        <aside class="inspector" id="inspector">
+        <aside class="inspector" id="inspector"><div class="resize-handle right" id="resize-inspector" title="Drag to resize"></div>
           <div class="inspector-head">
             <span class="title">
               <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m8 9-4 4 4 4M16 9l4 4-4 4"/></svg>
@@ -586,7 +604,7 @@
       </main>
 
       <!-- RIGHT: detail -->
-      <aside class="right">
+      <aside class="right" id="right-pane"><div class="resize-handle left" id="resize-right" title="Drag to resize"></div>
         <div class="detail-head">
           <h2>Detail</h2>
           <span class="stat" id="detail-source"></span>
@@ -1899,6 +1917,71 @@ function runCommunities(iters){
       };
     }
 
+    // ---------- Resizable panels ----------
+    // Three drag handles: left sidebar (right edge), code inspector (right
+    // edge), right detail panel (left edge). Persists to localStorage so
+    // layouts survive reloads. Min/max clamps prevent panes from collapsing
+    // smaller than their content needs or eating the whole canvas.
+    function setupResizers() {
+      const SAVE_KEY = "docgraph.layout.v1";
+      const saved = (() => {
+        try { return JSON.parse(localStorage.getItem(SAVE_KEY) || "{}"); }
+        catch { return {}; }
+      })();
+      const apply = (id, w, css) => {
+        const el = $(id); if (!el) return;
+        el.style[css] = `${w}px`;
+      };
+      if (saved.left)      apply("#left-pane",  saved.left,      "width");
+      if (saved.right)     apply("#right-pane", saved.right,     "width");
+      if (saved.inspector) apply("#inspector",  saved.inspector, "width");
+
+      const drag = (handle, target, side, key, min, max) => {
+        const tgt = $(target);
+        if (!handle || !tgt) return;
+        // Disable transitions during drag so the panel follows the cursor 1:1.
+        const origTrans = tgt.style.transition;
+        handle.addEventListener("mousedown", (e) => {
+          e.preventDefault();
+          handle.classList.add("dragging");
+          document.body.classList.add("resizing");
+          tgt.style.transition = "none";
+          const startX = e.clientX;
+          const startW = tgt.getBoundingClientRect().width;
+          const onMove = (ev) => {
+            const dx = ev.clientX - startX;
+            // 'right' side handle grows when dragged right; 'left' side
+            // handle (right panel) grows when dragged left.
+            const w = side === "right" ? startW + dx : startW - dx;
+            const clamped = Math.max(min, Math.min(max, w));
+            tgt.style.width = `${clamped}px`;
+            // Force a render — the canvas resizes when the layout grid
+            // reflows, so the graph view stays correct.
+            needsRender = true;
+          };
+          const onUp = () => {
+            window.removeEventListener("mousemove", onMove);
+            window.removeEventListener("mouseup", onUp);
+            handle.classList.remove("dragging");
+            document.body.classList.remove("resizing");
+            tgt.style.transition = origTrans;
+            // Persist final width
+            const w = tgt.getBoundingClientRect().width;
+            saved[key] = Math.round(w);
+            localStorage.setItem(SAVE_KEY, JSON.stringify(saved));
+            // Canvas size depends on parent; trigger a resize event so the
+            // setupCanvas() resize listener re-fits the canvas DPR scaling.
+            window.dispatchEvent(new Event("resize"));
+          };
+          window.addEventListener("mousemove", onMove);
+          window.addEventListener("mouseup", onUp);
+        });
+      };
+      drag($("#resize-left"),      "#left-pane",  "right", "left",      200, 600);
+      drag($("#resize-right"),     "#right-pane", "left",  "right",     250, 700);
+      drag($("#resize-inspector"), "#inspector",  "right", "inspector", 280, 900);
+    }
+
     function setupMisc() {
       $("#btn-reload").onclick = () => loadGraph();
       $("#sel-clear").onclick = clearSelection;
@@ -2043,6 +2126,7 @@ function runCommunities(iters){
     setupSearchInputs();
     setupZoom();
     setupMisc();
+    setupResizers();
     setupLiveUpdates();
     loadStats();
     loadGraph().then(() => tick());
