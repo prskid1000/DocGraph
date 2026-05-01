@@ -330,6 +330,27 @@
     .badge { display: inline-block; background: var(--bg); border: 1px solid var(--border);
       border-radius: 3px; padding: 1px 6px; font-size: 10px; color: var(--fg-dim); margin-right: 4px; }
 
+    /* Per-section skeleton with a tiny inline spinner. Used in the detail
+       panel so each section shows its own progress instead of a single
+       global "Loading…" that blocks on the slowest call. */
+    .skel-row { display: flex; align-items: center; gap: 8px; color: var(--fg-dim);
+      font-size: 11px; padding: 6px 8px; }
+    .skel-spin { width: 10px; height: 10px; border-radius: 50%;
+      border: 2px solid var(--border); border-top-color: var(--accent-2);
+      animation: lspin 0.8s linear infinite; flex-shrink: 0; }
+    .skel-fail { color: var(--bad); font-size: 11px; padding: 6px 8px; }
+
+    /* In-input search button — replaces the auto-search debounce. */
+    .search-bar .go-btn, .search-row .go-btn {
+      position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+      background: var(--accent-2); color: #0b0e14; border: 0; border-radius: 6px;
+      padding: 4px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
+      transition: filter .12s;
+    }
+    .search-bar .go-btn:hover, .search-row .go-btn:hover { filter: brightness(1.15); }
+    .search-row { position: relative; }
+    .search-row input { padding-right: 56px; }
+
     /* Custom scrollbars */
     ::-webkit-scrollbar { width: 10px; height: 10px; }
     ::-webkit-scrollbar-track { background: transparent; }
@@ -351,8 +372,8 @@
         <span class="icon">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg>
         </span>
-        <input id="q-top" placeholder="Search nodes, files, symbols…" autocomplete="off" />
-        <kbd>/</kbd>
+        <input id="q-top" placeholder="Search nodes, files, symbols… (Enter)" autocomplete="off" />
+        <button class="go-btn" id="q-top-go" title="Search">Go</button>
       </div>
       <div class="grow"></div>
       <div class="stats">
@@ -405,7 +426,8 @@
         <!-- Explorer tab -->
         <div class="tab-content explorer-pane" data-pane="explorer">
           <div class="search-row">
-            <input id="q" placeholder="Search code (semantic)…" autocomplete="off" />
+            <input id="q" placeholder="Search code (semantic)… press Enter" autocomplete="off" />
+            <button class="go-btn" id="q-go" title="Search">Go</button>
             <div class="kind-chips">
               <span class="kind-chip active" data-kind="">All</span>
               <span class="kind-chip" data-kind="function">Functions</span>
@@ -1450,7 +1472,10 @@ function runCommunities(iters){
 
       // Render each section as its own API call resolves so the panel doesn't
       // block on the slowest. We use a token to abort stale renders if the
-      // user clicks another node mid-flight.
+      // user clicks another node mid-flight. Each section starts with its own
+      // visible spinner so the user can see which sections are still loading
+      // — instead of a single shared "Loading…" that silently waits on the
+      // slowest of three calls.
       const token = ++_selectToken;
       detail.innerHTML = "";
       const head = el("div");
@@ -1464,6 +1489,18 @@ function runCommunities(iters){
 
       head.appendChild(el("h2", {}, sym));
       head.appendChild(el("div", { className: "meta" }, "Loading…"));
+      defSec.appendChild(section("Definition",
+        el("div", { className: "skel-row" },
+          el("span", { className: "skel-spin" }),
+          el("span", {}, "Fetching definition…"))));
+      refSec.appendChild(section("References",
+        el("div", { className: "skel-row" },
+          el("span", { className: "skel-spin" }),
+          el("span", {}, "Fetching references…"))));
+      neighSec.appendChild(section("Related",
+        el("div", { className: "skel-row" },
+          el("span", { className: "skel-spin" }),
+          el("span", {}, "Fetching neighborhood…"))));
 
       api(`/api/definition?name=${encodeURIComponent(sym)}`).then(defn => {
         if (token !== _selectToken) return;
@@ -1484,15 +1521,29 @@ function runCommunities(iters){
         } else if (n && n.kind === "File") {
           head.appendChild(el("h2", {}, n.name));
           head.appendChild(el("div", { className: "meta" }, "File"));
+          defSec.innerHTML = "";
           openInspector(n.name, null, null);
         } else {
           head.appendChild(el("h2", {}, sym));
+          defSec.innerHTML = "";
+          defSec.appendChild(section("Definition",
+            el("div", { className: "empty" }, "No definition found.")));
         }
-      }).catch(() => {});
+      }).catch((err) => {
+        if (token !== _selectToken) return;
+        defSec.innerHTML = "";
+        defSec.appendChild(section("Definition",
+          el("div", { className: "skel-fail" }, `Failed: ${err}`)));
+      });
 
       api(`/api/references?name=${encodeURIComponent(sym)}`).then(refs => {
         if (token !== _selectToken) return;
-        if (!refs || !refs.length) return;
+        refSec.innerHTML = "";
+        if (!refs || !refs.length) {
+          refSec.appendChild(section("References",
+            el("div", { className: "empty" }, "No references found.")));
+          return;
+        }
         const list = el("div");
         for (const r of refs.slice(0, 40)) {
           const li = el("div", { className: "link" },
@@ -1502,13 +1553,22 @@ function runCommunities(iters){
           li.onclick = () => searchByName(r.caller);
           list.appendChild(li);
         }
-        refSec.innerHTML = "";
         refSec.appendChild(section("References", list, refs.length));
-      }).catch(() => {});
+      }).catch((err) => {
+        if (token !== _selectToken) return;
+        refSec.innerHTML = "";
+        refSec.appendChild(section("References",
+          el("div", { className: "skel-fail" }, `Failed: ${err}`)));
+      });
 
       api(`/api/neighborhood?name=${encodeURIComponent(sym)}&limit=20`).then(neigh => {
         if (token !== _selectToken) return;
-        if (!neigh || !neigh.length) return;
+        neighSec.innerHTML = "";
+        if (!neigh || !neigh.length) {
+          neighSec.appendChild(section("Related",
+            el("div", { className: "empty" }, "No related entities.")));
+          return;
+        }
         const list = el("div");
         for (const r of neigh) {
           const li = el("div", { className: "link" },
@@ -1518,9 +1578,13 @@ function runCommunities(iters){
           li.onclick = () => select(null, r.name);
           list.appendChild(li);
         }
-        neighSec.innerHTML = "";
         neighSec.appendChild(section("Related", list, neigh.length));
-      }).catch(() => {});
+      }).catch((err) => {
+        if (token !== _selectToken) return;
+        neighSec.innerHTML = "";
+        neighSec.appendChild(section("Related",
+          el("div", { className: "skel-fail" }, `Failed: ${err}`)));
+      });
     }
     let _selectToken = 0;
 
@@ -1742,15 +1806,26 @@ function runCommunities(iters){
 
     function setupSearchInputs() {
       const q = $("#q"), qTop = $("#q-top");
-      let timer;
-      const run = () => {
-        const v = q.value.trim();
-        clearTimeout(timer);
-        timer = setTimeout(() => doSearch(v, currentKind), 200);
+      // No more auto-search-on-type — that fired on every keystroke (debounced
+      // 200ms). Now searches trigger only on Enter or the "Go" button. The
+      // top search stays in sync with the explorer-pane search so either
+      // input works.
+      const run = (val) => {
+        const v = (val ?? q.value).trim();
+        if (!v) { $("#results").innerHTML = "<div class='empty'>Type a query and press Enter.</div>"; return; }
+        q.value = v;
+        qTop.value = v;
+        activateTab("explorer");
+        doSearch(v, currentKind);
       };
-      q.addEventListener("input", run);
-      qTop.addEventListener("input", () => { q.value = qTop.value; activateTab("explorer"); run(); });
-      // "/" focuses the top search
+      const onEnter = (input) => (e) => {
+        if (e.key === "Enter") { e.preventDefault(); run(input.value); }
+      };
+      q.addEventListener("keydown", onEnter(q));
+      qTop.addEventListener("keydown", onEnter(qTop));
+      $("#q-go").onclick = () => run(q.value);
+      $("#q-top-go").onclick = () => run(qTop.value);
+      // "/" focuses the top search; Esc clears
       window.addEventListener("keydown", (e) => {
         if (e.key === "/" && !["INPUT","TEXTAREA"].includes(e.target.tagName)) {
           e.preventDefault(); qTop.focus();
@@ -1767,6 +1842,9 @@ function runCommunities(iters){
           $$(".kind-chip").forEach(x => x.classList.remove("active"));
           c.classList.add("active");
           currentKind = c.dataset.kind;
+          // Re-run the previous search with the new kind filter (only if
+          // the user has actually run a search — kind chips are inert
+          // until then).
           if (q.value.trim()) doSearch(q.value.trim(), currentKind);
         };
       });
