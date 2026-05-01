@@ -38,6 +38,12 @@ EXT_TO_LANG: dict[str, str] = {
     ".cxx": "cpp",
     ".hpp": "cpp",
     ".cs": "c_sharp",
+    ".kt": "kotlin",
+    ".kts": "kotlin",
+    ".scala": "scala",
+    ".sc": "scala",
+    ".ex": "elixir",
+    ".exs": "elixir",
     ".rb": "ruby",
     ".php": "php",
     ".sh": "bash",
@@ -66,6 +72,9 @@ LANGUAGES: dict[str, tuple[str, str]] = {
     "c": ("tree_sitter_c", "language"),
     "cpp": ("tree_sitter_cpp", "language"),
     "c_sharp": ("tree_sitter_c_sharp", "language"),
+    "kotlin": ("tree_sitter_kotlin", "language"),
+    "scala": ("tree_sitter_scala", "language"),
+    "elixir": ("tree_sitter_elixir", "language"),
     "ruby": ("tree_sitter_ruby", "language"),
     "php": ("tree_sitter_php", "language_php"),
     "bash": ("tree_sitter_bash", "language"),
@@ -170,12 +179,20 @@ TAGS_QUERIES: dict[str, str] = {
     "c": """
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
 (call_expression function: (identifier) @ref.call)
+(translation_unit
+  (declaration
+    declarator: (init_declarator declarator: (identifier) @name) @definition.variable))
 """,
     "cpp": """
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
 (class_specifier name: (type_identifier) @name) @definition.class
 (struct_specifier name: (type_identifier) @name) @definition.class
 (call_expression function: (identifier) @ref.call)
+(translation_unit
+  (declaration
+    declarator: (init_declarator declarator: (identifier) @name) @definition.variable))
+(field_declaration
+  declarator: (field_identifier) @name) @definition.variable
 """,
     "c_sharp": """
 (method_declaration name: (identifier) @name) @definition.method
@@ -190,17 +207,55 @@ TAGS_QUERIES: dict[str, str] = {
     (variable_declarator name: (identifier) @name) @definition.variable))
 (property_declaration name: (identifier) @name) @definition.variable
 """,
+    "kotlin": """
+(function_declaration (identifier) @name) @definition.function
+(class_declaration (identifier) @name) @definition.class
+(object_declaration (identifier) @name) @definition.class
+(property_declaration (variable_declaration (identifier) @name)) @definition.variable
+(call_expression (identifier) @ref.call)
+(import (qualified_identifier) @import.module)
+""",
+    "scala": """
+(function_definition (identifier) @name) @definition.function
+(class_definition (identifier) @name) @definition.class
+(object_definition (identifier) @name) @definition.class
+(trait_definition (identifier) @name) @definition.interface
+(val_definition (identifier) @name) @definition.variable
+(var_definition (identifier) @name) @definition.variable
+(call_expression (identifier) @ref.call)
+(import_declaration (identifier) @import.module)
+""",
+    "elixir": """
+((call
+  target: (identifier) @_kw
+  (arguments (alias) @name)) @definition.class
+ (#any-of? @_kw "defmodule" "defprotocol" "defimpl"))
+((call
+  target: (identifier) @_kw
+  (arguments (call target: (identifier) @name))) @definition.function
+ (#any-of? @_kw "def" "defp" "defmacro" "defmacrop"))
+((call
+  target: (identifier) @_kw
+  (arguments (identifier) @name)) @definition.function
+ (#any-of? @_kw "def" "defp" "defmacro" "defmacrop"))
+""",
     "ruby": """
 (method name: (identifier) @name) @definition.method
 (class name: (constant) @name) @definition.class
 (module name: (constant) @name) @definition.class
 (call method: (identifier) @ref.call)
+(program (assignment left: (constant) @name) @definition.variable)
+(program (assignment left: (global_variable) @name) @definition.variable)
 """,
     "php": """
 (function_definition name: (name) @name) @definition.function
 (method_declaration name: (name) @name) @definition.method
 (class_declaration name: (name) @name) @definition.class
 (function_call_expression function: (name) @ref.call)
+(property_declaration
+  (property_element (variable_name (name) @name)) @definition.variable)
+(const_declaration
+  (const_element (name) @name) @definition.variable)
 """,
     "bash": """
 (function_definition name: (word) @name) @definition.function
@@ -211,6 +266,8 @@ TAGS_QUERIES: dict[str, str] = {
 """,
     "css": """
 (rule_set (selectors (class_selector (class_name) @name))) @definition.class
+((declaration (property_name) @name) @definition.variable
+ (#match? @name "^--"))
 """,
     "json": "",
     "yaml": "",
