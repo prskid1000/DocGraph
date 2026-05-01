@@ -88,6 +88,9 @@ TAGS_QUERIES: dict[str, str] = {
 (call function: (attribute attribute: (identifier) @ref.call))
 (import_statement name: (dotted_name) @import.module)
 (import_from_statement module_name: (dotted_name) @import.module)
+(module
+  (expression_statement
+    (assignment left: (identifier) @name)) @definition.variable)
 """,
     "javascript": """
 (function_declaration name: (identifier) @name) @definition.function
@@ -101,6 +104,12 @@ TAGS_QUERIES: dict[str, str] = {
 (call_expression function: (member_expression property: (property_identifier) @ref.call))
 (new_expression constructor: (identifier) @ref.new)
 (import_statement source: (string) @import.module)
+(program
+  (lexical_declaration
+    (variable_declarator name: (identifier) @name) @definition.variable))
+(program
+  (variable_declaration
+    (variable_declarator name: (identifier) @name) @definition.variable))
 """,
     "typescript": """
 (function_declaration name: (identifier) @name) @definition.function
@@ -115,6 +124,13 @@ TAGS_QUERIES: dict[str, str] = {
 (call_expression function: (member_expression property: (property_identifier) @ref.call))
 (new_expression constructor: (identifier) @ref.new)
 (import_statement source: (string) @import.module)
+(program
+  (lexical_declaration
+    (variable_declarator name: (identifier) @name) @definition.variable))
+(program
+  (variable_declaration
+    (variable_declarator name: (identifier) @name) @definition.variable))
+(public_field_definition name: (property_identifier) @name) @definition.variable
 """,
     "java": """
 (method_declaration name: (identifier) @name) @definition.method
@@ -124,6 +140,8 @@ TAGS_QUERIES: dict[str, str] = {
 (method_invocation name: (identifier) @ref.call)
 (object_creation_expression type: (type_identifier) @ref.new)
 (import_declaration (scoped_identifier) @import.module)
+(field_declaration
+  declarator: (variable_declarator name: (identifier) @name) @definition.variable)
 """,
     "go": """
 (function_declaration name: (identifier) @name) @definition.function
@@ -132,6 +150,12 @@ TAGS_QUERIES: dict[str, str] = {
 (call_expression function: (identifier) @ref.call)
 (call_expression function: (selector_expression field: (field_identifier) @ref.call))
 (import_spec path: (interpreted_string_literal) @import.module)
+(source_file
+  (var_declaration
+    (var_spec name: (identifier) @name) @definition.variable))
+(source_file
+  (const_declaration
+    (const_spec name: (identifier) @name) @definition.variable))
 """,
     "rust": """
 (function_item name: (identifier) @name) @definition.function
@@ -140,6 +164,8 @@ TAGS_QUERIES: dict[str, str] = {
 (trait_item name: (type_identifier) @name) @definition.interface
 (call_expression function: (identifier) @ref.call)
 (call_expression function: (field_expression field: (field_identifier) @ref.call))
+(source_file (const_item name: (identifier) @name) @definition.variable)
+(source_file (static_item name: (identifier) @name) @definition.variable)
 """,
     "c": """
 (function_definition declarator: (function_declarator declarator: (identifier) @name)) @definition.function
@@ -159,6 +185,10 @@ TAGS_QUERIES: dict[str, str] = {
 (invocation_expression function: (member_access_expression name: (identifier) @ref.call))
 (object_creation_expression type: (identifier) @ref.new)
 (using_directive (qualified_name) @import.module)
+(field_declaration
+  (variable_declaration
+    (variable_declarator name: (identifier) @name) @definition.variable))
+(property_declaration name: (identifier) @name) @definition.variable
 """,
     "ruby": """
 (method name: (identifier) @name) @definition.method
@@ -279,10 +309,23 @@ def _enclosing(node: ts.Node, defs: list[tuple[ts.Node, str, str]]) -> tuple[str
 
 
 DEF_KIND_MAP = {
+    # Order matters for the dedup pass below: kinds listed earlier win when
+    # the same span gets matched by multiple captures (e.g. JS/TS
+    # `const foo = () => ...` matches both definition.function and
+    # definition.variable). We prefer the richer kind.
     "definition.function": "function",
     "definition.method": "method",
     "definition.class": "class",
     "definition.interface": "interface",
+    "definition.variable": "variable",
+}
+
+_KIND_PRIORITY = {
+    "class": 0,
+    "interface": 0,
+    "method": 1,
+    "function": 1,
+    "variable": 2,
 }
 
 
@@ -340,6 +383,31 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
                 body=source[d_node.start_byte:d_node.end_byte][:8000].decode("utf-8", errors="replace"),
             ))
             defs.append((d_node, qname, kind))
+
+    # Dedup by (name, line_start, line_end). Some node ranges are matched by
+    # multiple capture patterns — e.g. JS/TS `const foo = () => ...` matches
+    # both `definition.function` and `definition.variable`. Keep the higher-
+    # priority kind and drop the rest. Without this, the same identifier
+    # would land in the graph twice with the same qname.
+    if entities:
+        keepers: dict[tuple[str, int, int], int] = {}
+        for i, e in enumerate(entities):
+            key = (e.name, e.line_start, e.line_end)
+            cur = keepers.get(key)
+            if cur is None:
+                keepers[key] = i
+            else:
+                if _KIND_PRIORITY.get(e.kind, 99) < _KIND_PRIORITY.get(entities[cur].kind, 99):
+                    keepers[key] = i
+        kept_idxs = set(keepers.values())
+        if len(kept_idxs) != len(entities):
+            entities = [entities[i] for i in sorted(kept_idxs)]
+            # Rebuild defs in lockstep so downstream resolution stays aligned.
+            keep_qnames = {(e.qname, e.line_start) for e in entities}
+            defs = [
+                (n, q, k) for (n, q, k) in defs
+                if (q, n.start_point.row + 1) in keep_qnames
+            ]
 
     # Re-scope methods inside classes
     qname_remap: dict[str, str] = {}
