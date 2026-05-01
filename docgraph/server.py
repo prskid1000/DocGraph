@@ -128,6 +128,30 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
     async def api_test_impact(target: str, limit: int = 25):
         return _r().test_impact(target, limit=limit)
 
+    @app.get("/api/processes")
+    async def api_processes(limit: int = 25, max_chain_len: int = 8):
+        return _r().processes(limit=limit, max_chain_len=max_chain_len)
+
+    @app.get("/api/wiki/list")
+    async def api_wiki_list():
+        from docgraph.wiki import list_wiki
+        return list_wiki(cfg)
+
+    @app.get("/api/wiki/page")
+    async def api_wiki_page(slug: str):
+        from docgraph.wiki import get_wiki_page
+        page = get_wiki_page(cfg, slug)
+        if not page:
+            raise HTTPException(404, "wiki page not found")
+        return page
+
+    @app.post("/api/wiki/build")
+    async def api_wiki_build(payload: dict | None = None):
+        from docgraph.wiki import build_wiki
+        only = (payload or {}).get("module") if isinstance(payload, dict) else None
+        pages = await asyncio.to_thread(build_wiki, cfg, _db(), None, only)
+        return {"built": len(pages), "modules": [p.module for p in pages]}
+
     @app.post("/api/cypher")
     async def api_cypher(payload: dict):
         return _r().cypher(payload.get("query", ""), limit=int(payload.get("limit", 100)))
@@ -153,7 +177,7 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
         return _r().search_docs(q, limit=limit)
 
     @app.get("/api/graph")
-    async def api_graph(limit_nodes: int = 2000):
+    async def api_graph(limit_nodes: int = 10000):
         return _r().graph_dump(limit_nodes=limit_nodes)
 
     @app.get("/api/stats")

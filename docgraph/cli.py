@@ -249,6 +249,68 @@ def stats(
 
 
 @app.command()
+def wiki(
+    path: Path = typer.Argument(Path.cwd()),
+    module: str | None = typer.Option(None, "--module", "-m", help="Build only this module."),
+    llm_host: str = typer.Option(
+        "localhost", "--llm-host", help="Host running the local LLM server (default: localhost). Same flag as `index`."
+    ),
+    llm_port: int = typer.Option(
+        1235, "--llm-port", help="Local LLM server port (default: 1235). Same flag as `index`."
+    ),
+    llm_model: str = typer.Option(
+        "local-model", "--llm-model",
+        help="Model name to send to the LLM server (e.g. 'qwen3.6-35b', 'local-model'). Same flag as `index`.",
+    ),
+    llm_format: str = typer.Option(
+        "openai", "--llm-format",
+        help="API format: 'openai' or 'anthropic'. Same flag as `index`.",
+    ),
+    llm_max_tokens: int = typer.Option(
+        600, "--llm-max-tokens",
+        help="Max tokens per LLM call. Defaults higher than `index` (600 vs 150) "
+             "because wiki pages are 200-300 words.",
+    ),
+) -> None:
+    """Generate (or rebuild) the LLM-grounded wiki for the indexed repo.
+
+    Pulls a fact sheet for each top-level module from Kuzu and asks a local
+    LLM to write a 200-word page. Falls back to a plain rendering of the
+    facts when no LLM is reachable, so the wiki is never blank.
+
+    Uses the same LLM config as `docgraph index --llm-model`. All
+    `DOCGRAPH_LLM_*` env vars work too (host / port / model / format / api key).
+    """
+    from docgraph.wiki import build_wiki
+    from docgraph.llm import LLMClient, LLMConfig, llm_config_from_env
+
+    cfg = load_config(path)
+    if not cfg.db_path.exists():
+        console.print("[yellow]No index yet — run `docgraph index` first.[/yellow]")
+        raise typer.Exit(1)
+    db = GraphDB(cfg.db_path, read_only=True)
+    # Layer CLI flags on top of env defaults so a user with DOCGRAPH_LLM_API_KEY
+    # set doesn't have to re-type it every command.
+    base = llm_config_from_env()
+    base.host = llm_host
+    base.port = llm_port
+    base.model = llm_model
+    base.format = llm_format
+    base.max_tokens = llm_max_tokens
+    llm = LLMClient(base)
+    console.print(f"[cyan]Building wiki for {cfg.repo_root}…[/cyan]")
+    console.print(f"  LLM: {base.format} @ {base.host}:{base.port} (model={base.model})")
+    pages: list = []
+
+    def _progress(i: int, total: int, mod: str) -> None:
+        console.print(f"  [{i+1}/{total}] {mod}")
+
+    pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress)
+    console.print(f"[green]Built {len(pages)} wiki page(s).[/green]")
+    console.print(f"  Files at: {cfg.data_dir / 'wiki'}")
+
+
+@app.command()
 def clear(
     path: Path = typer.Argument(Path.cwd()),
     yes: bool = typer.Option(False, "--yes", "-y"),

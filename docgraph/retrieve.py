@@ -475,6 +475,58 @@ class Retriever:
                 ))
         return out
 
+    def processes(self, limit: int = 25, max_chain_len: int = 8) -> list[dict]:
+        """Detect 'processes' = top-level execution flows. An entry point is a
+        Function with no incoming CALLS edges (nothing else calls it) and high
+        PageRank (the structurally important ones). For each, walk forward
+        through CALLS up to `max_chain_len` hops and return the chain.
+
+        This mirrors GitNexus's 'process detection' panel: gives the user a
+        ranked list of 'main' workflows in the codebase without them having
+        to guess which entry to start from.
+        """
+        max_chain_len = max(2, min(int(max_chain_len), 12))
+        # Entry points: Functions with no incoming CALLS edges, ranked by PageRank.
+        # We exclude Functions named like helpers/getters/setters via a heuristic
+        # (single-letter or all-lowercase short names rank lower naturally via PR).
+        entries = self.db.fetch_all(
+            "MATCH (f:Function) WHERE NOT EXISTS { MATCH ()-[:CALLS]->(f) } "
+            "AND coalesce(f.pagerank, 0.0) > 0.0 "
+            "RETURN f.qname AS qname, f.name AS name, f.file AS file, "
+            "f.line_start AS line, coalesce(f.pagerank, 0.0) AS pagerank "
+            "ORDER BY pagerank DESC LIMIT $lim",
+            {"lim": int(limit) * 3},
+        )
+        out: list[dict] = []
+        for e in entries:
+            # Walk forward via CALLS; return distinct nodes in BFS order.
+            try:
+                chain = self.db.fetch_all(
+                    f"MATCH path = (start:Function)-[:CALLS*1..{max_chain_len}]->(callee) "
+                    f"WHERE start.qname = $q "
+                    f"WITH callee, length(path) AS depth "
+                    f"RETURN DISTINCT callee.qname AS qname, callee.name AS name, "
+                    f"callee.file AS file, callee.line_start AS line, "
+                    f"min(depth) AS depth "
+                    f"ORDER BY depth, qname LIMIT 50",
+                    {"q": e["qname"]},
+                )
+            except Exception:
+                chain = []
+            if not chain:
+                continue
+            out.append({
+                "entry": {
+                    "qname": e["qname"], "name": e["name"], "file": e["file"],
+                    "line": e["line"], "pagerank": e["pagerank"],
+                },
+                "chain": chain,
+                "fanout": len(chain),
+            })
+            if len(out) >= limit:
+                break
+        return out
+
     def test_impact(self, target: str, limit: int = 25) -> list[dict]:
         """Tests that exercise `target` (file or symbol). Differentiator:
         we already have TESTS edges + reverse CALLS, no competitor exposes

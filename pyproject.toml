@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "docgraph"
-version = "2.0.0"
-description = "Local code knowledge graph for LLMs — single-file embedded DB, parallel indexing, live graph UI, MCP server"
+version = "2.1.0"
+description = "Local code knowledge graph for LLMs — single-file embedded DB, parallel indexing, live graph UI, MCP server, LLM-grounded wiki, process detection"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }

@@ -38,7 +38,11 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 ### Watcher + UI
 
-- **Live graph UI** — single HTML file, force-directed canvas, no npm build. Sigma.js WebGL engine auto-engages above 2 k nodes.
+- **Live graph UI** — single HTML file, no build step. Force-directed layout (ForceAtlas2-lite + label-propagation community detection) runs in a **Web Worker** so the main thread stays at 60fps. Render is Canvas 2D, batched by color and viewport-culled — comfortable up to ~10k nodes.
+- **Detail Level / progressive reveal** — start with all `File` nodes (level 0); click any node to reveal its 1-hop neighbors. Lets you skim a 10k-node graph as a hub-and-spoke first, drill in only where you care.
+- **Color modes** — color nodes by **kind** (Function / Class / File / …) or by **community** (auto-clustered via label propagation, no LLM).
+- **Process detection** — entry-point → leaf call chains, surfaced in a dedicated **Processes** tab. An entry point = a function with no incoming `CALLS` edge; the panel shows ranked entries plus their forward call chain.
+- **LLM-grounded wiki** — the **Wiki** tab generates one Markdown page per top-level module from a Kuzu fact sheet (top classes / functions by PageRank, importers, tests). CLI: `docgraph wiki`. Falls back to a plain rendering when the LLM is unreachable.
 - **Watcher** — `docgraph watch` auto-reindexes on file changes (Rust `notify` under the hood, debounced).
 - **Live UI auto-redraw** — `docgraph watch --serve` runs the watcher and the web server in **one process** so they share the Kuzu file lock. After every reindex the browser refreshes itself via Server-Sent Events at `/api/events` — no F5, no polling.
 - **ML-training-style progress bars** — every index phase (parse, embed entities, embed chunks, write nodes, build symbol table, resolve edges, `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, PageRank, persist) reports `% | M/N | elapsed | ETA`. Same bars in `docgraph docs add`.
@@ -54,6 +58,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 - **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent (re-ingesting a URL replaces prior chunks).
 - **Optional LLM-augmented docstrings** — opt-in via `--llm-model <name>`; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash so incrementals stay fast.
+- **LLM-grounded wiki (opt-in)** — `docgraph wiki` walks every top-level module, builds a fact sheet from Kuzu (top classes / functions / importers / tests), and asks the same local LLM to write a 200-300 word Markdown page per module. Saved to `.docgraph/wiki/<slug>.md` and shown in the Web UI's Wiki tab. Same `--llm-*` flags and `DOCGRAPH_LLM_*` env vars as `docgraph index`.
 
 ## Performance
 
@@ -142,6 +147,29 @@ Run the Model Context Protocol server.
 
 Print entity + edge counts. No flags.
 
+### `docgraph wiki [path]`
+
+Generate (or rebuild) an LLM-grounded wiki for the indexed repo. For every top-level module DocGraph pulls a fact sheet from Kuzu (top classes / functions by PageRank, importers, tests) and asks a local LLM to write a 200-300 word page. Pages land in `.docgraph/wiki/<slug>.md` and are surfaced in the Web UI's **Wiki** tab. If no LLM is reachable, the page falls back to a plain rendering of the facts so the wiki is never blank.
+
+Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_*` env vars are honored too.
+
+| Flag | Default | Description |
+|---|---|---|
+| `--module STR`, `-m STR` | unset (all) | Build only the named top-level module. |
+| `--llm-host STR` | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Host running the local LLM server. |
+| `--llm-port INT` | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. |
+| `--llm-model STR` | `local-model` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects (e.g. `qwen3.6-35b`). |
+| `--llm-format STR` | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
+| `--llm-max-tokens INT` | `600` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Higher than `index`'s 150 because wiki pages are longer. |
+
+API equivalents (used by the Web UI's "Build wiki" button):
+
+```
+GET  /api/wiki/list                  # list of pages [{slug, title, module, summary}]
+GET  /api/wiki/page?slug=<slug>      # full Markdown body + facts JSON
+POST /api/wiki/build  {"module": "X"?}  # rebuild all (or one module). Same LLM config as the CLI; uses DOCGRAPH_LLM_* env vars.
+```
+
 ### `docgraph clear [path]`
 
 Delete `.docgraph/` for the repo (DB + cache + repos list).
@@ -213,14 +241,14 @@ Print version. No flags.
 | `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
 | `DOCGRAPH_GPU` | `index`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. |
 | `~/.docgraph/daemon.lock` | (lock file, not env var) | Auto-managed by `docgraph daemon start` / `stop`. Contains `host`, `port`, `pid`, `model`, `gpu`, `started`. Other docgraph processes consult this to discover the running daemon. Stale locks are cleaned automatically. |
-| `DOCGRAPH_LLM_MODEL` | `index` | unset (off). **Activator** — setting this enables LLM-augmented docstrings (same as `--llm-model`). |
+| `DOCGRAPH_LLM_MODEL` | `index`, `wiki` | unset for `index` (off — setting this enables LLM-augmented docstrings); `local-model` for `wiki`. |
 | `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset. Set to `1`/`true` to enable explicitly (rarely needed; setting `DOCGRAPH_LLM_MODEL` is enough). |
-| `DOCGRAPH_LLM_HOST` | `index` | `localhost` |
-| `DOCGRAPH_LLM_PORT` | `index` | `1235` |
-| `DOCGRAPH_LLM_FORMAT` | `index` | `openai` |
-| `DOCGRAPH_LLM_API_KEY` | `index` | unset. If set, sent as `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic). |
-| `DOCGRAPH_LLM_MAX_TOKENS` | `index` | `150` (reasoning is disabled via `reasoning_effort=none`, so this fits a one-sentence summary on Qwen3 / DeepSeek-R1). |
-| `DOCGRAPH_LLM_TIMEOUT` | `index` | `60` (seconds) |
+| `DOCGRAPH_LLM_HOST` | `index`, `wiki` | `localhost` |
+| `DOCGRAPH_LLM_PORT` | `index`, `wiki` | `1235` |
+| `DOCGRAPH_LLM_FORMAT` | `index`, `wiki` | `openai` |
+| `DOCGRAPH_LLM_API_KEY` | `index`, `wiki` | unset. If set, sent as `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic). |
+| `DOCGRAPH_LLM_MAX_TOKENS` | `index`, `wiki` | `150` for `index` (one sentence); `600` for `wiki` (one page). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3 / DeepSeek-R1) skip thinking and fit in these budgets. |
+| `DOCGRAPH_LLM_TIMEOUT` | `index`, `wiki` | `60` (seconds) |
 
 CLI flags override env vars. Env vars set defaults that survive across invocations.
 
@@ -341,6 +369,10 @@ Data lives at `<repo>/.docgraph/`:
 | `GET /api/impact_of?target=...&depth=&limit=` | Blast radius |
 | `GET /api/test_impact?target=...&limit=` | Tests covering target |
 | `POST /api/cypher` (`{query, limit}`) | Read-only Cypher |
+| `GET /api/processes?limit=&max_chain_len=` | Detected entry-point → call chains. Used by the **Processes** tab. |
+| `GET /api/wiki/list` | List of generated wiki pages (`{slug, title, module, summary}`). |
+| `GET /api/wiki/page?slug=...` | Markdown body + facts JSON for one page. |
+| `POST /api/wiki/build` (`{module?: "X"}`) | Rebuild all (or one module's) wiki page. Uses the same LLM config as `docgraph index --llm-model` via `DOCGRAPH_LLM_*` env vars. |
 | `GET /api/events` | Server-Sent Events stream. Emits `reindex_done` after every reindex when running under `docgraph watch --serve`; the bundled UI uses it to auto-refresh. Sends keepalive comments every 15 s. |
 
 ## Comparison

@@ -4,7 +4,7 @@ This file captures the things you can't infer from the code in 10 seconds. Read 
 
 ## What this project is
 
-A local code knowledge graph backed by a single embedded Kuzu file. Indexes any repo with tree-sitter, embeds entities with fastembed, and exposes everything via 15 MCP tools and a single-page web UI.
+A local code knowledge graph backed by a single embedded Kuzu file. Indexes any repo with tree-sitter, embeds entities with fastembed, and exposes everything via 15 MCP tools and a single-page web UI. As of 2.1.0, the UI also has process detection (entry-point → leaf call chains) and an LLM-grounded wiki of every top-level module.
 
 It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. The old code is preserved at tag `v1-legacy`. Do not resurrect any of those dependencies.
 
@@ -36,10 +36,11 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB); used when `search(rerank=True)`. |
 | `docgraph/llm.py` | Tiny urllib-based client for OpenAI- or Anthropic-compatible local servers. Used by `--llm-model <name>` to summarize entities lacking native docs. Off by default. Sends `reasoning_effort: "none"` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and a 150-token budget fits a one-sentence answer. |
 | `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
+| `docgraph/wiki.py` | LLM-grounded module wiki. `build_wiki(cfg, db, llm)` walks the top-level dirs, gathers a fact sheet from Kuzu (top classes / functions / importers / tests by PageRank), prompts the LLM, writes Markdown to `<repo>/.docgraph/wiki/<slug>.md`. Falls back to a fact-sheet rendering when the LLM is unreachable so the wiki is never blank. CLI: `docgraph wiki [--module X]`. API: `/api/wiki/list`, `/api/wiki/page?slug=`, `POST /api/wiki/build`. The fact-gathering uses `c.body` (not `c.docstring` — that property doesn't exist on the schema) and joins File via `path` not `file`. |
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. `watch_and_serve()` runs uvicorn + the watcher in one event loop and broadcasts SSE `reindex_done` on each cycle. |
 | `docgraph/mcp_tools.py` | 15 MCP tools (6 base + 9 differentiators). Keep this surface tight. |
 | `docgraph/server.py` | FastAPI: web UI + JSON API + SSE `/api/events`. `make_app(cfg, db=None)` accepts a pre-opened DB; `app.state.db_holder` is a swap-safe `(db, retriever)` wrapper used by `watch --serve`. |
-| `docgraph/ui/index.html` | Single-page graph viewer. Canvas + Sigma.js (lazy-loaded from esm.sh, auto-engages > 2 k nodes). |
+| `docgraph/ui/index.html` | Single-page graph viewer. Canvas 2D only — Sigma.js / WebGL was removed in 2.1.0 because it was unreliable on first paint. Performance comes from a Web Worker that runs **ForceAtlas2-lite** (linear repulsion, degree-weighted, on a spatial grid) + **label-propagation community detection**. Worker bootstrap is an inline `Blob([WORKER_SRC])`-backed Worker — no esm.sh, no CDN. Render batches edges/nodes by color and viewport-culls in world coords. New tabs: Processes (entry-point → call chains via `/api/processes`) and Wiki (LLM module pages via `/api/wiki/*`). Color-mode toggle (kind / community) lives in the Filters tab. |
 
 Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB), `<repo>/.docgraph/cache.json` (per-file `{hash, entities, edges}`), `<repo>/.docgraph/repos.json` (multi-repo list).
 

@@ -124,6 +124,12 @@
       color: var(--fg-dim); cursor: pointer; user-select: none;
     }
     .hop-chip.active { background: rgba(192,132,252,0.12); color: var(--accent-2); border-color: var(--accent-2); }
+    /* Hop chips are inert without a selection — dim them so it's obvious. */
+    body.no-selection #hop-row .hop-chip:not([data-hop="0"]) { opacity: 0.4; }
+    body.no-selection #hop-row::after {
+      content: "↑ click a node first"; display: block; width: 100%;
+      color: var(--fg-faint); font-size: 10px; margin-top: 4px; font-style: italic;
+    }
 
     .legend-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 4px 10px; font-size: 11px; }
     .legend-grid .row { display: flex; align-items: center; gap: 6px; color: var(--fg-dim); }
@@ -234,6 +240,9 @@
     .inspector-body .ln { display: inline-block; min-width: 32px; text-align: right; padding-right: 12px;
       color: var(--fg-faint); user-select: none; }
     .inspector-body .hi-line { background: rgba(192,132,252,0.07); border-left: 2px solid var(--accent-2); }
+    .inspector-body .ln-skip { padding: 6px 12px; color: var(--fg-faint); font-style: italic; cursor: pointer;
+      background: rgba(255,255,255,0.02); border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); }
+    .inspector-body .ln-skip:hover { color: var(--fg); background: rgba(125,211,252,0.06); }
 
     /* ---------- Right: detail ---------- */
     .right { background: var(--panel); border-left: 1px solid var(--border); display: flex; flex-direction: column; min-height: 0; }
@@ -274,6 +283,31 @@
       border: 1px solid var(--border); border-radius: 5px; cursor: pointer; transition: all .12s;
     }
     #detail button.action:hover { color: var(--accent); border-color: var(--accent); }
+    button.action {
+      font-size: 11px; padding: 5px 10px; background: var(--panel-2); color: var(--fg-dim);
+      border: 1px solid var(--border); border-radius: 5px; cursor: pointer; transition: all .12s;
+    }
+    button.action:hover { color: var(--accent); border-color: var(--accent); }
+    button.action.ghost { background: transparent; }
+
+    /* Process chain rows */
+    .process-chain { padding: 0 12px 8px; border-bottom: 1px solid var(--border); margin-bottom: 4px; }
+    .chain-row { display: flex; gap: 8px; padding: 4px 0; font-size: 11px; cursor: pointer; }
+    .chain-row:hover { color: var(--accent); }
+    .chain-row .edge-tag { color: var(--fg-faint); flex-shrink: 0; }
+    .chain-row .text { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+    /* Wiki Markdown */
+    .wiki-md { padding: 16px 20px; font-size: 13px; line-height: 1.65; color: var(--fg); }
+    .wiki-md h1 { font-size: 20px; margin: 0 0 12px; color: var(--fg); border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+    .wiki-md h2 { font-size: 15px; margin: 18px 0 8px; color: var(--accent-2); }
+    .wiki-md h3 { font-size: 13px; margin: 14px 0 6px; color: var(--fg); }
+    .wiki-md p  { margin: 0 0 10px; }
+    .wiki-md ul { margin: 0 0 10px; padding-left: 20px; }
+    .wiki-md li { margin-bottom: 4px; }
+    .wiki-md code { background: var(--panel-2); padding: 1px 5px; border-radius: 3px; font-size: 11.5px;
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace; }
+    .wiki-md strong { color: var(--accent); }
 
     .empty { padding: 40px 16px; text-align: center; color: var(--fg-faint); font-size: 12px; }
     .loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%,-50%);
@@ -334,6 +368,18 @@
             </span>
             <span>Filters</span>
           </div>
+          <div class="tab" data-tab="processes">
+            <span class="tab-icon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 3v18M5 7h14M5 12h10M5 17h7"/></svg>
+            </span>
+            <span>Processes</span>
+          </div>
+          <div class="tab" data-tab="wiki">
+            <span class="tab-icon">
+              <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 4h12a3 3 0 0 1 3 3v13H7a3 3 0 0 1-3-3V4Z"/><path d="M4 4v13a3 3 0 0 0 3 3"/></svg>
+            </span>
+            <span>Wiki</span>
+          </div>
           <div class="tab" id="tab-collapse" title="Collapse">
             <span class="tab-icon">
               <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="m15 18-6-6 6-6"/></svg>
@@ -370,14 +416,30 @@
             <div id="edge-toggles"></div>
           </div>
           <div class="group">
+            <div class="group-title">Detail Level</div>
+            <div class="group-sub">Drill in level by level. Level-0 = all files. Click any node to reveal its 1-hop neighbors.</div>
+            <div class="hop-row" id="lod-row">
+              <span class="hop-chip active" data-lod="all">All nodes</span>
+              <span class="hop-chip" data-lod="levels">Level 0 + click to expand</span>
+            </div>
+          </div>
+          <div class="group">
             <div class="group-title">Focus Depth</div>
-            <div class="group-sub">Show nodes within N hops of selection</div>
+            <div class="group-sub">Click a node first, then pick how many hops to keep.</div>
             <div class="hop-row" id="hop-row">
               <span class="hop-chip active" data-hop="0">All</span>
               <span class="hop-chip" data-hop="1">1 hop</span>
               <span class="hop-chip" data-hop="2">2 hops</span>
               <span class="hop-chip" data-hop="3">3 hops</span>
               <span class="hop-chip" data-hop="5">5 hops</span>
+            </div>
+          </div>
+          <div class="group">
+            <div class="group-title">Color Mode</div>
+            <div class="group-sub">How nodes are colored on the graph</div>
+            <div class="hop-row" id="color-mode-row">
+              <span class="hop-chip active" data-mode="kind">By Kind</span>
+              <span class="hop-chip" data-mode="community">By Community</span>
             </div>
           </div>
           <div class="group">
@@ -390,6 +452,28 @@
               <div class="row"><span class="swatch" style="background: var(--indigo)"></span>Module</div>
             </div>
             <div class="group-sub" style="margin-top: 10px;">Node size = PageRank</div>
+          </div>
+        </div>
+
+        <!-- Processes tab -->
+        <div class="tab-content explorer-pane hidden" data-pane="processes">
+          <div class="search-row" style="display:flex; gap:6px; align-items:center; padding: 10px 12px;">
+            <button id="btn-load-processes" class="action">Detect processes</button>
+            <span class="group-sub" style="margin: 0;">Entry-point → call chains</span>
+          </div>
+          <div class="results" id="processes-list">
+            <div class="empty">Click <b>Detect processes</b> to find top-level execution flows in this codebase.</div>
+          </div>
+        </div>
+
+        <!-- Wiki tab -->
+        <div class="tab-content explorer-pane hidden" data-pane="wiki">
+          <div class="search-row" style="display:flex; gap:6px; align-items:center; padding: 10px 12px;">
+            <button id="btn-build-wiki" class="action">Build wiki</button>
+            <button id="btn-refresh-wiki" class="action ghost">Refresh</button>
+          </div>
+          <div class="results" id="wiki-list">
+            <div class="empty">Wiki not built yet. Click <b>Build wiki</b> to generate LLM-grounded module pages.<br/><br/><span class="group-sub">Or run: <code>docgraph wiki</code></span></div>
           </div>
         </div>
       </aside>
@@ -481,6 +565,222 @@
       return e;
     };
 
+    // ---------- Layout Web Worker ----------
+    // ForceAtlas2-style layout + label-propagation community detection. Runs
+    // entirely off the main thread so the UI never blocks even on 5k+ nodes.
+    // Posts position updates back as Float32Array transfers (zero-copy).
+    const WORKER_SRC = `
+let positions=null,velocities=null,edges=null,degrees=null,communities=null;
+let N=0,E=0,running=false,frame=0,lowFrames=0,maxF=300;
+const pinned=new Set(),pinnedX=new Map(),pinnedY=new Map();
+const GRID=90;
+const grid=new Map();
+self.onmessage=(ev)=>{
+  const m=ev.data;
+  if(m.type==='init'){
+    positions=new Float32Array(m.positions);
+    N=positions.length/2;
+    velocities=new Float32Array(N*2);
+    edges=new Int32Array(m.edges);
+    E=edges.length/2;
+    degrees=new Float32Array(N);
+    for(let i=0;i<E;i++){degrees[edges[i*2]]++;degrees[edges[i*2+1]]++;}
+    communities=new Int32Array(N);
+    for(let i=0;i<N;i++)communities[i]=i;
+    frame=0;lowFrames=0;
+    runCommunities(8);
+    self.postMessage({type:'communities',data:new Int32Array(communities).buffer},[new Int32Array(communities).buffer]);
+  } else if(m.type==='run'){
+    running=true;maxF=m.maxFrames||300;loop();
+  } else if(m.type==='stop'){
+    running=false;
+  } else if(m.type==='pin'){
+    pinned.add(m.idx);pinnedX.set(m.idx,m.x);pinnedY.set(m.idx,m.y);
+    positions[m.idx*2]=m.x;positions[m.idx*2+1]=m.y;
+    velocities[m.idx*2]=0;velocities[m.idx*2+1]=0;
+  } else if(m.type==='unpin'){
+    pinned.delete(m.idx);pinnedX.delete(m.idx);pinnedY.delete(m.idx);
+  } else if(m.type==='kick'){
+    // Random velocity to escape local minima
+    for(let i=0;i<N;i++){velocities[i*2]+=(Math.random()-0.5)*4;velocities[i*2+1]+=(Math.random()-0.5)*4;}
+    if(!running){running=true;frame=0;lowFrames=0;loop();}
+  }
+};
+function loop(){
+  if(!running)return;
+  step();frame++;
+  if(frame%2===0){
+    const buf=new Float32Array(positions);
+    self.postMessage({type:'positions',data:buf.buffer,frame:frame},[buf.buffer]);
+  }
+  if(lowFrames>=20||frame>=maxF){
+    running=false;
+    const buf=new Float32Array(positions);
+    self.postMessage({type:'positions',data:buf.buffer,frame:frame},[buf.buffer]);
+    self.postMessage({type:'done'});
+    return;
+  }
+  setTimeout(loop,0);
+}
+function step(){
+  // Inverse-square repulsion (Coulomb-style) instead of FA2's linear. Linear
+  // decay made grid-cell cutoffs visible because far-cell contributions still
+  // mattered; with 1/d² they're negligible past one cell, so the field is
+  // smooth across cell boundaries and nodes don't line up on a grid.
+  const REPULSE=400,ATTRACT=0.03,GRAVITY=0.4,FRICTION=0.88,VCAP=6;
+  grid.clear();
+  for(let i=0;i<N;i++){
+    const cx=Math.floor(positions[i*2]/GRID),cy=Math.floor(positions[i*2+1]/GRID);
+    const k=cx*32768+cy;
+    let b=grid.get(k);if(!b){b=[];grid.set(k,b);}b.push(i);
+  }
+  const fx=new Float32Array(N),fy=new Float32Array(N);
+  for(let i=0;i<N;i++){
+    const ix=positions[i*2],iy=positions[i*2+1];
+    const cx=Math.floor(ix/GRID),cy=Math.floor(iy/GRID);
+    const di=Math.sqrt(degrees[i]+1);
+    for(let dcx=-1;dcx<=1;dcx++)for(let dcy=-1;dcy<=1;dcy++){
+      const b=grid.get((cx+dcx)*32768+(cy+dcy));if(!b)continue;
+      const st=b.length>40?Math.ceil(b.length/40):1;
+      for(let bi=0;bi<b.length;bi+=st){
+        const j=b[bi];if(i===j)continue;
+        const dx=ix-positions[j*2],dy=iy-positions[j*2+1];
+        const d2=dx*dx+dy*dy+0.01;
+        const d=Math.sqrt(d2);
+        // 1/d² Coulomb falls off fast enough that beyond ~1.5 cells the
+        // contribution is rounding-error tiny — eliminates the grid artifact.
+        const f=REPULSE*di*Math.sqrt(degrees[j]+1)/d2;
+        fx[i]+=dx/d*f;fy[i]+=dy/d*f;
+      }
+    }
+    const r=Math.sqrt(ix*ix+iy*iy)+0.001;
+    fx[i]-=ix/r*GRAVITY*di;fy[i]-=iy/r*GRAVITY*di;
+  }
+  for(let i=0;i<E;i++){
+    const a=edges[i*2],b=edges[i*2+1];
+    const dx=positions[b*2]-positions[a*2],dy=positions[b*2+1]-positions[a*2+1];
+    fx[a]+=dx*ATTRACT;fy[a]+=dy*ATTRACT;
+    fx[b]-=dx*ATTRACT;fy[b]-=dy*ATTRACT;
+  }
+  let total=0;
+  for(let i=0;i<N;i++){
+    if(pinned.has(i)){
+      positions[i*2]=pinnedX.get(i);positions[i*2+1]=pinnedY.get(i);
+      velocities[i*2]=0;velocities[i*2+1]=0;continue;
+    }
+    velocities[i*2]=(velocities[i*2]+fx[i])*FRICTION;
+    velocities[i*2+1]=(velocities[i*2+1]+fy[i])*FRICTION;
+    const v2=velocities[i*2]*velocities[i*2]+velocities[i*2+1]*velocities[i*2+1];
+    if(v2>VCAP*VCAP){const s=VCAP/Math.sqrt(v2);velocities[i*2]*=s;velocities[i*2+1]*=s;}
+    positions[i*2]+=velocities[i*2];positions[i*2+1]+=velocities[i*2+1];
+    total+=Math.sqrt(v2);
+  }
+  const avg=total/Math.max(1,N);
+  if(avg<0.5)lowFrames++;else lowFrames=0;
+}
+function runCommunities(iters){
+  // Label propagation: each node adopts most-common community among its neighbors.
+  const adj=new Array(N);for(let i=0;i<N;i++)adj[i]=[];
+  for(let i=0;i<E;i++){adj[edges[i*2]].push(edges[i*2+1]);adj[edges[i*2+1]].push(edges[i*2]);}
+  for(let i=0;i<N;i++)communities[i]=i;
+  const order=new Int32Array(N);for(let i=0;i<N;i++)order[i]=i;
+  for(let it=0;it<iters;it++){
+    for(let i=N-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));const t=order[i];order[i]=order[j];order[j]=t;}
+    let changed=0;
+    for(let oi=0;oi<N;oi++){
+      const v=order[oi],neigh=adj[v];if(!neigh.length)continue;
+      const counts=new Map();
+      for(const u of neigh){const c=communities[u];counts.set(c,(counts.get(c)||0)+1);}
+      let bestC=communities[v],bestN=-1;
+      for(const [c,n] of counts){if(n>bestN||(n===bestN&&c<bestC)){bestN=n;bestC=c;}}
+      if(bestC!==communities[v]){communities[v]=bestC;changed++;}
+    }
+    if(changed===0)break;
+  }
+  // Compact IDs
+  const remap=new Map();let nx=0;
+  for(let i=0;i<N;i++){if(!remap.has(communities[i]))remap.set(communities[i],nx++);communities[i]=remap.get(communities[i]);}
+}
+`;
+
+    let layoutWorker = null;
+    let workerPositionsBuffer = null;  // most recent positions from worker
+    function spawnWorker() {
+      if (layoutWorker) layoutWorker.terminate();
+      const blob = new Blob([WORKER_SRC], { type: "application/javascript" });
+      layoutWorker = new Worker(URL.createObjectURL(blob));
+      layoutWorker.onmessage = onWorkerMessage;
+    }
+
+    function onWorkerMessage(ev) {
+      const m = ev.data;
+      if (m.type === "positions") {
+        const buf = new Float32Array(m.data);
+        const N = Math.min(layout.length, buf.length / 2);
+        for (let i = 0; i < N; i++) {
+          if (layout[i] !== dragging) {
+            layout[i].x = buf[i * 2];
+            layout[i].y = buf[i * 2 + 1];
+          }
+        }
+        needsRender = true;
+      } else if (m.type === "communities") {
+        const arr = new Int32Array(m.data);
+        for (let i = 0; i < layout.length && i < arr.length; i++) {
+          layout[i].community = arr[i];
+        }
+        needsRender = true;
+      } else if (m.type === "done") {
+        layoutRunning = false;
+        $("#layout-pill").classList.remove("show");
+        updateLayoutToggleIcon();
+      }
+    }
+
+    function postLayoutInit() {
+      if (!layoutWorker) spawnWorker();
+      const N = layout.length;
+      const xy = new Float32Array(N * 2);
+      const idIdx = new Map();
+      for (let i = 0; i < N; i++) {
+        idIdx.set(layout[i].id, i);
+        xy[i * 2] = layout[i].x;
+        xy[i * 2 + 1] = layout[i].y;
+      }
+      const E = graph.edges.length;
+      const eb = new Int32Array(E * 2);
+      let ec = 0;
+      for (const e of graph.edges) {
+        const si = idIdx.get(e.src), di = idIdx.get(e.dst);
+        if (si == null || di == null) continue;
+        eb[ec * 2] = si; eb[ec * 2 + 1] = di; ec++;
+      }
+      const eslice = eb.slice(0, ec * 2);
+      const xyCopy = new Float32Array(xy);
+      layoutWorker.postMessage({ type: "init", positions: xyCopy.buffer, edges: eslice.buffer }, [xyCopy.buffer, eslice.buffer]);
+    }
+
+    function postLayoutRun() {
+      if (!layoutWorker) return;
+      layoutWorker.postMessage({ type: "run", maxFrames: LAYOUT_HARD_CAP_FRAMES });
+    }
+    function postLayoutStop() {
+      if (!layoutWorker) return;
+      layoutWorker.postMessage({ type: "stop" });
+    }
+    function postPin(idx, x, y) {
+      if (!layoutWorker) return;
+      layoutWorker.postMessage({ type: "pin", idx, x, y });
+    }
+    function postUnpin(idx) {
+      if (!layoutWorker) return;
+      layoutWorker.postMessage({ type: "unpin", idx });
+    }
+    function postKick() {
+      if (!layoutWorker) return;
+      layoutWorker.postMessage({ type: "kick" });
+    }
+
     // ---------- Constants ----------
     const NODE_KINDS = [
       { id: "Function", label: "Function", color: "#7dd3fc" },
@@ -489,6 +789,13 @@
       { id: "Variable", label: "Variable", color: "#fb923c" },
       { id: "Module",   label: "Module",   color: "#818cf8" },
     ];
+    // 16 visually-distinct hues for community coloring (mod-cycled).
+    const COMMUNITY_PALETTE = [
+      "#7dd3fc","#c084fc","#34d399","#fb923c","#f472b6","#facc15",
+      "#22d3ee","#a78bfa","#4ade80","#fb7185","#60a5fa","#f59e0b",
+      "#2dd4bf","#e879f9","#84cc16","#fdba74",
+    ];
+    let colorMode = "kind"; // "kind" | "community"
     const EDGE_KINDS = [
       { id: "CONTAINS",        label: "Contains",   color: "rgba(125,211,252,0.55)" },
       { id: "CALLS",           label: "Calls",      color: "rgba(125,211,252,0.55)" },
@@ -523,14 +830,26 @@
     let lowEnergyFrames = 0;
     let layoutFrameCount = 0;
     const LAYOUT_ENERGY_THRESHOLD = 0.5;   // per-node avg |v|
-    const LAYOUT_STOP_AFTER_FRAMES = 25;
-    const LAYOUT_HARD_CAP_FRAMES = 600;    // ~10s @60fps — give up regardless of energy
+    const LAYOUT_STOP_AFTER_FRAMES = 20;
+    const LAYOUT_HARD_CAP_FRAMES = 300;    // ~5s @60fps — give up regardless of energy
     const VELOCITY_CAP = 6;                // px/frame
+    const GRID_CELL = 90;                  // world-units per spatial-grid cell
+    const GRID_CELL_CAP = 40;              // max nodes contributing repulsion per cell scan
 
     const nodeFilter = new Set(NODE_KINDS.map(k => k.id));   // visible
     const edgeFilter = new Set(EDGE_KINDS.map(k => k.id));
     let focusHops = 0;  // 0 = all
     let visibleNodeIds = null; // computed from filters + focusHops
+
+    // Level-of-detail: structural drill-down.
+    //   'all'    — show everything loaded.
+    //   'levels' — start with level-0 (= all File nodes, no cap) plus any
+    //              nodes the user has revealed by clicking. Clicking expands
+    //              outward via 1-hop edges (callers, callees, contents).
+    // No top-K cap: level-0 is defined by node kind, not PageRank.
+    let lodMode = "all";          // "all" | "levels"
+    let level0Set = new Set();    // all File ids — the structural skeleton
+    let revealedSet = new Set();  // ids manually revealed via click expansion
 
     // ---------- Stats / repo ----------
     async function loadStats() {
@@ -545,7 +864,9 @@
     // ---------- Graph load ----------
     async function loadGraph() {
       $("#loading").style.display = "";
-      graph = await api("/api/graph?limit_nodes=4000");
+      // Worker handles FA2 + grid; render batches and viewport-culls. Easily
+      // good for ~10k. We leave the door open up to 25k for huge codebases.
+      graph = await api("/api/graph?limit_nodes=10000");
       $("#stat-nodes").textContent = graph.nodes.length;
       $("#stat-edges").textContent = graph.edges.length;
       $("#stat-edges-2").textContent = graph.edges.length;
@@ -553,6 +874,8 @@
       computeVisible();
       $("#loading").style.display = "none";
       fitOnFirstFrame = true;
+      spawnWorker();
+      postLayoutInit();
       startLayout();
       needsRender = true;
     }
@@ -562,10 +885,14 @@
       const maxPR = Math.max(0.0001, ...graph.nodes.map(n => n.pagerank || 0));
       layout = graph.nodes.map((n, i) => {
         const angle = (i / N) * Math.PI * 2;
-        const r0 = 200 + Math.sqrt(N) * 6;
+        const r0 = 200 + Math.sqrt(N) * 6 + (Math.random() - 0.5) * 30;
+        // Small random offset so positions never start on integer-grid coords
+        // — prevents the lattice artifact some users saw on first settle.
+        const jx = (Math.random() - 0.5) * 12;
+        const jy = (Math.random() - 0.5) * 12;
         return {
           id: n.id, name: n.name, kind: n.kind, file: n.file,
-          x: Math.cos(angle) * r0, y: Math.sin(angle) * r0,
+          x: Math.cos(angle) * r0 + jx, y: Math.sin(angle) * r0 + jy,
           vx: 0, vy: 0,
           r: 2.5 + Math.sqrt((n.pagerank || 0) / maxPR) * 12,
           color: COLORS[n.kind] || "#888",
@@ -573,6 +900,11 @@
         };
       });
       layoutById = new Map(layout.map(n => [n.id, n]));
+      // Level-0 = every File node we have. No PR cap — the user wanted the
+      // full file tier on first paint. Sub-files (Class/Function/Variable)
+      // are revealed by clicking.
+      level0Set = new Set(layout.filter(n => n.kind === "File").map(n => n.id));
+      revealedSet = new Set();
     }
 
     // ---------- Filters ----------
@@ -611,12 +943,31 @@
         };
         eh.appendChild(row);
       }
-      $$(".hop-chip").forEach(c => {
+      $$("#hop-row .hop-chip").forEach(c => {
         c.onclick = () => {
-          $$(".hop-chip").forEach(x => x.classList.remove("active"));
+          $$("#hop-row .hop-chip").forEach(x => x.classList.remove("active"));
           c.classList.add("active");
           focusHops = parseInt(c.dataset.hop, 10) || 0;
           computeVisible();
+          needsRender = true;
+        };
+      });
+      $$("#color-mode-row .hop-chip").forEach(c => {
+        c.onclick = () => {
+          $$("#color-mode-row .hop-chip").forEach(x => x.classList.remove("active"));
+          c.classList.add("active");
+          colorMode = c.dataset.mode;
+          needsRender = true;
+        };
+      });
+      $$("#lod-row .hop-chip").forEach(c => {
+        c.onclick = () => {
+          $$("#lod-row .hop-chip").forEach(x => x.classList.remove("active"));
+          c.classList.add("active");
+          lodMode = c.dataset.lod;
+          revealedSet = new Set();   // reset expansion when switching modes
+          computeVisible();
+          fitOnFirstFrame = true;    // re-fit so the new tier centers nicely
           needsRender = true;
         };
       });
@@ -627,7 +978,19 @@
       const kindOk = (n) => nodeFilter.has(n.kind);
       let allowed = new Set(layout.filter(kindOk).map(n => n.id));
 
-      // Step 2: focus depth (only when a node is selected and hops > 0)
+      // Step 2: LOD level filter — in 'levels' mode keep only level-0 (Files)
+      // plus anything the user has manually revealed. Skip when a selection
+      // is active and focusHops > 0 — focus mode takes precedence so the user
+      // can drill in via hops without having to flip LOD off first.
+      if (lodMode === "levels" && !(focusHops > 0 && selectedId !== null)) {
+        const lodAllowed = new Set();
+        for (const id of allowed) {
+          if (level0Set.has(id) || revealedSet.has(id)) lodAllowed.add(id);
+        }
+        allowed = lodAllowed;
+      }
+
+      // Step 3: focus depth (only when a node is selected and hops > 0)
       if (focusHops > 0 && selectedId !== null) {
         const adj = new Map();
         for (const e of graph.edges) {
@@ -656,73 +1019,9 @@
       $("#stat-visible").textContent = `· ${allowed.size} visible`;
     }
 
-    // ---------- Force simulation ----------
-    function step() {
-      if (!layoutRunning) return;
-      const N = layout.length;
-      // Scale repulsion down as N grows so 4k nodes don't explode the same way 500 nodes settle.
-      // Empirically: REPULSE ~ 700 for N=500, ~ 220 for N=4000.
-      const REPULSE = Math.max(120, 700 * Math.sqrt(500 / Math.max(50, N)));
-      const SPRING = 0.012;
-      const SPRING_LEN = 70;
-      const CENTER = 0.0008;
-      const FRICTION = 0.84;
-
-      for (let i = 0; i < N; i++) {
-        const a = layout[i];
-        let fx = -a.x * CENTER;
-        let fy = -a.y * CENTER;
-        for (let j = 0; j < N; j++) {
-          if (i === j) continue;
-          const b = layout[j];
-          const dx = a.x - b.x, dy = a.y - b.y;
-          const d2 = dx*dx + dy*dy + 0.01;
-          const d = Math.sqrt(d2);
-          const f = REPULSE / d2;
-          fx += dx * f / d;
-          fy += dy * f / d;
-        }
-        a.fx = fx; a.fy = fy;
-      }
-      for (const e of graph.edges) {
-        const a = layoutById.get(e.src), b = layoutById.get(e.dst);
-        if (!a || !b) continue;
-        const dx = b.x - a.x, dy = b.y - a.y;
-        const d = Math.sqrt(dx*dx + dy*dy) + 0.01;
-        const f = (d - SPRING_LEN) * SPRING;
-        a.fx += dx / d * f;
-        a.fy += dy / d * f;
-        b.fx -= dx / d * f;
-        b.fy -= dy / d * f;
-      }
-      // Integrate, cap velocity, track kinetic energy
-      let totalSpeed = 0;
-      for (const a of layout) {
-        if (a === dragging) continue;
-        a.vx = (a.vx + a.fx) * FRICTION;
-        a.vy = (a.vy + a.fy) * FRICTION;
-        // Velocity cap prevents the visible "blinking" / nodes flying off.
-        const v2 = a.vx*a.vx + a.vy*a.vy;
-        if (v2 > VELOCITY_CAP * VELOCITY_CAP) {
-          const s = VELOCITY_CAP / Math.sqrt(v2);
-          a.vx *= s; a.vy *= s;
-        }
-        a.x += a.vx;
-        a.y += a.vy;
-        totalSpeed += Math.sqrt(a.vx*a.vx + a.vy*a.vy);
-      }
-      layoutEnergy = totalSpeed / Math.max(1, N);
-
-      // Auto-stop once the graph has settled, or hit the hard cap.
-      layoutFrameCount++;
-      if (layoutEnergy < LAYOUT_ENERGY_THRESHOLD) lowEnergyFrames++;
-      else lowEnergyFrames = 0;
-      if (lowEnergyFrames >= LAYOUT_STOP_AFTER_FRAMES || layoutFrameCount >= LAYOUT_HARD_CAP_FRAMES) {
-        layoutRunning = false;
-        $("#layout-pill").classList.remove("show");
-        updateLayoutToggleIcon();
-      }
-    }
+    // ---------- Force simulation (delegated to Web Worker) ----------
+    // The actual physics runs in WORKER_SRC above. This thread just sends
+    // init / run / stop / pin messages and applies the position deltas.
 
     function updateLayoutToggleIcon() {
       const btn = $("#layout-toggle");
@@ -734,10 +1033,14 @@
 
     function startLayout() {
       layoutRunning = true;
-      lowEnergyFrames = 0;
-      layoutFrameCount = 0;
-      layoutEnergy = Infinity;
       $("#layout-pill").classList.add("show");
+      updateLayoutToggleIcon();
+      postLayoutRun();
+    }
+    function pauseLayout() {
+      layoutRunning = false;
+      postLayoutStop();
+      $("#layout-pill").classList.remove("show");
       updateLayoutToggleIcon();
     }
 
@@ -754,18 +1057,35 @@
       ctx.translate(viewport.tx, viewport.ty);
       ctx.scale(viewport.scale, viewport.scale);
 
-      // Edges
+      // Edges — batched by color (one stroke() per color, not per edge).
+      // Viewport-culled in world coords so off-screen edges skip even the moveTo.
       ctx.lineWidth = 0.6 / viewport.scale;
       const vis = visibleNodeIds;
+      const vMinX = -viewport.tx / viewport.scale;
+      const vMinY = -viewport.ty / viewport.scale;
+      const vMaxX = vMinX + w / viewport.scale;
+      const vMaxY = vMinY + h / viewport.scale;
+      const edgesByColor = new Map();
       for (const e of graph.edges) {
         if (!edgeFilter.has(e.kind)) continue;
         if (vis && !(vis.has(e.src) && vis.has(e.dst))) continue;
         const a = layoutById.get(e.src), b = layoutById.get(e.dst);
         if (!a || !b) continue;
-        ctx.strokeStyle = EDGE_COLORS[e.kind] || "rgba(255,255,255,0.08)";
+        // Cheap viewport cull: skip if both endpoints fall on the same outside side.
+        if ((a.x < vMinX && b.x < vMinX) || (a.x > vMaxX && b.x > vMaxX) ||
+            (a.y < vMinY && b.y < vMinY) || (a.y > vMaxY && b.y > vMaxY)) continue;
+        const col = EDGE_COLORS[e.kind] || "rgba(255,255,255,0.08)";
+        let arr = edgesByColor.get(col);
+        if (!arr) { arr = []; edgesByColor.set(col, arr); }
+        arr.push(a.x, a.y, b.x, b.y);
+      }
+      for (const [col, arr] of edgesByColor) {
+        ctx.strokeStyle = col;
         ctx.beginPath();
-        ctx.moveTo(a.x, a.y);
-        ctx.lineTo(b.x, b.y);
+        for (let i = 0; i < arr.length; i += 4) {
+          ctx.moveTo(arr[i], arr[i+1]);
+          ctx.lineTo(arr[i+2], arr[i+3]);
+        }
         ctx.stroke();
       }
       // Highlight edges of selection
@@ -783,25 +1103,57 @@
           ctx.stroke();
         }
       }
-      // Nodes
+      // Nodes — batched by color + alpha bucket (full vs dimmed).
+      const nodesFull = new Map();    // color -> [x,y,r, ...]
+      const nodesDim = new Map();
+      const isSelHighlight = selectedId !== null;
       for (const n of layout) {
         if (vis && !vis.has(n.id)) continue;
-        ctx.fillStyle = n.color;
-        ctx.globalAlpha = (selectedId !== null && n.id !== selectedId
-          && !isNeighbor(n.id, selectedId)) ? 0.3 : 1.0;
-        ctx.beginPath();
-        ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
-        ctx.fill();
-        if (n.id === selectedId) {
+        if (n.x < vMinX - 30 || n.x > vMaxX + 30 || n.y < vMinY - 30 || n.y > vMaxY + 30) continue;
+        const dim = isSelHighlight && n.id !== selectedId && !isNeighbor(n.id, selectedId);
+        const m = dim ? nodesDim : nodesFull;
+        const col = (colorMode === "community" && n.community != null)
+          ? COMMUNITY_PALETTE[n.community % COMMUNITY_PALETTE.length]
+          : n.color;
+        let arr = m.get(col);
+        if (!arr) { arr = []; m.set(col, arr); }
+        arr.push(n.x, n.y, n.r);
+      }
+      const drawBatch = (m, alpha) => {
+        ctx.globalAlpha = alpha;
+        for (const [col, arr] of m) {
+          ctx.fillStyle = col;
+          ctx.beginPath();
+          for (let i = 0; i < arr.length; i += 3) {
+            ctx.moveTo(arr[i] + arr[i+2], arr[i+1]);
+            ctx.arc(arr[i], arr[i+1], arr[i+2], 0, Math.PI * 2);
+          }
+          ctx.fill();
+        }
+      };
+      drawBatch(nodesDim, 0.3);
+      drawBatch(nodesFull, 1.0);
+      ctx.globalAlpha = 1.0;
+      // Selected/hover ring drawn last
+      if (selectedId !== null) {
+        const n = layoutById.get(selectedId);
+        if (n) {
           ctx.lineWidth = 2 / viewport.scale;
           ctx.strokeStyle = "#fff";
-          ctx.stroke();
-        } else if (n.id === hoverId) {
-          ctx.lineWidth = 1.4 / viewport.scale;
-          ctx.strokeStyle = "rgba(255,255,255,0.7)";
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
           ctx.stroke();
         }
-        ctx.globalAlpha = 1.0;
+      }
+      if (hoverId !== null && hoverId !== selectedId) {
+        const n = layoutById.get(hoverId);
+        if (n) {
+          ctx.lineWidth = 1.4 / viewport.scale;
+          ctx.strokeStyle = "rgba(255,255,255,0.7)";
+          ctx.beginPath();
+          ctx.arc(n.x, n.y, n.r, 0, Math.PI * 2);
+          ctx.stroke();
+        }
       }
       // Labels: top by PR + hover/selected
       ctx.fillStyle = "#e8eaf0";
@@ -840,7 +1192,8 @@
 
     let needsRender = true;
     function tick() {
-      if (layoutRunning) { step(); needsRender = true; }
+      // Physics now runs in the worker; this loop only paints frames when
+      // something changed. The worker triggers needsRender via onWorkerMessage.
       if (needsRender) { render(); needsRender = false; }
       rafId = requestAnimationFrame(tick);
     }
@@ -907,12 +1260,20 @@
       canvas.addEventListener("mousedown", (e) => {
         mouseDown = true; lastX = e.clientX; lastY = e.clientY; downAt = Date.now(); moved = false;
         const n = nodeAt(e.offsetX, e.offsetY);
-        if (n) dragging = n;
+        if (n) {
+          dragging = n;
+          const idx = layout.indexOf(n);
+          if (idx >= 0) postPin(idx, n.x, n.y);
+        }
       });
       window.addEventListener("mouseup", () => {
         mouseDown = false;
         const elapsed = Date.now() - downAt;
         if (elapsed < 250 && dragging && !moved) select(dragging.id);
+        if (dragging) {
+          const idx = layout.indexOf(dragging);
+          if (idx >= 0) postUnpin(idx);
+        }
         dragging = null;
       });
       canvas.addEventListener("mousemove", (e) => {
@@ -922,8 +1283,9 @@
           if (dragging) {
             dragging.x += dx / viewport.scale;
             dragging.y += dy / viewport.scale;
-            dragging.vx = 0; dragging.vy = 0;
-            startLayout();
+            const idx = layout.indexOf(dragging);
+            if (idx >= 0) postPin(idx, dragging.x, dragging.y);
+            if (!layoutRunning) startLayout();
           } else {
             viewport.tx += dx;
             viewport.ty += dy;
@@ -983,10 +1345,22 @@
     // ---------- Detail + Code Inspector ----------
     async function select(id, name) {
       selectedId = id;
+      document.body.classList.toggle("no-selection", id == null);
       neighborCache = { id: null, set: new Set() };
       const n = layoutById.get(id);
       const sym = name || (n && n.name);
-      if (focusHops > 0) computeVisible();
+      // In 'levels' mode, every click reveals the clicked node + its 1-hop
+      // neighbors via any currently-enabled edge type. Successive clicks keep
+      // accumulating revealed nodes — drill-down by exploration.
+      if (lodMode === "levels" && id != null) {
+        revealedSet.add(id);
+        for (const e of graph.edges) {
+          if (!edgeFilter.has(e.kind)) continue;
+          if (e.src === id) revealedSet.add(e.dst);
+          else if (e.dst === id) revealedSet.add(e.src);
+        }
+      }
+      if (focusHops > 0 || lodMode === "levels") computeVisible();
       needsRender = true;
 
       // Top pill
@@ -1003,39 +1377,56 @@
       detail.innerHTML = "<div class='empty'>Loading…</div>";
       highlightSelectedResult();
 
-      // Open code inspector for files & symbols
-      if (n && n.kind === "File") {
-        openInspector(n.name, null, null);
-      } else if (sym) {
-        // We'll fetch definition first, then load file content with line highlight
+      if (!sym) {
+        if (n && n.kind === "File") openInspector(n.name, null, null);
+        return;
       }
 
-      if (!sym) return;
-      const [defn, refs, neigh] = await Promise.all([
-        api(`/api/definition?name=${encodeURIComponent(sym)}`),
-        api(`/api/references?name=${encodeURIComponent(sym)}`),
-        api(`/api/neighborhood?name=${encodeURIComponent(sym)}&limit=20`),
-      ]);
-
+      // Render each section as its own API call resolves so the panel doesn't
+      // block on the slowest. We use a token to abort stale renders if the
+      // user clicks another node mid-flight.
+      const token = ++_selectToken;
       detail.innerHTML = "";
-      const d = defn[0];
-      if (d) {
-        detail.appendChild(el("h2", {}, sym));
-        detail.appendChild(el("div", { className: "meta" }, `${d.label} · ${d.file}:${d.line}`));
-        const actions = el("div", { style: { display: "flex", gap: "6px", marginTop: "6px" } });
-        const openBtn = el("button", { className: "action" }, "Open in inspector");
-        openBtn.onclick = () => openInspector(d.file, d.line, sym);
-        actions.appendChild(openBtn);
-        detail.appendChild(actions);
-        detail.appendChild(section("Definition", el("pre", {}, (d.body || "").slice(0, 6000))));
-      } else if (n && n.kind === "File") {
-        detail.appendChild(el("h2", {}, n.name));
-        detail.appendChild(el("div", { className: "meta" }, `File`));
-      } else {
-        detail.appendChild(el("h2", {}, sym));
-      }
+      const head = el("div");
+      const defSec = el("div");
+      const refSec = el("div");
+      const neighSec = el("div");
+      detail.appendChild(head);
+      detail.appendChild(defSec);
+      detail.appendChild(refSec);
+      detail.appendChild(neighSec);
 
-      if (refs.length) {
+      head.appendChild(el("h2", {}, sym));
+      head.appendChild(el("div", { className: "meta" }, "Loading…"));
+
+      api(`/api/definition?name=${encodeURIComponent(sym)}`).then(defn => {
+        if (token !== _selectToken) return;
+        const d = defn[0];
+        head.innerHTML = "";
+        if (d) {
+          head.appendChild(el("h2", {}, sym));
+          head.appendChild(el("div", { className: "meta" }, `${d.label} · ${d.file}:${d.line}`));
+          const actions = el("div", { style: { display: "flex", gap: "6px", marginTop: "6px" } });
+          const openBtn = el("button", { className: "action" }, "Open in inspector");
+          openBtn.onclick = () => openInspector(d.file, d.line, sym);
+          actions.appendChild(openBtn);
+          head.appendChild(actions);
+          defSec.innerHTML = "";
+          defSec.appendChild(section("Definition", el("pre", {}, (d.body || "").slice(0, 6000))));
+          // Open inspector to the definition's file
+          openInspector(d.file, d.line, sym);
+        } else if (n && n.kind === "File") {
+          head.appendChild(el("h2", {}, n.name));
+          head.appendChild(el("div", { className: "meta" }, "File"));
+          openInspector(n.name, null, null);
+        } else {
+          head.appendChild(el("h2", {}, sym));
+        }
+      }).catch(() => {});
+
+      api(`/api/references?name=${encodeURIComponent(sym)}`).then(refs => {
+        if (token !== _selectToken) return;
+        if (!refs || !refs.length) return;
         const list = el("div");
         for (const r of refs.slice(0, 40)) {
           const li = el("div", { className: "link" },
@@ -1045,9 +1436,13 @@
           li.onclick = () => searchByName(r.caller);
           list.appendChild(li);
         }
-        detail.appendChild(section(`References`, list, refs.length));
-      }
-      if (neigh.length) {
+        refSec.innerHTML = "";
+        refSec.appendChild(section("References", list, refs.length));
+      }).catch(() => {});
+
+      api(`/api/neighborhood?name=${encodeURIComponent(sym)}&limit=20`).then(neigh => {
+        if (token !== _selectToken) return;
+        if (!neigh || !neigh.length) return;
         const list = el("div");
         for (const r of neigh) {
           const li = el("div", { className: "link" },
@@ -1057,17 +1452,15 @@
           li.onclick = () => select(null, r.name);
           list.appendChild(li);
         }
-        detail.appendChild(section("Related", list, neigh.length));
-      }
-
-      if (d && d.file) {
-        // Open inspector to definition file with line highlight
-        openInspector(d.file, d.line, sym);
-      }
+        neighSec.innerHTML = "";
+        neighSec.appendChild(section("Related", list, neigh.length));
+      }).catch(() => {});
     }
+    let _selectToken = 0;
 
     function clearSelection() {
       selectedId = null;
+      document.body.classList.add("no-selection");
       $("#selected-pill").classList.remove("show");
       $("#detail").innerHTML = "<div class='empty'>Select an entity to inspect.</div>";
       $("#detail-source").textContent = "";
@@ -1112,24 +1505,64 @@
       }
     }
 
+    // Build code as one HTML string and inject in a single DOM op. ~50× faster
+    // than appendChild-per-line for big files. For very large files we render
+    // only a window around the highlight line; the user can expand on demand.
+    const _escMap = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    function escHtml(s) { return s.replace(/[&<>"']/g, c => _escMap[c]); }
+    const INSPECTOR_LINE_WINDOW = 800;
     function renderCode(content, hiLine) {
       const body = $("#inspector-body");
-      body.innerHTML = "";
-      const pre = el("pre");
+      const lines = content.split("\n");
+      const total = lines.length;
+      const padW = String(total).length;
+      let from = 0, to = total;
+      let prefix = "", suffix = "";
+      if (total > INSPECTOR_LINE_WINDOW) {
+        if (hiLine && hiLine > 0) {
+          from = Math.max(0, hiLine - Math.floor(INSPECTOR_LINE_WINDOW / 2));
+          to = Math.min(total, from + INSPECTOR_LINE_WINDOW);
+        } else {
+          to = INSPECTOR_LINE_WINDOW;
+        }
+        if (from > 0) prefix = `<div class="ln-skip" data-from="0" data-to="${from}">… ${from} earlier line${from===1?'':'s'} hidden — click to expand …</div>`;
+        if (to < total) suffix = `<div class="ln-skip" data-from="${to}" data-to="${total}">… ${total - to} later lines hidden — click to expand …</div>`;
+      }
+      const out = [prefix, "<pre>"];
+      for (let i = from; i < to; i++) {
+        const lnNum = i + 1;
+        const cls = lnNum === hiLine ? ' class="hi-line"' : "";
+        out.push(`<div${cls}><span class="ln">${String(lnNum).padStart(padW, " ")}</span>${escHtml(lines[i])}</div>`);
+      }
+      out.push("</pre>", suffix);
+      body.innerHTML = out.join("");
+      // Wire up "expand" affordances
+      body.querySelectorAll(".ln-skip").forEach(el => {
+        el.onclick = () => renderCodeFull(content, hiLine);
+      });
+      if (hiLine) {
+        const idx = hiLine - 1 - from;
+        const pre = body.querySelector("pre");
+        if (pre && idx >= 0 && idx < pre.children.length) {
+          pre.children[idx].scrollIntoView({ block: "center", behavior: "instant" });
+        }
+      }
+    }
+    function renderCodeFull(content, hiLine) {
+      const body = $("#inspector-body");
       const lines = content.split("\n");
       const padW = String(lines.length).length;
+      const out = ["<pre>"];
       for (let i = 0; i < lines.length; i++) {
         const lnNum = i + 1;
-        const lnEl = el("div", { className: lnNum === hiLine ? "hi-line" : "" },
-          el("span", { className: "ln" }, String(lnNum).padStart(padW, " ")),
-          lines[i],
-        );
-        pre.appendChild(lnEl);
+        const cls = lnNum === hiLine ? ' class="hi-line"' : "";
+        out.push(`<div${cls}><span class="ln">${String(lnNum).padStart(padW, " ")}</span>${escHtml(lines[i])}</div>`);
       }
-      body.appendChild(pre);
+      out.push("</pre>");
+      body.innerHTML = out.join("");
       if (hiLine) {
-        // Scroll the highlighted line near the top
-        const target = pre.children[hiLine - 1];
+        const pre = body.querySelector("pre");
+        const target = pre && pre.children[hiLine - 1];
         if (target) target.scrollIntoView({ block: "center", behavior: "instant" });
       }
     }
@@ -1138,6 +1571,11 @@
     function activateTab(name) {
       $$(".tab").forEach(t => t.classList.toggle("active", t.dataset.tab === name));
       $$(".tab-content").forEach(c => c.classList.toggle("hidden", c.dataset.pane !== name));
+      // Lazy-load tab data on first activation.
+      if (name === "wiki" && !activateTab._wikiLoaded) {
+        activateTab._wikiLoaded = true;
+        loadWikiList();
+      }
     }
 
     function setupTabs() {
@@ -1192,24 +1630,22 @@
       $("#zoom-out").onclick = () => { z(0.8); needsRender = true; };
       $("#zoom-fit").onclick = () => { fitToScreen(); needsRender = true; };
       $("#zoom-reset").onclick = () => {
-        for (const n of layout) {
-          n.vx = 0; n.vy = 0;
-          const a = Math.random() * Math.PI * 2;
-          const r0 = 200 + Math.random() * 200;
-          n.x = Math.cos(a) * r0; n.y = Math.sin(a) * r0;
+        // Re-seed positions on a circle and re-init the worker
+        const N = layout.length;
+        for (let i = 0; i < N; i++) {
+          const a = (i / Math.max(1, N)) * Math.PI * 2;
+          const r0 = 200 + Math.sqrt(N) * 6;
+          layout[i].x = Math.cos(a) * r0;
+          layout[i].y = Math.sin(a) * r0;
         }
         fitOnFirstFrame = true;
+        postLayoutInit();
         startLayout();
         needsRender = true;
       };
       $("#layout-toggle").onclick = () => {
-        if (layoutRunning) {
-          layoutRunning = false;
-          $("#layout-pill").classList.remove("show");
-        } else {
-          startLayout();
-        }
-        updateLayoutToggleIcon();
+        if (layoutRunning) pauseLayout();
+        else startLayout();
       };
     }
 
@@ -1217,6 +1653,126 @@
       $("#btn-reload").onclick = () => loadGraph();
       $("#sel-clear").onclick = clearSelection;
       $("#inspector-close").onclick = () => $("#inspector").classList.remove("show");
+
+      $("#btn-load-processes").onclick = loadProcesses;
+      $("#btn-build-wiki").onclick = buildWiki;
+      $("#btn-refresh-wiki").onclick = loadWikiList;
+    }
+
+    // ---------- Processes ----------
+    async function loadProcesses() {
+      const list = $("#processes-list");
+      list.innerHTML = "<div class='empty'>Detecting…</div>";
+      try {
+        const data = await api("/api/processes?limit=25&max_chain_len=8");
+        if (!data || !data.length) { list.innerHTML = "<div class='empty'>No clean entry points found. Either everything is called from somewhere, or the index is fresh and PageRank hasn't propagated yet.</div>"; return; }
+        list.innerHTML = "";
+        for (const p of data) {
+          const e = p.entry;
+          const card = el("div", { className: "result" },
+            el("div", { className: "name" },
+              el("span", { className: "kind-tag Function" }, "ENTRY"),
+              e.name,
+            ),
+            el("div", { className: "meta" }, `${e.file}:${e.line || 0} · pr ${(e.pagerank || 0).toFixed(4)} · fan-out ${p.fanout}`),
+          );
+          card.onclick = () => searchByName(e.name);
+          list.appendChild(card);
+          // Expandable chain
+          const chain = el("div", { className: "process-chain" });
+          for (const c of p.chain.slice(0, 12)) {
+            const row = el("div", { className: "chain-row", style: { paddingLeft: `${Math.min(c.depth || 1, 6) * 10}px` } },
+              el("span", { className: "edge-tag" }, "→"),
+              el("span", { className: "text" }, `${c.name} · ${c.file}:${c.line || 0}`),
+            );
+            row.onclick = (ev) => { ev.stopPropagation(); searchByName(c.name); };
+            chain.appendChild(row);
+          }
+          list.appendChild(chain);
+        }
+      } catch (e) {
+        list.innerHTML = `<div class='empty'>Failed: ${e}</div>`;
+      }
+    }
+
+    // ---------- Wiki ----------
+    async function loadWikiList() {
+      const list = $("#wiki-list");
+      list.innerHTML = "<div class='empty'>Loading…</div>";
+      try {
+        const data = await api("/api/wiki/list");
+        if (!data || !data.length) {
+          list.innerHTML = "<div class='empty'>Wiki not built yet. Click <b>Build wiki</b>.<br/><br/><span class='group-sub'>The first build can take a minute or two depending on how many modules you have.</span></div>";
+          return;
+        }
+        list.innerHTML = "";
+        for (const p of data) {
+          const card = el("div", { className: "result" },
+            el("div", { className: "name" },
+              el("span", { className: "kind-tag File" }, "WIKI"),
+              p.title,
+            ),
+            el("div", { className: "meta" }, p.module),
+            el("div", { className: "snippet" }, (p.summary || "").slice(0, 220)),
+          );
+          card.onclick = () => openWikiPage(p.slug, p.title);
+          list.appendChild(card);
+        }
+      } catch (e) {
+        list.innerHTML = `<div class='empty'>Failed: ${e}</div>`;
+      }
+    }
+
+    async function buildWiki() {
+      const list = $("#wiki-list");
+      list.innerHTML = "<div class='empty'>Building wiki — this calls the LLM once per top-level module. Could take 1-3 minutes.<br/><br/><span class='group-sub'>(If you don't have a local LLM running, the pages will fall back to plain fact-sheet rendering.)</span></div>";
+      try {
+        await fetch("/api/wiki/build", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" });
+        await loadWikiList();
+      } catch (e) {
+        list.innerHTML = `<div class='empty'>Build failed: ${e}</div>`;
+      }
+    }
+
+    async function openWikiPage(slug, title) {
+      const ins = $("#inspector");
+      ins.classList.add("show");
+      $("#inspector-file").innerHTML = "";
+      $("#inspector-file").appendChild(el("span", { className: "file-tag" }, "WIKI"));
+      $("#inspector-file").appendChild(document.createTextNode(title || slug));
+      const body = $("#inspector-body");
+      body.innerHTML = "<div class='empty'>Loading…</div>";
+      try {
+        const data = await api(`/api/wiki/page?slug=${encodeURIComponent(slug)}`);
+        body.innerHTML = `<div class="wiki-md">${renderMarkdown(data.body_md || "")}</div>`;
+      } catch (e) {
+        body.innerHTML = `<div class='empty'>Failed: ${e}</div>`;
+      }
+    }
+
+    // Minimal Markdown renderer — headings, bold, italic, bullet lists, paragraphs, inline code.
+    function renderMarkdown(src) {
+      const esc = (s) => s.replace(/[&<>]/g, c => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;" }[c]));
+      const lines = src.split(/\r?\n/);
+      const out = [];
+      let inList = false, paraBuf = [];
+      const flushPara = () => { if (paraBuf.length) { out.push(`<p>${inline(paraBuf.join(" "))}</p>`); paraBuf = []; } };
+      const closeList = () => { if (inList) { out.push("</ul>"); inList = false; } };
+      const inline = (t) => esc(t)
+        .replace(/`([^`]+)`/g, '<code>$1</code>')
+        .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
+        .replace(/(^|\s)\*([^*]+)\*/g, "$1<em>$2</em>");
+      for (const raw of lines) {
+        const line = raw.trimEnd();
+        if (!line.trim()) { flushPara(); closeList(); continue; }
+        const h = line.match(/^(#{1,6})\s+(.*)$/);
+        if (h) { flushPara(); closeList(); out.push(`<h${h[1].length}>${inline(h[2])}</h${h[1].length}>`); continue; }
+        const li = line.match(/^[-*]\s+(.*)$/);
+        if (li) { flushPara(); if (!inList) { out.push("<ul>"); inList = true; } out.push(`<li>${inline(li[1])}</li>`); continue; }
+        paraBuf.push(line);
+      }
+      flushPara(); closeList();
+      return out.join("\n");
     }
 
     function setupLiveUpdates() {
@@ -1230,6 +1786,7 @@
     }
 
     // ---------- Boot ----------
+    document.body.classList.add("no-selection");  // hop chips dim until first selection
     setupCanvas();
     setupTabs();
     buildFilterUI();
