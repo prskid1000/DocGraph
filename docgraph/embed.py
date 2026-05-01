@@ -36,13 +36,14 @@ class Embedder:
 
     def _ensure(self) -> TextEmbedding:
         if self._model is None:
-            if self.providers:
+            providers = self._available_providers(self.providers) if self.providers else None
+            if providers:
                 log.info(
-                    f"Loading embedding model {self.model_name} with providers={self.providers}..."
+                    f"Loading embedding model {self.model_name} with providers={providers}..."
                 )
                 try:
                     self._model = TextEmbedding(
-                        model_name=self.model_name, providers=self.providers
+                        model_name=self.model_name, providers=providers
                     )
                     self._log_active_provider()
                 except Exception as e:  # pragma: no cover - depends on installed ORT
@@ -52,9 +53,33 @@ class Embedder:
                     )
                     self._model = TextEmbedding(model_name=self.model_name)
             else:
-                log.info(f"Loading embedding model {self.model_name}...")
+                if self.providers:
+                    log.warning(
+                        f"GPU requested but no GPU provider is installed. "
+                        f"Install `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows). "
+                        f"Falling back to CPU."
+                    )
+                else:
+                    log.info(f"Loading embedding model {self.model_name}...")
                 self._model = TextEmbedding(model_name=self.model_name)
         return self._model
+
+    @staticmethod
+    def _available_providers(requested: list[str]) -> list[str]:
+        """Filter requested ORT providers against what's actually installed.
+        ORT errors hard if you list an unavailable provider (e.g. CUDA without
+        onnxruntime-gpu) instead of skipping it, so we pre-filter."""
+        try:
+            import onnxruntime as ort
+            available = set(ort.get_available_providers())
+        except Exception:
+            return []
+        kept = [p for p in requested if p in available]
+        # Drop the all-CPU case so the caller takes the no-providers code path
+        # (which lets fastembed apply its own default session options).
+        if kept == ["CPUExecutionProvider"]:
+            return []
+        return kept
 
     def _log_active_provider(self) -> None:
         """Best-effort introspection of which ORT provider actually got selected.
