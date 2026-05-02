@@ -277,6 +277,17 @@ pkill -f docgraph                              # *nix
 - Relying on `del db; gc.collect()` to release the Kuzu file lock on Windows → flaky. Call `db.close()` explicitly. After COPY FROM in particular, internal Kuzu refs survive plain GC.
 - Sending a request to a reasoning-model endpoint without `reasoning_effort: "none"` → empty content because the model burned all 150 tokens on `reasoning_content`. Fix is the flag, not bumping max_tokens.
 
+## Telecode integration (optional)
+
+[Telecode](../.telecode)'s system-tray UI can supervise `docgraph index`, `docgraph watch`, `docgraph serve`, `docgraph daemon start`, and one or more `docgraph mcp <path> --transport http` processes (one child per configured repo, ports = `base_port + i` via `DOCGRAPH_PORT` env). Each child's tools get bridged into telecode's proxy as managed tools (`docgraph_<slug>_<tool>` for multi-repo, `docgraph_<tool>` for single-repo) so a local LLM speaking through the proxy can call DocGraph without a separate MCP client.
+
+Implications when telecode owns the lifecycle:
+- **Don't run `docgraph watch` / `mcp` standalone against the same `.docgraph/`** — same lock-stomp risk as ever. Telecode's supervisor refuses to start Serve / MCP for a path while Watch holds it; if you want to manage a repo from the CLI, disable the corresponding telecode toggle first.
+- **Master toggles** in the telecode tray = full lifecycle (kill subprocesses + free ports + unregister bridge entries from the proxy registry). **Per-tool toggles** in the existing Managed list = injection-only.
+- **Auto-start.** `docgraph.{watch,serve,daemon,mcp}.auto_start: true` in telecode's `settings.json` brings the children up at `main.py:_post_init`.
+
+No code changes required on the docgraph side — telecode just spawns the existing CLI commands. Pointer: `<telecode>/docgraph/` package + the **DocGraph integration** section in `<telecode>/CLAUDE.md` for the full design.
+
 ## Known limitations / next-up
 
 - No SCIP / LSP integration → `CALLS` is name-based and will mis-resolve TS / Java overloads. Roadmap.

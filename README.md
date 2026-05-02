@@ -10,6 +10,10 @@ docgraph serve           # http://127.0.0.1:5500
 docgraph mcp             # stdio MCP for Cursor / Claude Desktop
 ```
 
+### GUI / process supervision (optional)
+
+Want a tray-based UI that runs and supervises `index`, `watch`, `serve`, `daemon`, and one-`docgraph mcp`-per-repo, and exposes the resulting MCP tools to a local LLM through a proxy? See [telecode](https://github.com/prithwirajs/telecode) — its DocGraph section auto-starts the subprocesses, tails their logs, and bridges every MCP tool into its managed-tools registry (`docgraph_<repo>_search`, `..._definition`, …). `mcp.paths` in telecode maps 1:1 to one `docgraph mcp` child per path.
+
 ## Why
 
 Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a vector DB + a separate UI app) or a thin keyword search. DocGraph keeps everything in one Python package backed by one file.
