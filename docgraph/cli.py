@@ -355,12 +355,21 @@ def wiki(
     llm = LLMClient(base)
     console.print(f"[cyan]Building wiki for {cfg.repo_root}…[/cyan]")
     console.print(f"  LLM: {base.format} @ {base.host}:{base.port} (model={base.model})")
-    pages: list = []
+
+    from docgraph.index import _bar
+    bar = _bar()
+    task_id: int | None = None
 
     def _progress(i: int, total: int, mod: str) -> None:
-        console.print(f"  [{i+1}/{total}] {mod}")
+        nonlocal task_id
+        if task_id is None:
+            task_id = bar.add_task("[cyan]wiki", total=total)
+        bar.update(task_id, completed=i, description=f"[cyan]wiki[/] {mod}")
 
-    pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress, force=force)
+    with bar:
+        pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress, force=force)
+        if task_id is not None:
+            bar.update(task_id, completed=len(pages) or bar.tasks[task_id].total)
     console.print(f"[green]Built {len(pages)} wiki page(s).[/green]")
     console.print(f"  Files at: {cfg.data_dir / 'wiki'}")
 

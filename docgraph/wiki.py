@@ -146,12 +146,14 @@ def _wiki_prompt(facts: dict) -> str:
     if facts.get("top_classes"):
         parts.append("- Top classes (by structural importance):")
         for c in facts["top_classes"][:6]:
-            doc = (c.get("doc") or "").splitlines()[0][:120]
+            lines = (c.get("doc") or "").splitlines()
+            doc = (lines[0][:120] if lines else "")
             parts.append(f"  - `{c.get('name','')}` ({c.get('file','')}:{c.get('line') or 0}) — {doc}")
     if facts.get("top_functions"):
         parts.append("- Top functions (by structural importance):")
         for f in facts["top_functions"][:8]:
-            doc = (f.get("doc") or "").splitlines()[0][:120]
+            lines = (f.get("doc") or "").splitlines()
+            doc = (lines[0][:120] if lines else "")
             parts.append(f"  - `{f.get('name','')}` ({f.get('file','')}:{f.get('line') or 0}) — {doc}")
     if facts.get("imports"):
         targets = ", ".join(sorted({i.get("target", "") for i in facts["imports"] if i.get("target")})[:10])
@@ -286,13 +288,15 @@ def _facts_to_markdown(facts: dict) -> str:
     if facts.get("top_classes"):
         out.append("## Key classes")
         for c in facts["top_classes"][:6]:
-            doc = (c.get("doc") or "").splitlines()[0][:160]
+            lines = (c.get("doc") or "").splitlines()
+            doc = (lines[0][:160] if lines else "")
             out.append(f"- **{c.get('name','')}** — `{c.get('file','')}:{c.get('line') or 0}`{(' — ' + doc) if doc else ''}")
         out.append("")
     if facts.get("top_functions"):
         out.append("## Key functions")
         for f in facts["top_functions"][:8]:
-            doc = (f.get("doc") or "").splitlines()[0][:160]
+            lines = (f.get("doc") or "").splitlines()
+            doc = (lines[0][:160] if lines else "")
             out.append(f"- **{f.get('name','')}** — `{f.get('file','')}:{f.get('line') or 0}`{(' — ' + doc) if doc else ''}")
         out.append("")
     if facts.get("importers"):
