@@ -85,6 +85,9 @@ def index(
              "'local-model'). Setting this turns the feature on; defaults below "
              "(port 1235, openai format) apply unless overridden.",
     ),
+    llm_host: str = typer.Option(
+        "localhost", "--llm-host", help="Local LLM server host (default: localhost). Ignored unless --llm-model is set.",
+    ),
     llm_port: int = typer.Option(
         1235, "--llm-port", help="Local LLM server port (default: 1235). Ignored unless --llm-model is set.",
     ),
@@ -108,6 +111,10 @@ def index(
         None, "--embed-batch-size",
         help="Batch size for embedding (default: 256). Lower it (e.g. 32) if "
              "you hit GPU device-hung errors with --gpu / DirectML.",
+    ),
+    workers: int = typer.Option(
+        0, "--workers",
+        help="Override the indexer worker count. 0 = auto (max(2, cpu_count - 1)).",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -135,9 +142,12 @@ def index(
     if llm_model is not None:
         cfg.llm_docstrings = True
         cfg.llm_model = llm_model
+        cfg.llm_host = llm_host
         cfg.llm_port = llm_port
         cfg.llm_format = llm_format
         cfg.llm_max_tokens = llm_max_tokens
+    if workers > 0:
+        cfg.workers = workers
     if gpu:
         cfg.gpu = True
         # DirectML can hang the GPU at the default batch size of 256 on

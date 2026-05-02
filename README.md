@@ -115,32 +115,55 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | `--full`, `-f` *(optional)* | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
 | `--repo PATH`, `-r PATH` *(optional)* | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
 | `--llm-model STR` *(optional)* | unset (off) — when set, defaults to `qwen3.6-35b` via `$DOCGRAPH_LLM_MODEL` | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
-| `--llm-port INT` *(optional)* | `1235` | Local LLM server port (host is always `localhost`). Ignored unless `--llm-model` is set. |
+| `--llm-host STR` *(optional)* | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Local LLM server host. Ignored unless `--llm-model` is set. |
+| `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. Ignored unless `--llm-model` is set. |
 | `--llm-format STR` *(optional)* | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`). Ignored unless `--llm-model` is set. |
 | `--llm-max-tokens INT` *(optional)* | `150` | Max tokens per LLM call. DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) fit a one-sentence answer in this budget; bump it for non-reasoning models if you want longer summaries. |
 | `--gpu` *(optional)* | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
+| `--workers INT` *(optional)* | `0` (auto) | Override the indexer worker count. `0` = auto = `max(2, cpu_count - 1)`. |
+| `--embed-batch-size INT` *(optional)* | `256` (`32` with `--gpu`) | Batch size for embedding. Lower it if you hit GPU device-hung errors with `--gpu` / DirectML. |
+| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
+
+### `docgraph host [path]`
+
+The unified server. One process serves N roots — web UI + JSON API + MCP HTTP all on the same port. **All flags are optional.**
+
+```bash
+docgraph host                                       # cwd as the only root
+docgraph host /repo-a                               # single-root sugar
+docgraph host --root /repo-a --root /repo-b        # multi-root
+docgraph host --root /repo-a --watch /repo-a      # also reindex on change
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root to register. With multiple roots, every API/MCP call accepts `root=<slug>` to pick. |
+| `--watch PATH` *(repeatable)* | — | Per-root watcher. Each value must match one of the registered `--root` entries. |
+| `--host STR` *(optional)* | `127.0.0.1` | Bind address |
+| `--port INT` *(optional)* | `5500` | Bind port |
+| `--debounce INT` *(optional)* | `500` | Watcher debounce (ms) |
 | `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 ### `docgraph watch [path]`
 
-Auto-reindex on file changes (Rust `notify` under the hood, debounced). Plain `watch` holds a writer lock — kill `serve` / `mcp` against the same DB first. With `--serve`, the watcher and the web UI run in **one process**, sharing the DB lock; the browser stays in sync via Server-Sent Events.
-
-**All flags are optional.**
+Auto-reindex on file changes (Rust `notify` under the hood, debounced). Now a thin alias for `docgraph host` with watchers — `docgraph watch <path>` is equivalent to a single-root host watching that path. `--serve` adds the web UI + JSON API + MCP HTTP. **All flags are optional.**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--root PATH`, `-r PATH` *(repeatable)* | — | Watch root. Single positional path is the sugar. |
 | `--debounce INT` *(optional)* | `500` | Debounce window in ms before reindex fires |
-| `--serve` *(optional)* | `false` | Also run the web UI + JSON API in the same process. UI auto-redraws after each reindex via `/api/events` SSE. |
+| `--serve` *(optional)* | `false` | Also run the web UI + JSON API + MCP HTTP. Equivalent to `docgraph host --watch <root>`. |
 | `--host STR` *(optional)* | `127.0.0.1` | Bind address (only with `--serve`) |
 | `--port INT` *(optional)* | `5500` | Bind port (only with `--serve`) |
 | `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 ### `docgraph serve [path]`
 
-Start the web UI + JSON API. **All flags are optional.**
+Thin alias for `docgraph host` with no watchers. **All flags are optional.**
 
 | Flag | Default | Description |
 |---|---|---|
+| `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root to register. Positional path is single-root sugar. |
 | `--host STR` *(optional)* | `127.0.0.1` (or `$DOCGRAPH_HOST`) | Bind address |
 | `--port INT` *(optional)* | `5500` (or `$DOCGRAPH_PORT`) | Bind port |
 | `--verbose`, `-v` *(optional)* | `false` | Verbose access logs |
@@ -149,10 +172,23 @@ Start the web UI + JSON API. **All flags are optional.**
 
 Run the Model Context Protocol server. **All flags are optional.**
 
+```bash
+docgraph mcp /myrepo --transport stdio              # editor stdio MCP. Probes a running host first.
+docgraph mcp /myrepo --transport stdio --standalone # explicit isolated mode (no host probe)
+docgraph mcp /myrepo --transport http               # standalone HTTP MCP (prefer `docgraph host` instead)
+```
+
 | Flag | Default | Description |
 |---|---|---|
-| `--transport STR` *(optional)* | `stdio` | `stdio` (for Cursor / Claude Desktop) or `http` (for web clients) |
+| `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root. Positional path is single-root sugar. |
+| `--transport STR` *(optional)* | `stdio` | `stdio` (for Cursor / Claude Desktop) or `http` |
+| `--host STR` *(optional)* | `127.0.0.1` | Bind address (HTTP transport, or stdio's host probe) |
+| `--port INT` *(optional)* | `5500` | Bind port (HTTP transport, or stdio's host probe) |
+| `--host-url STR` *(stdio only)* | — | Override the URL stdio probes for an existing host (default: `http://127.0.0.1:5500`) |
+| `--standalone` *(stdio only)* | `false` | Skip the host probe and run a single-process stdio server. |
 | `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
+
+**Strict-mode stdio.** With `--transport stdio` (default), `docgraph mcp <path>` first probes for a running `docgraph host`. If found, it acts as a thin proxy scoped to `<path>` (the LLM only sees that root in the schema). If `<path>` isn't a registered root on the host, it errors out — pass `--standalone` to bypass the probe and run isolated.
 
 ### `docgraph stats [path]`
 
