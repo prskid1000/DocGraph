@@ -243,6 +243,14 @@ def make_app(workspace: Workspace) -> FastAPI:
         full = bool((payload or {}).get("full", False))
 
         def _do() -> dict:
+            # Indexer.index_all() prints Rich progress bars to stdout. When
+            # docgraph host runs as a Windows subprocess with cp1252 stdout,
+            # the braille spinner glyphs crash the writer. Redirect to a
+            # devnull-equivalent for the duration of the call — the API
+            # caller doesn't see this output anyway; they get the stats
+            # dict in the JSON response.
+            import io, contextlib
+            sink = io.StringIO()
             writer = workspace.take_writer(slot.cfg.repo_root)
             try:
                 if full:
@@ -253,7 +261,8 @@ def make_app(workspace: Workspace) -> FastAPI:
                     providers=list(GPU_PROVIDERS) if slot.cfg.gpu else None,
                 )
                 indexer = Indexer(slot.cfg, writer, embedder=embedder)
-                stats = indexer.index_all(incremental=not full)
+                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                    stats = indexer.index_all(incremental=not full)
                 # Indexer.index_all(incremental=False) swaps `self.db` for a
                 # fresh GraphDB after wipe — close that one, not the original.
                 try:
