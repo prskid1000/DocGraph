@@ -151,8 +151,12 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
         p = payload or {}
         only = p.get("module") if isinstance(p, dict) else None
         force = bool(p.get("force")) if isinstance(p, dict) else False
-        pages = await asyncio.to_thread(build_wiki, cfg, _db(), None, only, None, force)
-        return {"built": len(pages), "modules": [p.module for p in pages]}
+        try:
+            depth = int(p.get("depth", 12)) if isinstance(p, dict) else 12
+        except (TypeError, ValueError):
+            depth = 12
+        pages = await asyncio.to_thread(build_wiki, cfg, _db(), None, only, None, force, depth)
+        return {"built": len(pages), "modules": [pg.module for pg in pages]}
 
     @app.post("/api/cypher")
     async def api_cypher(payload: dict):

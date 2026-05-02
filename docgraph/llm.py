@@ -32,9 +32,10 @@ DEFAULT_FORMAT = "openai"
 # the telecode proxy resolves into the right "no thinking" knobs per model
 # family (enable_thinking=false / thinking_budget_tokens=0 for Qwen3, etc.)
 # Without that flag, reasoning models eat 500-2000 tokens before the answer
-# and a 150-token budget comes back with empty content. The flag makes 150
-# enough for a one-sentence docstring; bump it via env / CLI if needed.
-DEFAULT_MAX_TOKENS = 150
+# and the budget comes back with empty content. With the flag, 512 is
+# comfortably enough for a one-sentence docstring (and gives slack for
+# verbose models). Wiki pages bump this to 4096 in `build_wiki`.
+DEFAULT_MAX_TOKENS = 512
 DEFAULT_TIMEOUT_SECS = 60
 
 

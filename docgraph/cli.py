@@ -93,8 +93,8 @@ def index(
         help="API format: 'openai' (Chat Completions) or 'anthropic' (Messages). Ignored unless --llm-model is set.",
     ),
     llm_max_tokens: int = typer.Option(
-        150, "--llm-max-tokens",
-        help="Max tokens per LLM call (default: 150). docgraph sends "
+        512, "--llm-max-tokens",
+        help="Max tokens per LLM call (default: 512). docgraph sends "
              "`reasoning_effort=none` so reasoning models (Qwen3 / "
              "DeepSeek-R1) skip thinking and fit in this budget.",
     ),
@@ -317,9 +317,16 @@ def wiki(
         help="API format: 'openai' or 'anthropic'. Same flag as `index`.",
     ),
     llm_max_tokens: int = typer.Option(
-        600, "--llm-max-tokens",
-        help="Max tokens per LLM call. Defaults higher than `index` (600 vs 150) "
-             "because wiki pages are 200-300 words.",
+        4096, "--llm-max-tokens",
+        help="Max tokens per LLM call (default 4096, vs 150 for `index` "
+             "docstrings). Generous so deeply-nested module pages have room.",
+    ),
+    depth: int = typer.Option(
+        12, "--depth", "-d",
+        help="Max directory levels to bucket files by. 1 = top-level only "
+             "(old behavior); 12 (default) = one page per leaf folder for "
+             "any reasonable repo. Ignored folders (node_modules/, .venv/, "
+             "ecosystem build dirs) are inherited from index time.",
     ),
     force: bool = typer.Option(
         False, "--force", "-f",
@@ -367,7 +374,7 @@ def wiki(
         bar.update(task_id, completed=i, description=f"[cyan]wiki[/] {mod}")
 
     with bar:
-        pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress, force=force)
+        pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress, force=force, depth=depth)
         if task_id is not None:
             bar.update(task_id, completed=len(pages) or bar.tasks[task_id].total)
     console.print(f"[green]Built {len(pages)} wiki page(s).[/green]")

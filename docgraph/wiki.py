@@ -43,18 +43,34 @@ def _slugify(s: str) -> str:
     return s.lower()[:120] or "module"
 
 
-def _module_groupings(db: GraphDB) -> list[dict]:
-    """Group all File rows by their top-level directory. Returns one entry
-    per group with its file paths."""
+def _module_groupings(db: GraphDB, depth: int = 12) -> list[dict]:
+    """Group all File rows by their containing directory, truncated to at
+    most `depth` directory levels. Each file lands in exactly one bucket.
+
+    `depth=1` = old behavior (top-level dir only). `depth=12` (default) is
+    effectively "use each file's actual containing directory" for any
+    repo shallower than 12 levels — i.e. one wiki page per leaf folder.
+
+    Files at the repo root land in the "(root)" bucket.
+
+    Ignored paths (`node_modules/`, `.venv/`, ecosystem build dirs, etc.)
+    are inherited from index time — they were never inserted as File nodes,
+    so they can't surface here.
+    """
     rows = db.fetch_all("MATCH (f:File) RETURN f.path AS path")
     groups: dict[str, list[str]] = defaultdict(list)
+    d = max(1, int(depth))
     for r in rows:
         path = (r.get("path") or "").replace("\\", "/")
         if not path:
             continue
-        # Top-level directory or the file itself if it's at the root
         parts = path.split("/")
-        key = parts[0] if len(parts) > 1 else "(root)"
+        if len(parts) <= 1:
+            key = "(root)"
+        else:
+            # All parts except the filename, capped at `depth` segments.
+            dirs = parts[:-1]
+            key = "/".join(dirs[:d])
         groups[key].append(path)
     out = []
     for k in sorted(groups):
@@ -183,24 +199,29 @@ def build_wiki(
     only_module: str | None = None,
     progress=None,
     force: bool = False,
+    depth: int = 12,
 ) -> list[WikiPage]:
-    """Generate (or re-generate) wiki pages for every top-level module.
-    Saves them to `<cfg.docgraph_dir>/wiki/`. Returns the list of pages.
+    """Generate (or re-generate) wiki pages for every module (one per
+    directory, capped at `depth` directory levels). Saves to
+    `<cfg.docgraph_dir>/wiki/`. Returns the list of pages.
 
     Resumable: modules whose `<slug>.md` already exists on disk with
     non-empty content are skipped (no LLM call). Pass `force=True` to
     rebuild every page from scratch.
+
+    `depth=1` = top-level dirs only (old behavior). `depth=12` (default)
+    = one page per leaf folder for any reasonable repo.
     """
     llm = llm or LLMClient(llm_config_from_env())
-    # Wiki pages are 200-300 words; docstring's 150-token default truncates
-    # them mid-sentence. Bump for the wiki call only — the original LLMConfig
-    # stays unchanged for any other caller of the same client.
-    if llm.cfg.max_tokens < 600:
-        llm.cfg.max_tokens = 600
+    # Wiki pages need much more headroom than docstrings (150 tokens).
+    # Bump for the wiki call only — the original LLMConfig stays unchanged
+    # for any other caller sharing the same client instance.
+    if llm.cfg.max_tokens < 4096:
+        llm.cfg.max_tokens = 4096
     wiki_dir = cfg.data_dir / WIKI_DIRNAME
     wiki_dir.mkdir(parents=True, exist_ok=True)
 
-    groups = _module_groupings(db)
+    groups = _module_groupings(db, depth=depth)
     if only_module:
         groups = [g for g in groups if g["module"] == only_module]
         if not groups:
