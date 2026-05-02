@@ -619,8 +619,15 @@
   <script type="module">
     const $ = (s) => document.querySelector(s);
     const $$ = (s) => Array.from(document.querySelectorAll(s));
-    const api = (path) => fetch(path).then(r => r.json());
-    const apiText = (path) => fetch(path).then(r => r.json());
+    const api = (path) => fetch(path).then(async r => {
+      if (!r.ok) {
+        let detail = "";
+        try { const j = await r.json(); detail = j && j.detail ? `: ${j.detail}` : ""; } catch (_) {}
+        throw new Error(`HTTP ${r.status}${detail}`);
+      }
+      return r.json();
+    });
+    const apiText = api;
     const el = (tag, props = {}, ...children) => {
       const e = document.createElement(tag);
       const { className, style, dataset, ...rest } = props;
@@ -1769,13 +1776,22 @@ function runCommunities(iters){
       body.innerHTML = "<div class='empty'>Loading…</div>";
       try {
         const data = await api(`/api/file_content?file=${encodeURIComponent(file)}`);
-        if (data && data.content != null) {
+        if (data && typeof data.content === "string" && data.content.length > 0) {
           renderCode(data.content, line);
+        } else if (data && data.content === "") {
+          body.innerHTML = "<div class='empty'>File is empty (0 bytes).</div>";
         } else {
-          body.innerHTML = "<div class='empty'>(empty)</div>";
+          body.innerHTML = "<div class='empty'>No content returned.</div>";
         }
       } catch (e) {
-        body.innerHTML = `<div class='empty'>Failed to load: ${e}</div>`;
+        const msg = String(e && e.message || e);
+        if (msg.includes("404")) {
+          body.innerHTML = `<div class='empty'>File no longer exists on disk. The graph may be stale — try <code>docgraph index</code> to refresh.<br><br><small>${escHtml(file)}</small></div>`;
+        } else if (msg.includes("403")) {
+          body.innerHTML = `<div class='empty'>Access denied (file is outside the indexed repo roots).</div>`;
+        } else {
+          body.innerHTML = `<div class='empty'>Failed to load: ${escHtml(msg)}</div>`;
+        }
       }
     }
 

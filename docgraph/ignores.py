@@ -22,31 +22,26 @@ from pathlib import Path
 # names are unambiguously dependency or cache dirs (no chance they contain user
 # source code), so we apply them regardless of the detected ecosystem.
 UNIVERSAL: list[str] = [
-    # VCS
-    ".git/",
-    ".svn/",
-    ".hg/",
-    ".bzr/",
-    # DocGraph itself
-    ".docgraph/",
+    # All dotfiles and dotfolders. Covers VCS (.git, .svn, .hg, .bzr), IDE
+    # (.idea, .vscode, .vs, .history), OS junk (.DS_Store, .AppleDouble),
+    # env files (.env, .env.*), tool caches (.venv, .tox, .pytest_cache,
+    # .mypy_cache, .ruff_cache, .gradle, .mvn, .terraform, .dart_tool,
+    # .elixir_ls, .metals, .bloop, .stack-work, .ipynb_checkpoints, .conda,
+    # .dvc, .Rproj.user, etc.), framework outputs (.next, .nuxt, .svelte-kit,
+    # .astro, .vercel, .netlify, .turbo, .parcel-cache, .angular, .ng,
+    # .nyc_output, .swiftpm, .cxx, .pub-cache, .flutter-plugins),
+    # Claude/agent state (.claude/, .docgraph/), and anything else dot-prefixed.
+    # `.gitignore`, `.docgraphignore`, `.cursorignore`, `.cursor/rules/*.mdc`
+    # are still picked up — Config and rules loaders read those by explicit
+    # path, not via the ignore spec.
+    ".*",
     # IDE / editor
-    ".idea/",
-    ".vscode/",
-    ".vs/",
-    ".history/",
     "*.iml",
     # OS junk
-    ".DS_Store",
-    ".AppleDouble",
-    ".Spotlight-V100",
-    ".Trashes",
     "Thumbs.db",
     "ehthumbs.db",
     "Desktop.ini",
     "$RECYCLE.BIN/",
-    # Env / secrets
-    ".env",
-    ".env.*",
     # Lockfiles
     "*.lock",
     "*.lockb",
@@ -125,84 +120,32 @@ UNIVERSAL: list[str] = [
     "*.min.css",
     "*.map",
     # --- Unambiguous dependency / cache directories (no chance of source) ---
+    # Non-dot-prefixed dep/cache dirs only — anything dot-prefixed is already
+    # covered by the `.*` rule above.
     # JS/TS
     "node_modules/",
     "bower_components/",
     "jspm_packages/",
     "web_modules/",
-    ".next/",
-    ".nuxt/",
-    ".output/",
-    ".svelte-kit/",
-    ".astro/",
-    ".docusaurus/",
-    ".vercel/",
-    ".netlify/",
-    ".serverless/",
-    ".turbo/",
-    ".parcel-cache/",
-    ".cache/",
-    ".angular/",
-    ".ng/",
-    ".nyc_output/",
     "*.tsbuildinfo",
     # Python
     "__pycache__/",
-    ".venv/",
     "venv/",
-    ".tox/",
-    ".nox/",
-    ".pytest_cache/",
-    ".mypy_cache/",
-    ".ruff_cache/",
-    ".pyre/",
-    ".pytype/",
     "*.egg-info/",
     "pip-wheel-metadata/",
     "htmlcov/",
-    # JVM
-    ".gradle/",
-    ".mvn/",
-    # .NET / Visual Studio
-    ".vs/",
     # Mobile / iOS / Android
     "DerivedData/",
-    ".swiftpm/",
     "xcuserdata/",
-    ".cxx/",
-    # Dart / Flutter
-    ".dart_tool/",
-    ".flutter-plugins",
-    ".flutter-plugins-dependencies",
-    ".pub-cache/",
-    # Elixir
-    ".elixir_ls/",
-    # Infrastructure
-    ".terraform/",
-    # JVM / Scala tooling
-    ".metals/",
-    ".bloop/",
-    ".bsp/",
     # Haskell
-    ".stack-work/",
     "dist-newstyle/",
     # Zig
     "zig-cache/",
     "zig-out/",
-    # R
-    ".Rproj.user/",
-    ".Rhistory",
-    ".RData",
-    ".Ruserdata",
     # Data science / ML experiment tracking
-    ".ipynb_checkpoints/",
     "mlruns/",
     "wandb/",
     "lightning_logs/",
-    ".dvc/cache/",
-    ".dvc/tmp/",
-    # Conda
-    ".conda/",
 ]
 
 
