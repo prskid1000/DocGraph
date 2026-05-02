@@ -228,6 +228,54 @@ def make_app(workspace: Workspace) -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    # --- Admin: in-process index ---
+    # Lets external supervisors (telecode) trigger a reindex without
+    # spawning a separate `docgraph index` subprocess that would fight
+    # the host for the Kuzu writer lock. The host briefly closes its RO
+    # handle for the affected root, takes the writer, runs an incremental
+    # (or full) index pass via `Indexer.index_all`, then reopens RO.
+    @app.post("/api/admin/index")
+    async def api_admin_index(payload: dict | None = None,
+                               root: RootSlug = DEFAULT):
+        from docgraph.index import Indexer
+        from docgraph.embed import Embedder, GPU_PROVIDERS
+        slot = _slot(root)
+        full = bool((payload or {}).get("full", False))
+
+        def _do() -> dict:
+            writer = workspace.take_writer(slot.cfg.repo_root)
+            try:
+                if full:
+                    writer.wipe(keep_schema=False)
+                writer.init_schema()
+                embedder = Embedder(
+                    slot.cfg.embedding_model,
+                    providers=list(GPU_PROVIDERS) if slot.cfg.gpu else None,
+                )
+                indexer = Indexer(slot.cfg, writer, embedder=embedder)
+                stats = indexer.index_all(incremental=not full)
+                # Indexer.index_all(incremental=False) swaps `self.db` for a
+                # fresh GraphDB after wipe — close that one, not the original.
+                try:
+                    indexer.db.close()
+                except Exception:
+                    pass
+                return stats
+            finally:
+                workspace.release_writer(slot.cfg.repo_root)
+
+        try:
+            stats = await asyncio.to_thread(_do)
+        except Exception as exc:
+            log.exception("api_admin_index failed: %s", exc)
+            raise HTTPException(500, f"index failed: {exc}") from exc
+        import time as _time
+        workspace.mark_indexed(slot.cfg.repo_root, _time.time())
+        broadcast(app, "reindex_done", {
+            "repo_slug": slot.slug, "ts": _time.time(), "events": -1,
+        })
+        return {"slug": slot.slug, "full": full, "stats": stats}
+
     @app.get("/api/file_content")
     async def api_file_content(file: str, root: RootSlug = DEFAULT):
         slot = _slot(root)

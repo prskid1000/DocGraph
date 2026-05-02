@@ -92,6 +92,43 @@ def test_file_map(client: TestClient):
     assert "entities" in body
 
 
+def test_admin_index_runs_in_process(tmp_path: Path):
+    """POST /api/admin/index should run an incremental reindex via the
+    workspace's writer-lock dance and return a stats dict. Telecode's
+    IndexRunner uses this when the host is alive to avoid spawning a
+    parallel subprocess that would fight Kuzu's per-file lock.
+
+    Uses an isolated tmp repo to avoid colliding with the session-scoped
+    `indexed` fixture's reader connection."""
+    import gc
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("def hello(): return 1\n", encoding="utf-8")
+    cfg = load_config(tmp_path)
+    # Build a baseline index so the workspace can open an RO handle.
+    from docgraph.db import GraphDB
+    from docgraph.embed import Embedder
+    from docgraph.index import Indexer
+    db = GraphDB(cfg.db_path, embedding_dim=384)
+    db.init_schema()
+    embedder = Embedder(cfg.embedding_model)
+    Indexer(cfg, db, embedder=embedder).index_all(incremental=False)
+    db.close()
+    gc.collect()
+
+    ws = Workspace([cfg])
+    app = make_app(ws)
+    try:
+        with TestClient(app) as c:
+            r = c.post("/api/admin/index", json={"full": False})
+            assert r.status_code == 200, r.text
+            body = r.json()
+            assert "stats" in body
+            assert body.get("full") is False
+            assert "slug" in body
+    finally:
+        ws.close()
+
+
 def test_neighborhood(client: TestClient):
     r = client.get("/api/neighborhood", params={"name": "Authenticator", "limit": 5})
     assert r.status_code == 200
