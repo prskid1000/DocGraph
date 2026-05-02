@@ -113,7 +113,7 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | Flag | Default | Description |
 |---|---|---|
 | `--full`, `-f` *(optional)* | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
-| `--repo PATH`, `-r PATH` *(optional)* | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
+| `--repo PATH`, `-r PATH` *(optional)* | — | Additional repo root to fold into **the same** `.docgraph/graph.kuzu` (monorepo / sibling-projects shape). Persisted in `.docgraph/repos.json`. This is *indexer-side* multi-root — different from the *host-side* multi-root model where each `--root` to `docgraph host` is an independent index. |
 | `--llm-model STR` *(optional)* | unset (off) — when set, defaults to `qwen3.6-35b` via `$DOCGRAPH_LLM_MODEL` | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
 | `--llm-host STR` *(optional)* | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Local LLM server host. Ignored unless `--llm-model` is set. |
 | `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. Ignored unless `--llm-model` is set. |
@@ -230,30 +230,6 @@ Delete `.docgraph/` for the repo (DB + cache + repos list).
 |---|---|---|
 | `--yes`, `-y` *(optional)* | `false` | Skip the confirmation prompt |
 
-### `docgraph daemon start`
-
-Start the optional embedding daemon. Holds a single warm ONNX session in memory; other docgraph processes on this host route their embed calls through it via loopback TCP, cutting cold start to a TCP round trip. Foreground by default; pass `--detach` to background it. Lock file at `~/.docgraph/daemon.lock`.
-
-**All flags are optional.**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--port INT` *(optional)* | `5577` | Loopback TCP port. 127.0.0.1 only — never exposed off-host. |
-| `--model STR` *(optional)* | `BAAI/bge-small-en-v1.5` | Embedding model. Must match what your repos were indexed with, or vectors won't be comparable. |
-| `--gpu` *(optional)* | `false` | Load the model on GPU via ONNX Runtime providers. Same opt-in install requirements as `docgraph index --gpu`. |
-| `--detach`, `-d` *(optional)* | `false` | Spawn a background process and return. POSIX: double-fork; Windows: `DETACHED_PROCESS`. |
-| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
-
-Embedder integration is automatic: if the daemon is running when an `Embedder.embed()` call is made, the call gets routed through it. If the daemon is down or the protocol fails, the embedder loads its own session as before — never fails the request.
-
-### `docgraph daemon stop`
-
-Stop the running daemon. Idempotent — no-op if nothing's running. No flags.
-
-### `docgraph daemon status`
-
-Print whether the daemon is running and its config (pid, port, model, gpu flag, start time). Exits non-zero if no daemon is running. No flags.
-
 ### `docgraph install-mcp [path]`
 
 Print a JSON snippet ready to paste into Cursor / Claude Desktop's MCP config. No flags.
@@ -290,11 +266,10 @@ Print version. No flags.
 
 | Var | Used by | Default |
 |---|---|---|
-| `DOCGRAPH_HOST` | `serve`, `mcp` (http) | `127.0.0.1` |
-| `DOCGRAPH_PORT` | `serve`, `mcp` (http) | `5500` |
+| `DOCGRAPH_HOST` | `host`, `serve`, `mcp` (http) | `127.0.0.1` |
+| `DOCGRAPH_PORT` | `host`, `serve`, `mcp` (http) | `5500` |
 | `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
-| `DOCGRAPH_GPU` | `index`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. |
-| `~/.docgraph/daemon.lock` | (lock file, not env var) | Auto-managed by `docgraph daemon start` / `stop`. Contains `host`, `port`, `pid`, `model`, `gpu`, `started`. Other docgraph processes consult this to discover the running daemon. Stale locks are cleaned automatically. |
+| `DOCGRAPH_GPU` | `index`, `host`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. If a DirectML / CUDA session is poisoned mid-inference (e.g. another process saturating the GPU), the embedder transparently falls back to CPU and continues. |
 | `DOCGRAPH_LLM_MODEL` | `index`, `wiki` | unset for `index` (off — setting this enables LLM-augmented docstrings); `qwen3.6-35b` for `wiki`. |
 | `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset. Set to `1`/`true` to enable explicitly (rarely needed; setting `DOCGRAPH_LLM_MODEL` is enough). |
 | `DOCGRAPH_LLM_HOST` | `index`, `wiki` | `localhost` |
@@ -373,17 +348,21 @@ then add an entry to `LANGUAGES` and a query to `TAGS_QUERIES` in `docgraph/pars
 
 ```
 docgraph/
-  cli.py          # typer entry: index / serve / mcp / stats / clear / install-mcp
-  config.py       # auto-detect repo root, .gitignore, .docgraphignore
-  parse.py        # tree-sitter universal parser (per-language tags queries)
-  index.py        # parallel pipeline + per-file delta updates
-  db.py           # Kuzu schema (5 node tables, 13 edge tables) + bulk insert
-  embed.py        # fastembed wrapper (BGE-small ONNX, 384-dim)
-  rank.py         # PageRank over call + reference + inheritance graph
-  retrieve.py     # hybrid retrieval (vector cosine + name boost + PageRank)
-  mcp_tools.py    # 15 MCP tools wrapping the retriever
-  server.py       # FastAPI: web UI + JSON API
-  ui/index.html   # single-page force-directed canvas viewer (zero deps)
+  cli.py             # typer entry: host (unified) / index / serve / mcp / watch / stats / wiki / clear / install-mcp
+  workspace.py       # registry of registered roots — one host serves N roots, dynamic enum from slugs
+  config.py          # auto-detect repo root, .gitignore, .docgraphignore
+  parse.py           # tree-sitter universal parser (per-language tags queries)
+  index.py           # parallel pipeline + per-file delta updates
+  db.py              # Kuzu schema (5 node tables, 13 edge tables) + bulk insert
+  embed.py           # fastembed wrapper (BGE-small ONNX, 384-dim) + GPU→CPU recovery on ORT Fail
+  rank.py            # PageRank over call + reference + inheritance graph
+  retrieve.py        # hybrid retrieval (vector cosine + name boost + PageRank)
+  mcp_tools.py       # 15 MCP tools + list_roots, all carrying a closed-enum `root` parameter
+  mcp_stdio_proxy.py # strict stdio↔HTTP proxy for editors (Cursor, Claude Desktop)
+  server.py          # FastAPI host: web UI + JSON API + SSE + FastMCP mounted at /mcp
+  watch.py           # per-root async awatch tasks; one workspace-wide reindex semaphore
+  wiki.py            # LLM-grounded module wiki (per-leaf-folder pages, resumable)
+  ui/index.html      # single-page force-directed canvas viewer (zero deps)
 ```
 
 Data lives at `<repo>/.docgraph/`:
@@ -400,11 +379,16 @@ Data lives at `<repo>/.docgraph/`:
 6. Re-resolve only edges that touch a changed file; edges fully inside the unchanged set stay untouched.
 7. Recompute `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, and PageRank — they're global and cheap.
 
-## JSON API (when running `docgraph serve`)
+## JSON API (when running `docgraph host`)
+
+Every retriever route accepts a `root=<slug>` query parameter. The slug is one of those returned by `GET /api/roots`; on a single-root host it has one value and is the default, so callers can omit it.
 
 | Endpoint | Notes |
 |---|---|
 | `GET /` | The web UI |
+| `GET /api/roots` | Discover registered roots: `[{slug, path, default, watching, last_indexed_at}, …]`. The closed `root` enum on every other route is built from this list at host startup. |
+| `POST /api/admin/index` (`{full?: bool}`) | In-process incremental (or `full=true`) reindex via the workspace's writer-lock dance. Lets external supervisors trigger a reindex without spawning a parallel `docgraph index` subprocess that would fight Kuzu's exclusive writer lock. Response is `{slug, full, stats, log}` where `log` is the captured Rich progress transcript. |
+| `POST /mcp` (and friends) | Mounted FastMCP HTTP transport — same tool surface as `docgraph mcp --transport http`, just on the host's port instead of a separate process. |
 | `GET /api/search?q=...&kind=...&limit=10` | Same as the MCP tool |
 | `GET /api/definition?name=...&file=...` | |
 | `GET /api/references?name=...` | |
@@ -437,7 +421,7 @@ Data lives at `<repo>/.docgraph/`:
 | Runs fully local | ✅ | ✅ | ✅ | partial (cloud-augmented) | ❌ (cloud only) | ✅ (self-hosted) | ✅ |
 | Embedded store | Kuzu (graph + vectors) | KuzuDB / LadybugDB | SQLite | proprietary | cloud | Postgres + cloud index | LanceDB / SQLite |
 | Languages day 1 | 17 (tree-sitter) | many | 66 | many | many | many (SCIP) | many (tree-sitter) |
-| Live graph UI | force-directed + Sigma WebGL | Mermaid (static) | ❌ | ❌ | ❌ | partial (call-graph view) | ❌ |
+| Live graph UI | force-directed canvas + Web Worker physics | Mermaid (static) | ❌ | ❌ | ❌ | partial (call-graph view) | ❌ |
 | Per-file incremental | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Personalized PageRank | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Cross-encoder rerank | ✅ (opt-in) | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
@@ -454,13 +438,20 @@ Data lives at `<repo>/.docgraph/`:
 
 > Aider, Bloop, OpenGrok, and CodeQL are adjacent but solve different problems (in-terminal pair-programming, semantic code search without graph, security analysis) and are omitted to keep the table focused on local code-graph tools.
 
-## Multi-repo
+## Multi-root
+
+A single `docgraph host` process can serve any number of independently-indexed repos at once. Each registered root has its own `.docgraph/graph.kuzu`; the host opens a per-root read-only connection at startup, and every MCP tool / JSON route accepts a closed-enum `root=<slug>` argument so the LLM picks the right one per call.
 
 ```bash
-docgraph index --repo /path/to/repo-b --repo /path/to/repo-c
-docgraph watch       # picks up all repos automatically (persisted in .docgraph/repos.json)
-docgraph serve
+docgraph index /path/to/repo-a                           # build the index for each repo first
+docgraph index /path/to/repo-b
+docgraph host --root /path/to/repo-a --root /path/to/repo-b   # one process, one port
+docgraph host --root /path/to/repo-a --watch /path/to/repo-a  # also reindex repo-a on file change
 ```
+
+The workspace is **immutable for a host's lifetime** — adding or removing a root requires a host restart. That's deliberate: it keeps the closed-enum schema valid for the entire process and avoids hot-reload races.
+
+A different concept lives one layer down: `docgraph index --repo` lets the **indexer** walk multiple sibling paths into **one** `.docgraph/graph.kuzu` (useful for monorepos). The two shapes can coexist — a host can register one root whose Config carries `extra_roots`.
 
 In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/src/foo.py`) so they stay unique. Cross-repo `IMPORTS` resolve naturally through the existing fuzzy import matcher.
 

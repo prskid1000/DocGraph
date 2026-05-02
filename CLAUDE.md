@@ -27,7 +27,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/config.py` | Auto-detects repo root + ecosystems, respects `.gitignore` + `.docgraphignore`. Single-root indexer-side multi-root via `Config.extra_roots` (different concept: indexes multiple paths into one DB). Persisted in `.docgraph/repos.json`. The host-level multi-root abstraction lives in `workspace.py`. |
 | `docgraph/ignores.py` | Universal ignore patterns + per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Swift / Ruby / Dart / Elixir / Scala / PHP / Terraform / Unity / Go). Universal layer also covers Jupyter / MLflow / wandb / DVC / Haskell / Zig / R / Scala tooling. Inline string lists, no template files. |
 | `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. Method qname rescoping is keyed on `id(node)` not on the original qname string — methods sharing a base qname (`file::area` for both `Square.area` and `Circle.area`) used to collide and remap to one final qname. |
-| `docgraph/daemon.py` | Optional cross-CLI embedding daemon. Length-prefixed JSON on loopback TCP (default port 5577). `is_running()` checks the lock file at `~/.docgraph/daemon.lock` and pings the recorded port — stale locks (PID dead, port silent) are auto-cleared. `Embedder.embed()` consults `embed_via_daemon()` before loading its own ONNX session; daemon-side `_serve_one()` calls `embedder._ensure().embed(...)` directly to avoid recursing back through the wrapper. |
+| `docgraph/daemon.py` | Optional cross-CLI embedding daemon, kept as an internal optimization only — there is **no** `docgraph daemon` CLI command anymore (the host owns the embedder pool, so the daemon was redundant). The TCP shape (length-prefixed JSON on loopback, default 5577) is unchanged. `Embedder.embed()` consults `embed_via_daemon()` before loading its own ONNX session; daemon-side `_serve_one()` calls `embedder._ensure().embed(...)` directly to avoid recursing back through the wrapper. |
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
 | `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
 | `docgraph/db.py` | Kuzu schema + bulk insert helpers. Edges go through `COPY FROM arrow (from='X', to='Y')` (pyarrow-staged) — 10-50× faster than the old MATCH+CREATE. Default `insert_edges` batch is 10k rows. The `_known_ids` cache filters dangling-endpoint rows before COPY (which hard-errors on missing PKs, vs. the old silent-drop). `close()` is explicit + `__del__` calls it — needed because Windows + Kuzu's COPY internals don't release the file lock on `del` alone. |
@@ -43,7 +43,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. `watch_workspace(workspace, roots)` runs N async `_watch_one` tasks (one per root) on the current event loop. `watch_and_serve_workspace` does the same but also boots uvicorn for the host app. A workspace-wide `asyncio.Semaphore(1)` serializes reindexes across roots so two CPU-bound passes don't fight. Each per-root task takes a writer, runs `Indexer.index_all(incremental=True)` via `to_thread()`, releases the writer (which reopens the workspace's RO slot), and broadcasts SSE `reindex_done {repo_slug, ts, events}`. |
 | `docgraph/mcp_tools.py` | 15 retriever-backed tools + `list_roots`. Each retriever-backed tool gets a `root: RootSlug = DEFAULT` argument typed as a dynamic `(str, Enum)` built at `make_mcp` time from the workspace's slugs. **No `from __future__ import annotations` here** — Pydantic's lazy `get_type_hints` can't resolve the closure-local `RootSlug` if annotations are stringified. |
 | `docgraph/mcp_stdio_proxy.py` | Strict stdio↔HTTP proxy for editors (Cursor, Claude Desktop). Probes `http://127.0.0.1:5500/api/roots`; if a host is up, exposes a stdio surface scoped to the editor's `<path>` (refuses if that path isn't a registered root — config-consistency over silent duplication). If no host is reachable, exits with a clear "start a host first" error. `--standalone` is the explicit opt-out for "I don't want host sharing". |
-| `docgraph/server.py` | FastAPI host: web UI + JSON API + SSE `/api/events`. `make_app(workspace)` builds a dynamic `RootSlug` enum from the workspace's slugs and threads it through every route as a closed-enum `root` query param. New: `GET /api/roots` for clients to discover registered roots. **No `from __future__ import annotations`** — same enum-evaluation concern as `mcp_tools.py`. |
+| `docgraph/server.py` | FastAPI host: web UI + JSON API + SSE `/api/events` + FastMCP mounted at `/mcp` (single port, lifespan chained — uvicorn config must use `lifespan="on"` or the `/mcp` route 500s). `make_app(workspace)` builds a dynamic `RootSlug` enum from the workspace's slugs and threads it through every route as a closed-enum `root` query param. Discovery / admin: `GET /api/roots` (lists registered roots), `POST /api/admin/index` (in-process incremental or `{full:true}` reindex via `Workspace.take_writer / release_writer`; lets external supervisors avoid Kuzu's exclusive writer lock). **No `from __future__ import annotations`** — same enum-evaluation concern as `mcp_tools.py`. |
 | `docgraph/ui/index.html` | Single-page graph viewer. Canvas 2D only — Sigma.js / WebGL was removed in 2.1.0 because it was unreliable on first paint. Performance comes from a Web Worker that runs **ForceAtlas2-lite** (linear repulsion, degree-weighted, on a spatial grid) + **label-propagation community detection**. Worker bootstrap is an inline `Blob([WORKER_SRC])`-backed Worker — no esm.sh, no CDN. Render batches edges/nodes by color and viewport-culls in world coords. New tabs: Processes (entry-point → call chains via `/api/processes`) and Wiki (LLM module pages via `/api/wiki/*`). Color-mode toggle (kind / community) lives in the Filters tab. |
 
 Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB), `<repo>/.docgraph/cache.json` (per-file `{hash, entities, edges}`), `<repo>/.docgraph/repos.json` (multi-repo list).
@@ -88,7 +88,7 @@ If you change the parse output shape, update the cache writer **and** the cache 
 ## Testing
 
 ```bash
-.venv/Scripts/python -m pytest                 # ~65s, 178 tests (incl. daemon)
+.venv/Scripts/python -m pytest                 # ~70s, ~295 tests
 ```
 
 Tests in `tests/`:
@@ -104,6 +104,9 @@ Tests in `tests/`:
 - `test_llm.py` — LLM client unit tests (urllib mocked); covers OpenAI + Anthropic + auth headers + malformed-response fallback
 - `test_llm_live.py` — **Optional live integration.** Probes `localhost:1235/v1/models` for `qwen3.6-35b`; auto-skips if either is missing. Override host/port/model via `DOCGRAPH_LLM_TEST_*` env vars.
 - `test_daemon.py` — Embedding daemon: ping / embed roundtrip / stale-lock cleanup. Spins up `run_daemon` in a thread on a free port with a sandboxed `LOCK_PATH`, so it never touches the user's real `~/.docgraph/daemon.lock`.
+- `test_workspace.py` — `Workspace` registry: 4-step `resolve()`, default-slug fallback, slug listing, `take_writer` / `release_writer` round-trip and the read-only reopen.
+- `test_cli_flags.py` — Locks every CLI flag telecode passes (`--workers`, `--gpu`, `--llm-host`, `--llm-port`, `--llm-format`, `--llm-max-tokens`, `--llm-model`). Parametrized so a removed flag fails loudly.
+- `test_embed_fallback.py` — GPU→CPU recovery in `Embedder.embed()`: simulates a DirectML `DXGI_ERROR_DEVICE_HUNG` failure mid-inference, verifies the cached session is dropped and a CPU retry succeeds. Also covers "unrelated errors propagate" and "no fallback when already on CPU".
 
 **Kuzu writer-visibility gotcha:** a `kuzu.Connection` opened with `read_only=False` doesn't see its own writes via subsequent `fetch_all` queries in the same process. The conftest fixture (and `test_indexer._index_and_reopen_readonly`) close the writer and reopen read-only after indexing. If you write a new test and reads come back empty, that's the cause.
 
@@ -234,9 +237,9 @@ Adding a language: drop a regex into `_SCOPE_BOUNDARY_PATTERNS` keyed by the sam
 - `cfg.gpu` is forwarded to every `Embedder(...)` site: `Indexer`, `make_app`, `make_mcp`, `watch_repo`, `watch_and_serve`, `docs.add_doc`. So `--gpu` on `index` doesn't help live search unless the same flag is set when launching `serve` / `mcp` — env var `DOCGRAPH_GPU=1` is the cleanest way to make it sticky across processes.
 - The reranker (`rerank.py`) doesn't read `cfg.gpu` — fastembed's cross-encoder picks providers from its default. Could be wired through later if the 33 MB Jina model becomes a bottleneck.
 
-## UI engines
+## UI engine
 
-Canvas (default, O(N²) force) and Sigma.js (WebGL, lazy-loaded from esm.sh). Auto-engages > 2 k nodes; manual toggle button. No build step.
+Canvas 2D only — Sigma.js / WebGL was removed in 2.1.0 (unreliable on first paint, esm.sh dependency, brittle interaction with the worker physics). The current viewer pairs canvas rendering with a Web Worker running ForceAtlas2-lite on a spatial grid + label-propagation community detection; the worker is bootstrapped from an inline `Blob([WORKER_SRC])` so there's no CDN dependency. Render batches by color and viewport-culls in world coords. No build step.
 
 ## Coding conventions
 
@@ -295,6 +298,8 @@ pkill -f docgraph                                             # *nix
 - Sending a request to a reasoning-model endpoint without `reasoning_effort: "none"` → empty content because the model burned all 150 tokens on `reasoning_content`. Fix is the flag, not bumping max_tokens.
 - Using `from __future__ import annotations` in `mcp_tools.py` or `server.py` → Pydantic's lazy `get_type_hints` can't resolve the closure-local `RootSlug` enum and tools/routes blow up at request time with "TypeAdapter is not fully defined". Both files deliberately avoid the future import.
 - `str(enum_member)` on a `(str, Enum)` subclass returns `'RootSlug.X'`, not `'x'`. Use `member.value` when looking the slug up in the workspace.
+- DirectML embeddings can return `DXGI_ERROR_DEVICE_HUNG` (0x887A0006) mid-inference when another process (e.g. llama.cpp running a 30B+ model with `n_gpu_layers > 0`) is saturating the GPU. The ORT session is **poisoned** after that — every subsequent `model.embed(...)` returns the same Fail. `Embedder.embed()` catches ORT-flavored failures, drops the cached session from `_MODEL_CACHE`, clears `self.providers`, and retries on CPU. Don't remove the recovery wrapper without a replacement; without it `/api/admin/index` 500s on every call once the GPU's been hung.
+- Mounting FastMCP into the FastAPI host without setting `lifespan="on"` in the uvicorn config → `/mcp` returns 500 on every request because FastMCP's streamable-HTTP session manager never initializes. The chained lifespan in `make_app` runs both FastAPI startup and FastMCP startup; uvicorn must call it.
 
 ## Telecode integration
 
