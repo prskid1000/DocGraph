@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections import deque
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -113,11 +114,63 @@ class Config:
         return self.repo_root / logical_rel
 
 
+_DESCENT_MAX_DEPTH = 5
+_DESCENT_SKIP = {"node_modules", "venv", "__pycache__", "target", "build", "dist", "out"}
+
+
+def _descend_for_docgraph(start: Path) -> Path | None:
+    """BFS downward from `start` looking for a `.docgraph/` directory. Returns
+    the parent of the shallowest match (so launching Claude in a workspace
+    folder one level above the project still works). Skips dot-folders and
+    common build/cache dirs to keep the scan fast on large trees. Bounded to
+    depth 5; deeper layouts should pass an explicit path."""
+    queue: deque[tuple[Path, int]] = deque([(start, 0)])
+    while queue:
+        d, depth = queue.popleft()
+        if (d / ".docgraph").is_dir():
+            return d
+        if depth >= _DESCENT_MAX_DEPTH:
+            continue
+        try:
+            entries = list(os.scandir(d))
+        except OSError:
+            continue
+        for entry in entries:
+            try:
+                if not entry.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            name = entry.name
+            if name.startswith(".") or name in _DESCENT_SKIP:
+                continue
+            queue.append((Path(entry.path), depth + 1))
+    return None
+
+
 def find_repo_root(start: Path | None = None) -> Path:
+    """Resolve the repo root anchored on `.docgraph/`.
+
+    1. Walk UP from `start` (default cwd); first ancestor with `.docgraph/`
+       wins. Handles "ran from a subdirectory of an indexed project".
+    2. If nothing upward, BFS DOWN from `start` (bounded depth 5) so launching
+       Claude from a workspace folder one level above the project still finds
+       it.
+    3. Otherwise fall back to `start` itself — first `docgraph index` will
+       create `.docgraph/` here.
+
+    Note: deliberately does NOT use `.git/` as a marker. In a monorepo the
+    `.git/` lives at the top while each sub-project owns its own `.docgraph/`;
+    matching on `.git/` would anchor on the monorepo root and look at the
+    wrong index.
+    """
     cur = (start or Path.cwd()).resolve()
     for parent in [cur, *cur.parents]:
-        if (parent / ".git").exists():
+        if (parent / ".docgraph").is_dir():
             return parent
+    found = _descend_for_docgraph(cur)
+    if found is not None:
+        return found
     return cur
 
 
