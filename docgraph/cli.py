@@ -321,6 +321,11 @@ def wiki(
         help="Max tokens per LLM call. Defaults higher than `index` (600 vs 150) "
              "because wiki pages are 200-300 words.",
     ),
+    force: bool = typer.Option(
+        False, "--force", "-f",
+        help="Rebuild every page from scratch. Default behavior is resumable: "
+             "modules whose page already exists on disk are skipped (no LLM call).",
+    ),
 ) -> None:
     """Generate (or rebuild) the LLM-grounded wiki for the indexed repo.
 
@@ -355,7 +360,7 @@ def wiki(
     def _progress(i: int, total: int, mod: str) -> None:
         console.print(f"  [{i+1}/{total}] {mod}")
 
-    pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress)
+    pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress, force=force)
     console.print(f"[green]Built {len(pages)} wiki page(s).[/green]")
     console.print(f"  Files at: {cfg.data_dir / 'wiki'}")
 

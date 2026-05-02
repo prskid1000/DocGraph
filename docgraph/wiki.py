@@ -180,9 +180,15 @@ def build_wiki(
     llm: LLMClient | None = None,
     only_module: str | None = None,
     progress=None,
+    force: bool = False,
 ) -> list[WikiPage]:
     """Generate (or re-generate) wiki pages for every top-level module.
-    Saves them to `<cfg.docgraph_dir>/wiki/`. Returns the list of pages."""
+    Saves them to `<cfg.docgraph_dir>/wiki/`. Returns the list of pages.
+
+    Resumable: modules whose `<slug>.md` already exists on disk with
+    non-empty content are skipped (no LLM call). Pass `force=True` to
+    rebuild every page from scratch.
+    """
     llm = llm or LLMClient(llm_config_from_env())
     # Wiki pages are 200-300 words; docstring's 150-token default truncates
     # them mid-sentence. Bump for the wiki call only — the original LLMConfig
@@ -202,6 +208,30 @@ def build_wiki(
     pages: list[WikiPage] = []
     for i, g in enumerate(groups):
         module = g["module"]
+        slug = _slugify(module)
+        title = module if module != "(root)" else "Repository root"
+        body_path = wiki_dir / f"{slug}.md"
+        facts_path = wiki_dir / f"{slug}.facts.json"
+
+        # Resume: existing non-empty page → reuse without re-LLMing.
+        if not force and body_path.exists() and body_path.stat().st_size > 0:
+            try:
+                body = body_path.read_text(encoding="utf-8")
+                facts = json.loads(facts_path.read_text(encoding="utf-8")) if facts_path.exists() else {"module": module, "file_count": len(g["files"])}
+                summary = body.splitlines()[0][:200] if body.strip() else f"{len(g['files'])} files in {module}."
+                pages.append(WikiPage(
+                    slug=slug, title=title, module=module,
+                    summary=summary, body_md=body, facts=facts,
+                ))
+                if progress:
+                    try:
+                        progress(i, len(groups), f"{module} (cached)")
+                    except Exception:
+                        pass
+                continue
+            except Exception as e:
+                log.debug("wiki: failed to reuse %s, regenerating: %s", slug, e)
+
         if progress:
             try:
                 progress(i, len(groups), module)
@@ -216,24 +246,34 @@ def build_wiki(
             summary = f"{facts['file_count']} files in {module}."
         else:
             summary = body.splitlines()[0][:200]
-        slug = _slugify(module)
-        title = module if module != "(root)" else "Repository root"
         page = WikiPage(
             slug=slug, title=title, module=module,
             summary=summary, body_md=body, facts=facts,
         )
-        (wiki_dir / f"{slug}.md").write_text(body, encoding="utf-8")
-        (wiki_dir / f"{slug}.facts.json").write_text(
+        body_path.write_text(body, encoding="utf-8")
+        facts_path.write_text(
             json.dumps(facts, indent=2, default=str), encoding="utf-8"
         )
         pages.append(page)
 
-    # Index file
-    index_payload = [
-        {"slug": p.slug, "title": p.title, "module": p.module, "summary": p.summary}
+    # Index file. Merge with any existing entries when scoped to a single
+    # module so a `--module X` rebuild doesn't wipe other pages from the index.
+    new_entries = {
+        p.slug: {"slug": p.slug, "title": p.title, "module": p.module, "summary": p.summary}
         for p in pages
-    ]
-    (wiki_dir / INDEX_FILE).write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
+    }
+    index_path = wiki_dir / INDEX_FILE
+    if only_module and index_path.exists():
+        try:
+            existing = json.loads(index_path.read_text(encoding="utf-8"))
+            merged = {e["slug"]: e for e in existing if isinstance(e, dict) and e.get("slug")}
+            merged.update(new_entries)
+            index_payload = list(merged.values())
+        except Exception:
+            index_payload = list(new_entries.values())
+    else:
+        index_payload = list(new_entries.values())
+    index_path.write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
     return pages
 
 

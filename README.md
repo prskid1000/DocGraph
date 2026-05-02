@@ -155,6 +155,8 @@ Print entity + edge counts. No flags.
 
 Generate (or rebuild) an LLM-grounded wiki for the indexed repo. For every top-level module DocGraph pulls a fact sheet from Kuzu (top classes / functions by PageRank, importers, tests) and asks a local LLM to write a 200-300 word page. Pages land in `.docgraph/wiki/<slug>.md` and are surfaced in the Web UI's **Wiki** tab. If no LLM is reachable, the page falls back to a plain rendering of the facts so the wiki is never blank.
 
+**Resumable.** If the run is interrupted (Ctrl-C, network blip, OOM), just run `docgraph wiki` again — modules whose page is already on disk are skipped without an LLM call. Pass `--force` to rebuild every page from scratch.
+
 Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_*` env vars are honored too.
 
 **All flags are optional.** Like `docgraph index`'s LLM-docstring path, the only one you typically pass is `--llm-model` (most local servers reject unknown model names). Everything else has a working default.
@@ -167,13 +169,14 @@ Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_
 | `--llm-model STR` *(optional)* | `local-model` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects (e.g. `qwen3.6-35b`). Pass this if your server requires a specific name. |
 | `--llm-format STR` *(optional)* | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
 | `--llm-max-tokens INT` *(optional)* | `600` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Higher than `index`'s 150 because wiki pages are longer. |
+| `--force`, `-f` *(optional)* | off | Rebuild every page from scratch. Default is resumable: skip modules whose page is already on disk. |
 
 API equivalents (used by the Web UI's "Build wiki" button):
 
 ```
-GET  /api/wiki/list                  # list of pages [{slug, title, module, summary}]
-GET  /api/wiki/page?slug=<slug>      # full Markdown body + facts JSON
-POST /api/wiki/build  {"module": "X"?}  # rebuild all (or one module). Same LLM config as the CLI; uses DOCGRAPH_LLM_* env vars.
+GET  /api/wiki/list                                # list of pages [{slug, title, module, summary}]
+GET  /api/wiki/page?slug=<slug>                    # full Markdown body + facts JSON
+POST /api/wiki/build  {"module": "X"?, "force": true?}  # rebuild all (or one module). Resumable by default; pass force=true to redo every page.
 ```
 
 ### `docgraph clear [path]`
@@ -380,7 +383,7 @@ Data lives at `<repo>/.docgraph/`:
 | `GET /api/processes?limit=&max_chain_len=` | Detected entry-point → call chains. Used by the **Processes** tab. |
 | `GET /api/wiki/list` | List of generated wiki pages (`{slug, title, module, summary}`). |
 | `GET /api/wiki/page?slug=...` | Markdown body + facts JSON for one page. |
-| `POST /api/wiki/build` (`{module?: "X"}`) | Rebuild all (or one module's) wiki page. Uses the same LLM config as `docgraph index --llm-model` via `DOCGRAPH_LLM_*` env vars. |
+| `POST /api/wiki/build` (`{module?: "X", force?: true}`) | Rebuild all (or one module's) wiki page. Resumable: skips modules already on disk unless `force=true`. Uses the same LLM config as `docgraph index --llm-model` via `DOCGRAPH_LLM_*` env vars. |
 | `GET /api/events` | Server-Sent Events stream. Emits `reindex_done` after every reindex when running under `docgraph watch --serve`; the bundled UI uses it to auto-refresh. Sends keepalive comments every 15 s. |
 
 ## Comparison

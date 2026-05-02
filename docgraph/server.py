@@ -148,8 +148,10 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
     @app.post("/api/wiki/build")
     async def api_wiki_build(payload: dict | None = None):
         from docgraph.wiki import build_wiki
-        only = (payload or {}).get("module") if isinstance(payload, dict) else None
-        pages = await asyncio.to_thread(build_wiki, cfg, _db(), None, only)
+        p = payload or {}
+        only = p.get("module") if isinstance(p, dict) else None
+        force = bool(p.get("force")) if isinstance(p, dict) else False
+        pages = await asyncio.to_thread(build_wiki, cfg, _db(), None, only, None, force)
         return {"built": len(pages), "modules": [p.module for p in pages]}
 
     @app.post("/api/cypher")
