@@ -93,6 +93,54 @@ class LLMClient:
             log.debug(f"LLM unexpected error for {name}: {e}")
             return ""
 
+    def chat(self, prompt: str) -> str:
+        """Multi-paragraph completion. Unlike `summarize`, returns the FULL
+        response body — used by callers like `wiki` that need prose, not a
+        one-liner. No `_clean` truncation."""
+        try:
+            if self.cfg.format == "anthropic":
+                return self._call_anthropic_raw(prompt)
+            return self._call_openai_raw(prompt)
+        except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
+            log.debug("LLM chat call failed: %s", e)
+            return ""
+        except Exception as e:  # noqa: BLE001
+            log.debug("LLM chat unexpected error: %s", e)
+            return ""
+
+    def _call_openai_raw(self, prompt: str) -> str:
+        """OpenAI Chat Completions, full content returned (no `_clean`)."""
+        payload = {
+            "model": self.cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.cfg.max_tokens,
+            "temperature": 0.2,
+            "stream": False,
+            "reasoning_effort": "none",
+        }
+        data = self._post(self.cfg.endpoint, payload)
+        try:
+            return (data["choices"][0]["message"]["content"] or "").strip()
+        except (KeyError, IndexError, TypeError):
+            return ""
+
+    def _call_anthropic_raw(self, prompt: str) -> str:
+        """Anthropic Messages, full content returned (no `_clean`)."""
+        payload = {
+            "model": self.cfg.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": self.cfg.max_tokens,
+            "temperature": 0.2,
+        }
+        data = self._post(self.cfg.endpoint, payload)
+        try:
+            for b in data.get("content", []):
+                if b.get("type") == "text":
+                    return (b.get("text", "") or "").strip()
+            return ""
+        except (KeyError, IndexError, TypeError):
+            return ""
+
     def _call_openai(self, prompt: str) -> str:
         payload = {
             "model": self.cfg.model,

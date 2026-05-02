@@ -215,15 +215,22 @@ def build_wiki(
         body_path = wiki_dir / f"{slug}.md"
         facts_path = wiki_dir / f"{slug}.facts.json"
 
-        # Resume: existing non-empty page → reuse without re-LLMing.
+        # Resume: reuse existing page only if it's non-empty AFTER strip.
+        # Whitespace-only files (the old `_clean`-truncation bug) must be
+        # treated as missing and regenerated.
+        existing_body = ""
         if not force and body_path.exists() and body_path.stat().st_size > 0:
             try:
-                body = body_path.read_text(encoding="utf-8")
+                existing_body = body_path.read_text(encoding="utf-8")
+            except Exception:
+                existing_body = ""
+        if not force and existing_body.strip():
+            try:
                 facts = json.loads(facts_path.read_text(encoding="utf-8")) if facts_path.exists() else {"module": module, "file_count": len(g["files"])}
-                summary = body.splitlines()[0][:200] if body.strip() else f"{len(g['files'])} files in {module}."
+                summary = existing_body.strip().splitlines()[0][:200]
                 pages.append(WikiPage(
                     slug=slug, title=title, module=module,
-                    summary=summary, body_md=body, facts=facts,
+                    summary=summary, body_md=existing_body, facts=facts,
                 ))
                 if progress:
                     try:
@@ -241,13 +248,16 @@ def build_wiki(
                 pass
         facts = _facts_for_module(db, module, g["files"])
         prompt = _wiki_prompt(facts)
-        body = llm._call_openai(prompt) if llm.cfg.format == "openai" else llm._call_anthropic(prompt)
-        if not body:
+        # Use chat() not _call_openai — _call_openai routes through _clean()
+        # which truncates to a single line (correct for one-sentence
+        # docstrings, fatal for multi-paragraph wiki pages).
+        body = llm.chat(prompt)
+        if not body or not body.strip():
             # Fall back to a plain rendering of the facts so the wiki is never blank.
             body = _facts_to_markdown(facts)
             summary = f"{facts['file_count']} files in {module}."
         else:
-            summary = body.splitlines()[0][:200]
+            summary = body.strip().splitlines()[0][:200]
         page = WikiPage(
             slug=slug, title=title, module=module,
             summary=summary, body_md=body, facts=facts,

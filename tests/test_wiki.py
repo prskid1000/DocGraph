@@ -76,11 +76,7 @@ class _StubLLM(LLMClient):
         self.calls: list[str] = []
         self._response = response
 
-    def _call_openai(self, prompt: str) -> str:  # type: ignore[override]
-        self.calls.append(prompt)
-        return self._response
-
-    def _call_anthropic(self, prompt: str) -> str:  # type: ignore[override]
+    def chat(self, prompt: str) -> str:  # type: ignore[override]
         self.calls.append(prompt)
         return self._response
 
@@ -197,3 +193,69 @@ def test_wiki_falls_back_when_llm_returns_empty(indexed):
     assert len(pages) > 0
     body = (wiki_dir / f"{pages[0].slug}.md").read_text(encoding="utf-8")
     assert body.strip().startswith("# "), "fallback markdown should start with a heading"
+
+
+def test_wiki_falls_back_on_whitespace_only_response(indexed):
+    """Regression: whitespace-only LLM body must trigger the fallback, not
+    write a blank file. Previously `if not body:` was False for "\\n\\n"."""
+    cfg, db, _embedder, _stats = indexed
+    wiki_dir = cfg.data_dir / "wiki"
+    for p in wiki_dir.glob("*"):
+        p.unlink()
+
+    pages = build_wiki(cfg, db, _StubLLM(response="   \n\n  \n"))
+    assert len(pages) > 0
+    for p in pages:
+        body = (wiki_dir / f"{p.slug}.md").read_text(encoding="utf-8")
+        assert body.strip(), f"{p.slug}.md is blank — fallback didn't fire"
+        assert body.strip().startswith("# ")
+
+
+def test_wiki_resume_regenerates_blank_files(indexed):
+    """Regression: a pre-existing blank/whitespace-only page on disk (e.g.
+    from a prior buggy run) must be regenerated, not silently reused."""
+    cfg, db, _embedder, _stats = indexed
+    wiki_dir = cfg.data_dir / "wiki"
+    for p in wiki_dir.glob("*"):
+        p.unlink()
+
+    # Build once so we know the slugs.
+    pages_full = build_wiki(cfg, db, _StubLLM())
+    # Corrupt the first page to whitespace-only — simulate the old bug.
+    victim = pages_full[0]
+    (wiki_dir / f"{victim.slug}.md").write_text("\n\n  \n", encoding="utf-8")
+
+    llm = _StubLLM()
+    build_wiki(cfg, db, llm)
+    assert len(llm.calls) == 1, "blank file should be regenerated, others cached"
+    body = (wiki_dir / f"{victim.slug}.md").read_text(encoding="utf-8")
+    assert body.strip(), "blank file was not regenerated"
+
+
+def test_wiki_returns_full_multi_paragraph_body(indexed):
+    """Regression: wiki used to call _call_openai which routes through
+    _clean(), truncating multi-paragraph output to a single line. The
+    `chat()` method must return the full body unchanged."""
+    cfg, db, _embedder, _stats = indexed
+    wiki_dir = cfg.data_dir / "wiki"
+    for p in wiki_dir.glob("*"):
+        p.unlink()
+
+    multi = (
+        "## Summary\n\n"
+        "This module handles authentication.\n\n"
+        "## Key entities\n\n"
+        "- `Authenticator` — issues tokens.\n"
+        "- `TokenError` — raised on bad credentials.\n\n"
+        "## How it's used\n\n"
+        "Imported by the API layer.\n"
+    )
+    pages = build_wiki(cfg, db, _StubLLM(response=multi))
+    assert len(pages) > 0
+    body = (wiki_dir / f"{pages[0].slug}.md").read_text(encoding="utf-8")
+    # All four section headings must survive — the old _clean() path kept
+    # only the first line.
+    assert "## Summary" in body
+    assert "## Key entities" in body
+    assert "## How it's used" in body
+    assert "Authenticator" in body
