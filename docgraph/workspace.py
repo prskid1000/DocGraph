@@ -70,7 +70,11 @@ class Workspace:
             self._add_locked(cfg)
 
     # ── construction helpers ────────────────────────────────────────────
-    def _embedder_for(self, cfg: Config) -> Embedder:
+    def embedder_for(self, cfg: Config) -> Embedder:
+        """Return a workspace-pooled `Embedder` for this Config. Multiple
+        roots with the same `(embedding_model, gpu)` share one ONNX
+        session — important under GPU because DirectML / CUDA don't take
+        kindly to two sessions racing for the same device."""
         key = (cfg.embedding_model, cfg.gpu)
         emb = self._embedders.get(key)
         if emb is None:
@@ -80,6 +84,9 @@ class Workspace:
             )
             self._embedders[key] = emb
         return emb
+
+    # Internal alias for back-compat — older call sites can still use this.
+    _embedder_for = embedder_for
 
     def _add_locked(self, cfg: Config) -> RootSlot:
         root = cfg.repo_root.resolve()

@@ -15,6 +15,7 @@ annotations would prevent FastAPI/Pydantic's `TypeAdapter` from
 resolving `RootSlug` at request time.
 """
 import asyncio
+import contextlib
 import enum
 import json
 import logging
@@ -41,12 +42,25 @@ def _root_enum(workspace: Workspace) -> type[enum.Enum]:
 
 
 def make_app(workspace: Workspace) -> FastAPI:
-    app = FastAPI(title="DocGraph", version="2.2.0")
+    # Build the FastMCP server up-front so we can chain its lifespan
+    # (initializes the streamable-HTTP session manager) into FastAPI's.
+    # Without this, any POST /mcp/ would 500 with "Session terminated".
+    from docgraph.mcp_tools import make_mcp
+    mcp_server = make_mcp(workspace)
+    mcp_http = mcp_server.http_app(path="/")  # Starlette-with-lifespan
+
+    @contextlib.asynccontextmanager
+    async def _lifespan(_app: FastAPI):
+        async with mcp_http.lifespan(_app):
+            yield
+
+    app = FastAPI(title="DocGraph", version="2.2.0", lifespan=_lifespan)
     RootSlug = _root_enum(workspace)
     DEFAULT = RootSlug(workspace.default_slug())
 
     app.state.workspace = workspace
     app.state.subscribers = []  # list[asyncio.Queue]
+    app.state.mcp = mcp_server
 
     def _slot(root) -> RootSlot:
         if root is None:
@@ -242,13 +256,12 @@ def make_app(workspace: Workspace) -> FastAPI:
         slot = _slot(root)
         full = bool((payload or {}).get("full", False))
 
-        def _do() -> dict:
-            # Indexer.index_all() prints Rich progress bars to stdout. When
-            # docgraph host runs as a Windows subprocess with cp1252 stdout,
-            # the braille spinner glyphs crash the writer. Redirect to a
-            # devnull-equivalent for the duration of the call — the API
-            # caller doesn't see this output anyway; they get the stats
-            # dict in the JSON response.
+        def _do() -> tuple[dict, str]:
+            # Indexer.index_all() prints Rich progress bars. We capture
+            # them so the response can return both the stats dict AND a
+            # plain-text transcript the API caller (telecode) can write
+            # to its own log file. Capturing also avoids any cp1252-
+            # related crashes if the host runs in a non-utf-8 console.
             import io, contextlib
             sink = io.StringIO()
             writer = workspace.take_writer(slot.cfg.repo_root)
@@ -256,10 +269,11 @@ def make_app(workspace: Workspace) -> FastAPI:
                 if full:
                     writer.wipe(keep_schema=False)
                 writer.init_schema()
-                embedder = Embedder(
-                    slot.cfg.embedding_model,
-                    providers=list(GPU_PROVIDERS) if slot.cfg.gpu else None,
-                )
+                # Reuse the workspace's embedder pool. DirectML / CUDA
+                # don't take kindly to two ONNX sessions sharing one GPU
+                # device; building a fresh `Embedder` here would race
+                # the host's existing read-path embedder.
+                embedder = workspace._embedder_for(slot.cfg)
                 indexer = Indexer(slot.cfg, writer, embedder=embedder)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     stats = indexer.index_all(incremental=not full)
@@ -269,12 +283,12 @@ def make_app(workspace: Workspace) -> FastAPI:
                     indexer.db.close()
                 except Exception:
                     pass
-                return stats
+                return stats, sink.getvalue()
             finally:
                 workspace.release_writer(slot.cfg.repo_root)
 
         try:
-            stats = await asyncio.to_thread(_do)
+            stats, captured = await asyncio.to_thread(_do)
         except Exception as exc:
             log.exception("api_admin_index failed: %s", exc)
             raise HTTPException(500, f"index failed: {exc}") from exc
@@ -283,7 +297,7 @@ def make_app(workspace: Workspace) -> FastAPI:
         broadcast(app, "reindex_done", {
             "repo_slug": slot.slug, "ts": _time.time(), "events": -1,
         })
-        return {"slug": slot.slug, "full": full, "stats": stats}
+        return {"slug": slot.slug, "full": full, "stats": stats, "log": captured}
 
     @app.get("/api/file_content")
     async def api_file_content(file: str, root: RootSlug = DEFAULT):
@@ -305,6 +319,11 @@ def make_app(workspace: Workspace) -> FastAPI:
         if cfg.ai_blocked_logical(file):
             return {"file": file, "content": "[redacted by .cursorignore]", "redacted": True}
         return {"file": file, "content": full.read_text(encoding="utf-8", errors="replace")}
+
+    # Mount the FastMCP HTTP app under /mcp. Telecode's bridge does
+    # POST http://host:port/mcp; Starlette redirects /mcp → /mcp/ which
+    # the mcp.client.streamable_http transport (httpx-backed) follows.
+    app.mount("/mcp", mcp_http)
 
     return app
 

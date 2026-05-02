@@ -202,7 +202,10 @@ async def watch_and_serve_workspace(
     config = uvicorn.Config(
         app, host=host, port=port,
         log_level="info" if verbose else "warning",
-        lifespan="off", timeout_graceful_shutdown=1,
+        # NB: lifespan must be enabled — the FastAPI app's lifespan
+        # initializes FastMCP's streamable-HTTP session manager. Setting
+        # this to "off" makes /mcp 500 on every request.
+        lifespan="on", timeout_graceful_shutdown=1,
     )
     server = uvicorn.Server(config)
     server_task = asyncio.create_task(server.serve())

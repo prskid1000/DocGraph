@@ -92,6 +92,20 @@ def test_file_map(client: TestClient):
     assert "entities" in body
 
 
+def test_mcp_endpoint_is_mounted(client: TestClient):
+    """Sanity check that POST /mcp is reachable via the FastAPI host
+    (FastMCP mounted under /mcp). Telecode's bridge_host POSTs to /mcp
+    to discover the tool surface; if this route is missing, the bridge
+    silently fails and managed-tools never get registered."""
+    # GET on the MCP endpoint should not 404; the streamable-http
+    # transport responds to GET with 405/406 once it's mounted.
+    r = client.get("/mcp/", follow_redirects=True)
+    assert r.status_code != 404, (
+        "MCP endpoint not mounted — bridge will not be able to register tools. "
+        "Check that make_app() mounts mcp_http under /mcp."
+    )
+
+
 def test_admin_index_runs_in_process(tmp_path: Path):
     """POST /api/admin/index should run an incremental reindex via the
     workspace's writer-lock dance and return a stats dict. Telecode's
