@@ -309,7 +309,7 @@ def wiki(
         1235, "--llm-port", help="Local LLM server port (default: 1235). Same flag as `index`."
     ),
     llm_model: str = typer.Option(
-        "local-model", "--llm-model",
+        "qwen3.6-35b", "--llm-model",
         help="Model name to send to the LLM server (e.g. 'qwen3.6-35b', 'local-model'). Same flag as `index`.",
     ),
     llm_format: str = typer.Option(

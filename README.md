@@ -107,7 +107,7 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 |---|---|---|
 | `--full`, `-f` *(optional)* | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
 | `--repo PATH`, `-r PATH` *(optional)* | — | Additional repo root to include (repeatable). Persisted in `.docgraph/repos.json`; subsequent `watch` / `serve` / `mcp` pick it up automatically |
-| `--llm-model STR` *(optional)* | unset (off) | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
+| `--llm-model STR` *(optional)* | unset (off) — when set, defaults to `qwen3.6-35b` via `$DOCGRAPH_LLM_MODEL` | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
 | `--llm-port INT` *(optional)* | `1235` | Local LLM server port (host is always `localhost`). Ignored unless `--llm-model` is set. |
 | `--llm-format STR` *(optional)* | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`). Ignored unless `--llm-model` is set. |
 | `--llm-max-tokens INT` *(optional)* | `150` | Max tokens per LLM call. DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) fit a one-sentence answer in this budget; bump it for non-reasoning models if you want longer summaries. |
@@ -166,7 +166,7 @@ Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_
 | `--module STR`, `-m STR` *(optional)* | unset (all) | Build only the named top-level module. |
 | `--llm-host STR` *(optional)* | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Host running the local LLM server. |
 | `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. |
-| `--llm-model STR` *(optional)* | `local-model` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects (e.g. `qwen3.6-35b`). Pass this if your server requires a specific name. |
+| `--llm-model STR` *(optional)* | `qwen3.6-35b` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects. Override if your server uses a different identifier (`local-model`, `gpt-oss-20b`, etc.). |
 | `--llm-format STR` *(optional)* | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
 | `--llm-max-tokens INT` *(optional)* | `600` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Higher than `index`'s 150 because wiki pages are longer. |
 | `--force`, `-f` *(optional)* | off | Rebuild every page from scratch. Default is resumable: skip modules whose page is already on disk. |
@@ -252,7 +252,7 @@ Print version. No flags.
 | `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
 | `DOCGRAPH_GPU` | `index`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. |
 | `~/.docgraph/daemon.lock` | (lock file, not env var) | Auto-managed by `docgraph daemon start` / `stop`. Contains `host`, `port`, `pid`, `model`, `gpu`, `started`. Other docgraph processes consult this to discover the running daemon. Stale locks are cleaned automatically. |
-| `DOCGRAPH_LLM_MODEL` | `index`, `wiki` | unset for `index` (off — setting this enables LLM-augmented docstrings); `local-model` for `wiki`. |
+| `DOCGRAPH_LLM_MODEL` | `index`, `wiki` | unset for `index` (off — setting this enables LLM-augmented docstrings); `qwen3.6-35b` for `wiki`. |
 | `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset. Set to `1`/`true` to enable explicitly (rarely needed; setting `DOCGRAPH_LLM_MODEL` is enough). |
 | `DOCGRAPH_LLM_HOST` | `index`, `wiki` | `localhost` |
 | `DOCGRAPH_LLM_PORT` | `index`, `wiki` | `1235` |

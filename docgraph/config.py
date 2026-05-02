@@ -36,7 +36,7 @@ class Config:
     llm_docstrings: bool = False
     llm_host: str = "localhost"
     llm_port: int = 1235
-    llm_model: str = "local-model"
+    llm_model: str = "qwen3.6-35b"
     llm_format: str = "openai"  # "openai" | "anthropic"
     llm_max_tokens: int = 150  # reasoning is disabled via reasoning_effort=none
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
@@ -162,7 +162,7 @@ def load_config(
         ),
         llm_host=os.environ.get("DOCGRAPH_LLM_HOST", "localhost"),
         llm_port=int(os.environ.get("DOCGRAPH_LLM_PORT", "1235")),
-        llm_model=os.environ.get("DOCGRAPH_LLM_MODEL", "local-model"),
+        llm_model=os.environ.get("DOCGRAPH_LLM_MODEL", "qwen3.6-35b"),
         llm_format=os.environ.get("DOCGRAPH_LLM_FORMAT", "openai"),
         llm_max_tokens=int(os.environ.get("DOCGRAPH_LLM_MAX_TOKENS", "150")),
     )

@@ -8,7 +8,7 @@ Configurable via CLI flags or env vars (no settings file):
 
     --llm-docstrings        / DOCGRAPH_LLM_DOCSTRINGS=1
     --llm-port    <int>     / DOCGRAPH_LLM_PORT (default: 1235)
-    --llm-model   <str>     / DOCGRAPH_LLM_MODEL (default: "local-model")
+    --llm-model   <str>     / DOCGRAPH_LLM_MODEL (default: "qwen3.6-35b")
     --llm-format  openai|anthropic / DOCGRAPH_LLM_FORMAT (default: "openai")
     (api key)               / DOCGRAPH_LLM_API_KEY (optional)
 
@@ -26,7 +26,7 @@ from dataclasses import dataclass
 log = logging.getLogger(__name__)
 
 DEFAULT_PORT = 1235
-DEFAULT_MODEL = "local-model"
+DEFAULT_MODEL = "qwen3.6-35b"
 DEFAULT_FORMAT = "openai"
 # We send `reasoning_effort: "none"` on every call (see _call_openai), which
 # the telecode proxy resolves into the right "no thinking" knobs per model
