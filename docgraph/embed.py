@@ -163,6 +163,32 @@ class Embedder:
                     return via.astype(np.float32, copy=False)
             except Exception:
                 pass
+        try:
+            return self._run_embed(texts_list, batch_size, on_progress)
+        except Exception as exc:
+            # ORT GPU sessions can fail mid-inference for reasons unrelated
+            # to docgraph: device hung (DXGI 0x887A0006 — common when
+            # another process like llama.cpp is saturating the GPU),
+            # OOM in shared VRAM, kernel cache eviction. The session is
+            # poisoned after such a failure; rebuilding it on the same
+            # provider just re-fails. Drop the cache entry, force CPU,
+            # retry once.
+            if not self._is_recoverable_ort_error(exc) or not self.providers:
+                raise
+            log.warning(
+                "GPU embed failed (%s); dropping DirectML session and "
+                "retrying on CPU. Likely cause: another GPU process "
+                "(LLM) is contending for the device.", exc,
+            )
+            self._fallback_to_cpu()
+            return self._run_embed(texts_list, batch_size, on_progress)
+
+    def _run_embed(
+        self,
+        texts_list: list[str],
+        batch_size: int,
+        on_progress: Callable[[int], None] | None,
+    ) -> np.ndarray:
         model = self._ensure()
         arrs: list[np.ndarray] = []
         for vec in model.embed(texts_list, batch_size=batch_size):
@@ -172,6 +198,36 @@ class Embedder:
         if not arrs:
             return np.zeros((0, self.dim), dtype=np.float32)
         return np.stack(arrs)
+
+    @staticmethod
+    def _is_recoverable_ort_error(exc: BaseException) -> bool:
+        """Heuristic: ORT's pybind11_state errors and DXGI device-hung
+        codes are the ones we want to recover from. Other failures (e.g.
+        a malformed model file) won't get better on CPU and should
+        propagate."""
+        try:
+            import onnxruntime as ort  # noqa: F401
+            from onnxruntime.capi.onnxruntime_pybind11_state import Fail as ORTFail
+            if isinstance(exc, ORTFail):
+                return True
+        except Exception:
+            pass
+        msg = str(exc)
+        return ("ONNXRuntimeError" in msg
+                or "DmlExecutionProvider" in msg
+                or "887A0006" in msg)
+
+    def _fallback_to_cpu(self) -> None:
+        """Drop GPU session + cache entry; re-init on CPU on next embed."""
+        with _MODEL_CACHE_LOCK:
+            old_providers = (
+                self._available_providers(self.providers) if self.providers else None
+            )
+            for key in (_cache_key(self.model_name, old_providers),
+                        _cache_key(self.model_name, self.providers)):
+                _MODEL_CACHE.pop(key, None)
+        self._model = None
+        self.providers = None
 
     def embed_iter(self, texts: Iterable[str], batch_size: int = 256) -> Iterator[np.ndarray]:
         """Streaming variant: yield one float32 ndarray at a time."""
