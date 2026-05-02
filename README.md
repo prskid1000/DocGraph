@@ -1,18 +1,20 @@
 # DocGraph
 
-A local code knowledge graph for LLMs. Indexes any repo with tree-sitter, stores entities and relationships in a single embedded Kuzu file, and exposes everything via MCP and a live web graph UI.
+A local code knowledge graph for LLMs. Indexes any repo with tree-sitter, stores entities and relationships in an embedded Kuzu file, and exposes everything via MCP and a live web graph UI. Runs **multiple repos at once** from a single host process — agents pick which repo per call via a closed-enum `root` argument.
 
 ```bash
 pipx install docgraph
 cd /any/repo
-docgraph index           # ~5s for 100k LOC; sub-second incremental
-docgraph serve           # http://127.0.0.1:5500
-docgraph mcp             # stdio MCP for Cursor / Claude Desktop
+docgraph index                                       # ~5s for 100k LOC; sub-second incremental
+docgraph host                                        # http://127.0.0.1:5500 — single repo (cwd)
+docgraph host --root /repo-a --root /repo-b          # multi-root: one process, two repos
+docgraph host --root /repo-a --watch /repo-a         # also reindex on change
+docgraph mcp /repo-a --transport stdio               # editor stdio MCP (proxies through host if up)
 ```
 
 ### GUI / process supervision (optional)
 
-Want a tray-based UI that runs and supervises `index`, `watch`, `serve`, `daemon`, and one-`docgraph mcp`-per-repo, and exposes the resulting MCP tools to a local LLM through a proxy? See [telecode](https://github.com/prithwirajs/telecode) — its DocGraph section auto-starts the subprocesses, tails their logs, and bridges every MCP tool into its managed-tools registry (`docgraph_<repo>_search`, `..._definition`, …). `mcp.paths` in telecode maps 1:1 to one `docgraph mcp` child per path.
+Want a tray-based UI that supervises one `docgraph host` covering every repo you care about, and bridges every MCP tool into a local LLM through a proxy? See [telecode](https://github.com/prithwirajs/telecode) — its DocGraph section auto-starts the host, tails its log, and registers `docgraph_<tool>` in the managed-tools registry. The agent selects which repo per call via the `root` enum the host emits.
 
 ## Why
 
@@ -20,12 +22,12 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 ### Architecture
 
-- **One file embedded DB** (Kuzu) — graph + vectors, no servers.
+- **One Kuzu DB per repo, one host process per machine.** `docgraph host` runs the unified server: web UI + JSON API + MCP HTTP + optional watchers, all rooted in a `Workspace` registry that owns the per-repo connections. Multi-root via repeatable `--root` flags.
+- **Closed-enum `root` selection.** The host reads its registered slugs at boot and emits the JSON API + MCP tool schemas with a JSON Schema enum. LLMs pick from a known set; protocol-layer rejection on typos. Single-root case collapses to a one-value default.
 - **165+ languages** out of the box via tree-sitter (just install more `tree-sitter-*` packages).
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
-- **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML for a multi-x speedup on large repos. Still no torch dep — just `pip install onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows). Falls back to CPU silently if no GPU runtime is installed.
-- **Optional cross-CLI embedding daemon** — `docgraph daemon start` keeps one warm ONNX session in memory; subsequent `index` / `mcp` / `serve` invocations route their embed calls through it via loopback TCP, cutting cold start to a TCP round trip. Off by default; `--detach` runs in the background.
+- **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML. Still no torch dep — just `pip install onnxruntime-gpu` / `onnxruntime-directml`. Falls back to CPU silently if no GPU runtime is installed.
 - **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-model <name>` (you supply the local server).
 
 ### Retrieval
@@ -51,9 +53,10 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Live UI auto-redraw** — `docgraph watch --serve` runs the watcher and the web server in **one process** so they share the Kuzu file lock. After every reindex the browser refreshes itself via Server-Sent Events at `/api/events` — no F5, no polling.
 - **ML-training-style progress bars** — every index phase (parse, embed entities, embed chunks, write nodes, build symbol table, resolve edges, `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, PageRank, persist) reports `% | M/N | elapsed | ETA`. Same bars in `docgraph docs add`.
 
-### Multi-repo + ignores
+### Multi-root + ignores
 
-- **Multi-repo** — `--repo` (repeatable) merges several repos into one graph; cross-repo `IMPORTS` resolve naturally. List persisted in `.docgraph/repos.json`.
+- **Multi-root** — `docgraph host --root A --root B` runs one process serving N independent repos, each with its own `.docgraph/graph.kuzu`. Every API/MCP call accepts a `root=<slug>` arg (closed enum, validated at the protocol layer). The single web UI's repo picker is populated from `GET /api/roots`.
+- **Indexer-side `--repo` (repeatable)** still works for monorepos: merges several path roots into a single index. Different from multi-root above (workspace registers independent indexes side-by-side; `--repo` builds one index from multiple paths).
 - **Smart default ignores** — universal baseline (Cursor-parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs (`target/`, `build/`, `bin/`, `obj/`) only ignored when their marker file is detected.
 - **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI. The HTTP API also sandboxes `/api/file_content` to the repo root (403 on traversal) and redacts `.cursorignore`'d files.
 - **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)` so any MCP client gets glob-matched auto-attach.

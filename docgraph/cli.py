@@ -168,104 +168,248 @@ def index(
     console.print(table)
 
 
+def _build_workspace(roots: list[Path]) -> "Workspace":
+    """Resolve roots → list[Config] → Workspace. Errors clearly if any
+    root has no index yet."""
+    from docgraph.workspace import Workspace
+    configs = []
+    for r in roots:
+        cfg = load_config(r)
+        if not cfg.db_path.exists():
+            console.print(
+                f"[yellow]Root {cfg.repo_root} has no index yet. "
+                f"Run `docgraph index {cfg.repo_root}` first.[/yellow]"
+            )
+            raise typer.Exit(1)
+        configs.append(cfg)
+    return Workspace(configs)
+
+
+def _resolve_roots(positional: Path | None,
+                    extra: list[Path] | None) -> list[Path]:
+    """Combine positional + repeated --root flags. Falls back to cwd."""
+    out: list[Path] = []
+    if positional is not None:
+        out.append(positional)
+    if extra:
+        out.extend(extra)
+    if not out:
+        out.append(Path.cwd())
+    seen: set[Path] = set()
+    deduped: list[Path] = []
+    for p in out:
+        rp = p.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        deduped.append(p)
+    return deduped
+
+
 @app.command()
-def watch(
-    path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
-    debounce: int = typer.Option(500, "--debounce", help="Debounce window (ms) before reindex fires"),
-    serve: bool = typer.Option(
-        False, "--serve",
-        help="Also run the web UI + JSON API in the same process. The UI auto-redraws on each reindex via SSE.",
+def host(
+    path: Path | None = typer.Argument(None, help="Single root (sugar for --root <path>)."),
+    root: list[Path] = typer.Option(
+        None, "--root", "-r",
+        help="Repo root to register (repeatable). With multiple roots, "
+             "every API/MCP call accepts a `root=<slug>` arg to pick.",
     ),
-    host: str = typer.Option("127.0.0.1", "--host", help="Bind address for --serve mode."),
-    port: int = typer.Option(5500, "--port", help="Bind port for --serve mode."),
+    watch: list[Path] = typer.Option(
+        None, "--watch",
+        help="Per-root watcher: pass once per root to enable live reindex. "
+             "Each value must match one of the registered --root entries.",
+    ),
+    bind_host: str = typer.Option("127.0.0.1", "--host", help="Bind address."),
+    bind_port: int = typer.Option(5500, "--port", help="Bind port."),
+    debounce: int = typer.Option(500, "--debounce", help="Watcher debounce (ms)."),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Watch the repo and incrementally reindex on file changes.
+    """Run the unified DocGraph host: web UI + JSON API + MCP HTTP, multi-root.
 
-    Plain `watch` holds a writer lock — kill any `docgraph serve` / `docgraph mcp`
-    against the same repo first.
-
-    `watch --serve` runs the web UI + JSON API in the same process, so they share
-    a single DB lock. The browser stays in sync via Server-Sent Events at
-    `/api/events`; the graph re-renders automatically after each reindex.
+    Single-root (terminal sugar):
+        docgraph host                       # uses cwd
+        docgraph host /path/to/repo         # positional
+    Multi-root:
+        docgraph host --root /repo-a --root /repo-b --watch /repo-a
     """
     _setup_logging(verbose)
-    cfg = load_config(path)
-    _install_hard_sigint()
-    try:
-        if serve:
-            from docgraph.watch import watch_and_serve
-            asyncio.run(watch_and_serve(cfg, debounce_ms=debounce, host=host, port=port))
-            return
-        console.print(f"[cyan]Watching[/cyan] {cfg.repo_root}  debounce={debounce}ms")
-        from docgraph.watch import watch_repo
-        watch_repo(cfg, debounce_ms=debounce)
-    except KeyboardInterrupt:
-        pass
+    roots = _resolve_roots(path, root)
+    workspace = _build_workspace(roots)
+    watch_paths = [p.resolve() for p in (watch or [])]
+    # Validate that every --watch points at a registered root.
+    registered = set(workspace.roots())
+    for w in watch_paths:
+        if w not in registered:
+            console.print(
+                f"[red]--watch {w} is not registered as a --root[/red]"
+            )
+            raise typer.Exit(2)
 
-
-@app.command()
-def serve(
-    path: Path = typer.Argument(Path.cwd(), help="Repo root"),
-    host: str | None = typer.Option(None),
-    port: int | None = typer.Option(None),
-    verbose: bool = typer.Option(False, "--verbose", "-v"),
-) -> None:
-    """Start the web UI + JSON API."""
-    _setup_logging(verbose)
-    cfg = load_config(path)
-    if host:
-        cfg.host = host
-    if port:
-        cfg.port = port
-    if not cfg.db_path.exists():
-        console.print("[yellow]No index yet. Run `docgraph index` first.[/yellow]")
-        raise typer.Exit(1)
     from docgraph.server import make_app
-    app_obj = make_app(cfg)
-    console.print(f"[green]Serving[/green] http://{cfg.host}:{cfg.port}/  [dim](Ctrl+C to stop)[/]")
-    # See _install_hard_sigint(): the graceful-drain timeout is a fallback
-    # for non-Windows. On Windows it's the SIGINT handler that actually
-    # terminates the process — uvicorn's own signal plumbing doesn't fire
-    # reliably while the loop is blocked on I/O.
+    app_obj = make_app(workspace)
     _install_hard_sigint()
+
+    if watch_paths:
+        # Run watchers + uvicorn on the same event loop.
+        from docgraph.watch import watch_and_serve_workspace
+        try:
+            asyncio.run(watch_and_serve_workspace(
+                workspace, app_obj, watch_paths,
+                host=bind_host, port=bind_port,
+                debounce_ms=debounce, verbose=verbose,
+            ))
+        except KeyboardInterrupt:
+            pass
+        finally:
+            workspace.close()
+        return
+
+    console.print(
+        f"[green]DocGraph host[/green] http://{bind_host}:{bind_port}/  "
+        f"[dim]({len(roots)} root{'s' if len(roots) > 1 else ''})[/]"
+    )
     try:
         uvicorn.run(
-            app_obj,
-            host=cfg.host,
-            port=cfg.port,
+            app_obj, host=bind_host, port=bind_port,
             log_level="info" if verbose else "warning",
             timeout_graceful_shutdown=1,
         )
     except KeyboardInterrupt:
         pass
+    finally:
+        workspace.close()
+
+
+@app.command()
+def watch(
+    path: Path | None = typer.Argument(None, help="Single root (default: cwd)."),
+    root: list[Path] = typer.Option(None, "--root", "-r", help="Watch root (repeatable)."),
+    debounce: int = typer.Option(500, "--debounce"),
+    serve: bool = typer.Option(False, "--serve", help="Also expose web UI + JSON API + MCP."),
+    bind_host: str = typer.Option("127.0.0.1", "--host"),
+    bind_port: int = typer.Option(5500, "--port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Watch one or more roots and incrementally reindex on changes.
+
+    `watch --serve` is equivalent to `host --watch <each-root>`.
+    Plain `watch` (no --serve) is the foreground-only variant.
+    """
+    _setup_logging(verbose)
+    roots = _resolve_roots(path, root)
+    if serve:
+        # Delegate to the host command — same code path.
+        host(
+            path=None, root=roots, watch=roots,
+            bind_host=bind_host, bind_port=bind_port,
+            debounce=debounce, verbose=verbose,
+        )
+        return
+    workspace = _build_workspace(roots)
+    _install_hard_sigint()
+    try:
+        from docgraph.watch import watch_workspace
+        asyncio.run(watch_workspace(workspace, list(workspace.roots()), debounce_ms=debounce))
+    except KeyboardInterrupt:
+        pass
+    finally:
+        workspace.close()
+
+
+@app.command()
+def serve(
+    path: Path | None = typer.Argument(None, help="Single root."),
+    root: list[Path] = typer.Option(None, "--root", "-r", help="Repeatable."),
+    bind_host: str | None = typer.Option(None, "--host"),
+    bind_port: int | None = typer.Option(None, "--port"),
+    verbose: bool = typer.Option(False, "--verbose", "-v"),
+) -> None:
+    """Thin alias: equivalent to `docgraph host` with no watchers."""
+    host(
+        path=path, root=root, watch=None,
+        bind_host=bind_host or "127.0.0.1",
+        bind_port=bind_port or 5500,
+        debounce=500, verbose=verbose,
+    )
 
 
 @app.command()
 def mcp(
-    path: Path = typer.Argument(Path.cwd(), help="Repo root"),
+    path: Path | None = typer.Argument(None, help="Single root."),
+    root: list[Path] = typer.Option(None, "--root", "-r", help="Repeatable."),
     transport: str = typer.Option("stdio", help="stdio | http"),
+    bind_host: str = typer.Option("127.0.0.1", "--host"),
+    bind_port: int = typer.Option(5500, "--port"),
+    host_url: str | None = typer.Option(
+        None, "--host-url",
+        help="(stdio only) HTTP host to proxy through. If a host responds at "
+             "this URL, stdio acts as a thin proxy. Default: probe http://127.0.0.1:5500.",
+    ),
+    standalone: bool = typer.Option(
+        False, "--standalone",
+        help="(stdio only) Skip the host probe and always run a single-process "
+             "stdio server. Useful when you don't want stdio to share state "
+             "with a running host.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Run the MCP server (stdio for Cursor/Claude, http for web clients)."""
+    """Run the MCP server.
+
+    stdio (default): for Cursor / Claude Desktop / editors. If a host is
+        already running on `--host-url` (default http://127.0.0.1:5500),
+        this acts as a thin stdio↔HTTP proxy scoped to the supplied path.
+        Otherwise it runs a single-process stdio server. Use `--standalone`
+        to skip the probe.
+    http: starts an MCP HTTP server scoped to the registered roots. Prefer
+        `docgraph host` instead — it bundles MCP HTTP with the web UI.
+    """
     _setup_logging(verbose)
-    cfg = load_config(path)
-    if not cfg.db_path.exists():
-        console.print("[yellow]No index yet. Run `docgraph index` first.[/yellow]", file=sys.stderr)
-        raise typer.Exit(1)
-    from docgraph.mcp_tools import make_mcp
-    server = make_mcp(cfg)
+    roots = _resolve_roots(path, root)
     _install_hard_sigint()
-    try:
-        if transport == "stdio":
-            server.run()
-        elif transport == "http":
-            server.run(transport="http", host=cfg.host, port=cfg.port)
-        else:
-            console.print(f"[red]Unknown transport {transport}[/red]", file=sys.stderr)
-            raise typer.Exit(2)
-    except KeyboardInterrupt:
-        pass
+
+    if transport == "stdio":
+        if standalone:
+            # Explicit opt-out: run a self-contained stdio server. The user
+            # is on the hook for not double-loading workspaces if a host
+            # is also running.
+            workspace = _build_workspace(roots)
+            from docgraph.mcp_tools import make_mcp
+            server = make_mcp(workspace)
+            try:
+                server.run()
+            except KeyboardInterrupt:
+                pass
+            finally:
+                workspace.close()
+            return
+
+        # Strict: must talk to a running host.
+        probe = host_url or f"http://{bind_host}:{bind_port}"
+        from docgraph.mcp_stdio_proxy import run_stdio_proxy
+        if run_stdio_proxy(probe, scope_root=roots[0]):
+            return
+        console.print(
+            f"[red]No docgraph host responded at {probe}.[/red]\n"
+            f"Start one (e.g. `docgraph host --root {roots[0]}`) and retry, "
+            f"or pass `--standalone` to run an isolated stdio server.",
+            file=sys.stderr,
+        )
+        raise typer.Exit(3)
+
+    if transport == "http":
+        workspace = _build_workspace(roots)
+        from docgraph.mcp_tools import make_mcp
+        server = make_mcp(workspace)
+        try:
+            server.run(transport="http", host=bind_host, port=bind_port)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            workspace.close()
+        return
+
+    console.print(f"[red]Unknown transport {transport}[/red]", file=sys.stderr)
+    raise typer.Exit(2)
 
 
 @app.command()

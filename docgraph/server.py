@@ -1,153 +1,142 @@
-"""FastAPI server: hosts the graph UI + JSON API + mounts MCP over HTTP.
+"""FastAPI host server: graph UI + JSON API + MCP HTTP endpoint.
 
-For stdio MCP (Cursor / Claude Desktop), use `docgraph mcp` instead.
+Multi-root: every API route accepts `?root=<slug>` (closed enum built
+from the workspace's registered slugs). When omitted, the default root
+(first registered) is used. The web UI's repo picker dropdown is
+populated from `GET /api/roots`.
 
-DB swap protocol (used by `watch --serve`): `make_app` accepts an optional
-pre-opened `GraphDB`. The `app.state.db_holder` wraps the DB plus a
-threading.Lock so the watcher can atomically swap to a fresh post-reindex
-GraphDB without racing in-flight API requests. SSE subscribers at
-`/api/events` get pinged after each swap so the UI can re-fetch the graph.
+Reindex SSE events on `/api/events` carry `{repo_slug, ts}` so a
+multi-root UI can refresh only the affected slot.
+
+Note: this module deliberately does NOT use `from __future__ import
+annotations`. Each route's `root` parameter is annotated with the
+dynamically-built enum class (a local in `make_app`); deferred
+annotations would prevent FastAPI/Pydantic's `TypeAdapter` from
+resolving `RootSlug` at request time.
 """
-from __future__ import annotations
-
 import asyncio
+import enum
 import json
 import logging
 from pathlib import Path
-from threading import Lock
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException, Request
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
-from docgraph.config import Config
-from docgraph.db import GraphDB
-from docgraph.embed import Embedder
-from docgraph.retrieve import Retriever
+from docgraph.workspace import Workspace, RootSlot
 
 log = logging.getLogger(__name__)
 
 UI_DIR = Path(__file__).parent / "ui"
 
 
-class DBHolder:
-    """Mutable wrapper around GraphDB + Retriever. The watcher swaps both at
-    once after each reindex; API handlers acquire the lock briefly per query
-    so they always see a coherent (db, retriever) pair."""
-
-    def __init__(self, db: GraphDB, retriever: Retriever) -> None:
-        self.db = db
-        self.retriever = retriever
-        self.lock = Lock()
-
-    def swap(self, db: GraphDB, retriever: Retriever) -> None:
-        with self.lock:
-            old = self.db
-            self.db = db
-            self.retriever = retriever
-        try:
-            old.close()
-        except Exception:
-            pass
+def _root_enum(workspace: Workspace) -> type[enum.Enum]:
+    """Same dynamic enum as mcp_tools._root_enum, but for FastAPI query params.
+    FastAPI's parameter handling renders `Enum` subclasses as OpenAPI enums."""
+    members = {s.upper().replace("-", "_"): s for s in workspace.slugs()}
+    if not members:
+        raise ValueError("Workspace has no roots")
+    return enum.Enum("RootSlug", members, type=str)  # type: ignore[arg-type]
 
 
-def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
-    app = FastAPI(
-        title="DocGraph",
-        version="2.0.0",
-    )
+def make_app(workspace: Workspace) -> FastAPI:
+    app = FastAPI(title="DocGraph", version="2.2.0")
+    RootSlug = _root_enum(workspace)
+    DEFAULT = RootSlug(workspace.default_slug())
 
-    if db is None:
-        db = GraphDB(cfg.db_path, read_only=True)
-    from docgraph.embed import GPU_PROVIDERS
-    embedder = Embedder(
-        cfg.embedding_model,
-        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
-    )
-    retriever = Retriever(db, embedder, cfg=cfg)
-    holder = DBHolder(db, retriever)
-    app.state.db_holder = holder
+    app.state.workspace = workspace
     app.state.subscribers = []  # list[asyncio.Queue]
-    app.state.embedder = embedder
 
-    def _r() -> Retriever:
-        with holder.lock:
-            return holder.retriever
+    def _slot(root) -> RootSlot:
+        if root is None:
+            return workspace.resolve(None)
+        slug = root.value if hasattr(root, "value") else str(root)
+        return workspace.resolve(slug)
 
-    def _db() -> GraphDB:
-        with holder.lock:
-            return holder.db
+    def _r(root):
+        return _slot(root).retriever
 
     # --- UI ---
     @app.get("/", response_class=HTMLResponse)
     async def index() -> str:
         return (UI_DIR / "index.html").read_text(encoding="utf-8")
 
-    # --- JSON API ---
+    # --- Roots discovery ---
+    @app.get("/api/roots")
+    async def api_roots():
+        return workspace.list()
+
+    # --- JSON API (every route accepts ?root=<slug>) ---
     @app.get("/api/search")
     async def api_search(
         q: str, kind: str | None = None, limit: int = 10,
         focus_file: str | None = None, focus_symbol: str | None = None,
-        rerank: bool = False,
+        rerank: bool = False, root: RootSlug = DEFAULT,
     ):
-        return _r().search(
+        return _r(root).search(
             q, kind=kind, limit=limit,
             focus_file=focus_file, focus_symbol=focus_symbol, rerank=rerank,
         )
 
     @app.get("/api/definition")
-    async def api_definition(name: str, file: str | None = None):
-        return _r().definition(name, file=file)
+    async def api_definition(name: str, file: str | None = None,
+                              root: RootSlug = DEFAULT):
+        return _r(root).definition(name, file=file)
 
     @app.get("/api/references")
-    async def api_references(name: str):
-        return _r().references(name)
+    async def api_references(name: str, root: RootSlug = DEFAULT):
+        return _r(root).references(name)
 
     @app.get("/api/call_graph")
-    async def api_call_graph(name: str, depth: int = 2):
-        return _r().call_graph(name, depth=depth)
+    async def api_call_graph(name: str, depth: int = 2, root: RootSlug = DEFAULT):
+        return _r(root).call_graph(name, depth=depth)
 
     @app.get("/api/file_map")
-    async def api_file_map(file: str):
-        return _r().file_map(file)
+    async def api_file_map(file: str, root: RootSlug = DEFAULT):
+        return _r(root).file_map(file)
 
     @app.get("/api/neighborhood")
-    async def api_neighborhood(name: str, limit: int = 10):
-        return _r().neighborhood(name, limit=limit)
+    async def api_neighborhood(name: str, limit: int = 10, root: RootSlug = DEFAULT):
+        return _r(root).neighborhood(name, limit=limit)
 
     @app.get("/api/explore")
-    async def api_explore(seeds: str, hops: int = 3, limit: int = 25):
+    async def api_explore(seeds: str, hops: int = 3, limit: int = 25,
+                           root: RootSlug = DEFAULT):
         seed_list = [s.strip() for s in seeds.split(",") if s.strip()]
-        return _r().explore(seeds=seed_list, hops=hops, limit=limit)
+        return _r(root).explore(seeds=seed_list, hops=hops, limit=limit)
 
     @app.get("/api/impact_of")
-    async def api_impact_of(target: str, depth: int = 3, limit: int = 50):
-        return _r().impact_of(target, depth=depth, limit=limit)
+    async def api_impact_of(target: str, depth: int = 3, limit: int = 50,
+                             root: RootSlug = DEFAULT):
+        return _r(root).impact_of(target, depth=depth, limit=limit)
 
     @app.get("/api/test_impact")
-    async def api_test_impact(target: str, limit: int = 25):
-        return _r().test_impact(target, limit=limit)
+    async def api_test_impact(target: str, limit: int = 25, root: RootSlug = DEFAULT):
+        return _r(root).test_impact(target, limit=limit)
 
     @app.get("/api/processes")
-    async def api_processes(limit: int = 25, max_chain_len: int = 8):
-        return _r().processes(limit=limit, max_chain_len=max_chain_len)
+    async def api_processes(limit: int = 25, max_chain_len: int = 8,
+                             root: RootSlug = DEFAULT):
+        return _r(root).processes(limit=limit, max_chain_len=max_chain_len)
 
     @app.get("/api/wiki/list")
-    async def api_wiki_list():
+    async def api_wiki_list(root: RootSlug = DEFAULT):
         from docgraph.wiki import list_wiki
-        return list_wiki(cfg)
+        return list_wiki(_slot(root).cfg)
 
     @app.get("/api/wiki/page")
-    async def api_wiki_page(slug: str):
+    async def api_wiki_page(slug: str, root: RootSlug = DEFAULT):
         from docgraph.wiki import get_wiki_page
-        page = get_wiki_page(cfg, slug)
+        page = get_wiki_page(_slot(root).cfg, slug)
         if not page:
             raise HTTPException(404, "wiki page not found")
         return page
 
     @app.post("/api/wiki/build")
-    async def api_wiki_build(payload: dict | None = None):
+    async def api_wiki_build(payload: dict | None = None, root: RootSlug = DEFAULT):
         from docgraph.wiki import build_wiki
+        slot = _slot(root)
         p = payload or {}
         only = p.get("module") if isinstance(p, dict) else None
         force = bool(p.get("force")) if isinstance(p, dict) else False
@@ -155,50 +144,55 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
             depth = int(p.get("depth", 12)) if isinstance(p, dict) else 12
         except (TypeError, ValueError):
             depth = 12
-        pages = await asyncio.to_thread(build_wiki, cfg, _db(), None, only, None, force, depth)
+        pages = await asyncio.to_thread(
+            build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
+        )
         return {"built": len(pages), "modules": [pg.module for pg in pages]}
 
     @app.post("/api/cypher")
-    async def api_cypher(payload: dict):
-        return _r().cypher(payload.get("query", ""), limit=int(payload.get("limit", 100)))
+    async def api_cypher(payload: dict, root: RootSlug = DEFAULT):
+        return _r(root).cypher(payload.get("query", ""), limit=int(payload.get("limit", 100)))
 
     @app.get("/api/git_changes")
-    async def api_git_changes(ref: str | None = None):
-        return _r().git_changes(ref=ref)
+    async def api_git_changes(ref: str | None = None, root: RootSlug = DEFAULT):
+        return _r(root).git_changes(ref=ref)
 
     @app.get("/api/git_blame")
-    async def api_git_blame(file: str, line_start: int = 1, line_end: int | None = None):
-        return _r().git_blame(file, line_start=line_start, line_end=line_end)
+    async def api_git_blame(file: str, line_start: int = 1,
+                             line_end: int | None = None, root: RootSlug = DEFAULT):
+        return _r(root).git_blame(file, line_start=line_start, line_end=line_end)
 
     @app.get("/api/git_recent")
-    async def api_git_recent(file: str | None = None, limit: int = 20):
-        return _r().git_recent(file=file, limit=limit)
+    async def api_git_recent(file: str | None = None, limit: int = 20,
+                              root: RootSlug = DEFAULT):
+        return _r(root).git_recent(file=file, limit=limit)
 
     @app.get("/api/rules_for")
-    async def api_rules_for(file: str):
-        return _r().rules_for(file)
+    async def api_rules_for(file: str, root: RootSlug = DEFAULT):
+        return _r(root).rules_for(file)
 
     @app.get("/api/search_docs")
-    async def api_search_docs(q: str, limit: int = 10):
-        return _r().search_docs(q, limit=limit)
+    async def api_search_docs(q: str, limit: int = 10, root: RootSlug = DEFAULT):
+        return _r(root).search_docs(q, limit=limit)
 
     @app.get("/api/graph")
-    async def api_graph(limit_nodes: int = 10000):
-        return _r().graph_dump(limit_nodes=limit_nodes)
+    async def api_graph(limit_nodes: int = 10000, root: RootSlug = DEFAULT):
+        return _r(root).graph_dump(limit_nodes=limit_nodes)
 
     @app.get("/api/files")
-    async def api_files():
-        return _r().files_dump()
+    async def api_files(root: RootSlug = DEFAULT):
+        return _r(root).files_dump()
 
     @app.get("/api/node_neighbors")
-    async def api_node_neighbors(id: int, hops: int = 1):
-        return _r().node_neighbors(int(id), hops=hops)
+    async def api_node_neighbors(id: int, hops: int = 1, root: RootSlug = DEFAULT):
+        return _r(root).node_neighbors(int(id), hops=hops)
 
     @app.get("/api/stats")
-    async def api_stats():
-        d = _db()
+    async def api_stats(root: RootSlug = DEFAULT):
+        slot = _slot(root)
+        d = slot.db_ro
         rows = d.fetch_all("CALL show_tables() RETURN *")
-        out: dict = {"tables": rows, "repo": str(cfg.repo_root)}
+        out: dict = {"tables": rows, "repo": str(slot.cfg.repo_root)}
         for label in ("File", "Function", "Class", "Variable", "Module"):
             r = d.fetch_all(f"MATCH (n:{label}) RETURN count(n) AS c")
             out[label] = r[0]["c"] if r else 0
@@ -207,15 +201,13 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
     # --- SSE: live reindex events ---
     @app.get("/api/events")
     async def api_events(request: Request) -> StreamingResponse:
-        """Server-Sent Events stream. The watcher (in `docgraph watch --serve`
-        mode) pushes a `reindex_done` event after each successful reindex
-        so the UI can refresh its graph + stats without polling."""
+        """SSE stream. Watcher tasks broadcast `reindex_done` after each
+        per-root reindex; payload carries `{repo_slug, ts, events}`."""
         queue: asyncio.Queue[dict] = asyncio.Queue()
         app.state.subscribers.append(queue)
 
         async def gen() -> AsyncIterator[bytes]:
             try:
-                # Initial hello so EventSource resolves immediately
                 yield b": ready\n\n"
                 while True:
                     if await request.is_disconnected():
@@ -223,7 +215,6 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
                     try:
                         evt = await asyncio.wait_for(queue.get(), timeout=15.0)
                     except asyncio.TimeoutError:
-                        # Heartbeat keeps the connection alive through proxies
                         yield b": keepalive\n\n"
                         continue
                     name = evt.get("event", "message")
@@ -238,12 +229,14 @@ def make_app(cfg: Config, db: GraphDB | None = None) -> FastAPI:
         return StreamingResponse(gen(), media_type="text/event-stream")
 
     @app.get("/api/file_content")
-    async def api_file_content(file: str):
+    async def api_file_content(file: str, root: RootSlug = DEFAULT):
+        slot = _slot(root)
+        cfg = slot.cfg
         full = cfg.path_for(file).resolve()
         allowed = False
-        for root, _ in cfg.roots_with_prefix():
+        for r, _ in cfg.roots_with_prefix():
             try:
-                full.relative_to(root.resolve())
+                full.relative_to(r.resolve())
                 allowed = True
                 break
             except ValueError:

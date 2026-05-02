@@ -1,17 +1,21 @@
-"""File watcher: triggers incremental reindex on changes.
+"""File watcher: per-root awatch tasks that incrementally reindex on change.
 
-Uses watchfiles (Rust notify under the hood). Filters out paths that hit
-.gitignore / .docgraphignore / unsupported languages before debouncing,
-so a `git checkout` of 5k files in node_modules doesn't blow up.
+After this rewrite, watching is workspace-scoped. The single `docgraph
+host` process can watch any subset of its registered roots — each root
+gets its own asyncio task holding its own writer connection on its own
+.docgraph/graph.kuzu (Kuzu's per-file locks make this safe).
 
-Two modes:
-- `watch_repo` — classic: holds a single writer connection for the
-  watcher's lifetime. `docgraph serve` / `docgraph mcp` against the same
-  DB will fail to acquire their locks.
-- `watch_and_serve` — unified: runs the watcher AND a FastAPI server in
-  one process so they can share a single Database lock. After each
-  reindex, we close+reopen the DB (Kuzu writer-visibility quirk) and push
-  an SSE `reindex_done` event so the live UI refreshes itself.
+A workspace-wide `asyncio.Semaphore(1)` serializes reindexes across roots
+so two CPU-bound passes don't fight; an unbounded semaphore would let
+them run in parallel but the indexer is heavy enough that fairness is
+better than aggregate throughput here.
+
+After each per-root reindex:
+  1. Close the writer.
+  2. Reopen the workspace's read-only slot for that root (via
+     `Workspace.release_writer`) so subsequent reads see the new data.
+  3. Broadcast SSE `reindex_done {repo_slug, ts, events}` so the live
+     UI refreshes only the affected slot.
 """
 from __future__ import annotations
 
@@ -21,18 +25,19 @@ import time
 from pathlib import Path
 
 from rich.console import Console
-from watchfiles import Change, awatch, watch
+from watchfiles import Change, awatch
 
 from docgraph.config import Config, MAX_FILE_BYTES
-from docgraph.db import GraphDB
 from docgraph.embed import Embedder, GPU_PROVIDERS
 from docgraph.index import Indexer
 from docgraph.parse import detect_language
+from docgraph.workspace import Workspace, slug_for_root
 
 _console = Console()
-
 log = logging.getLogger(__name__)
 
+
+# ── path-level filter (unchanged) ───────────────────────────────────────────
 
 def _is_relevant(cfg: Config, path: Path) -> bool:
     abs_path = path.resolve()
@@ -49,7 +54,6 @@ def _is_relevant(cfg: Config, path: Path) -> bool:
         return False
     if cfg.is_ignored(rel, root=matched_root):
         return False
-    # For deletes, the file no longer exists; we still want to track them.
     if path.exists():
         if path.is_dir():
             return False
@@ -61,110 +65,47 @@ def _is_relevant(cfg: Config, path: Path) -> bool:
         except OSError:
             return False
     else:
-        # Best-effort: only react to deletions of language-supported extensions
         if detect_language(path) is None:
             return False
     return True
 
 
-def watch_repo(cfg: Config, debounce_ms: int = 500) -> None:
-    """Block forever, reindexing on changes. Ctrl-C to stop."""
-    db = GraphDB(cfg.db_path, embedding_dim=384)
-    db.init_schema()
-    embedder = Embedder(
-        cfg.embedding_model,
-        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
-    )
-    indexer = Indexer(cfg, db, embedder=embedder)
+class _WatchFilter:
+    """watchfiles filter — drops ignored / non-source paths pre-debounce."""
 
-    _console.rule(f"[bold cyan]Baseline index[/] — {cfg.repo_root}")
-    indexer.index_all(incremental=True)
+    def __init__(self, cfg: Config) -> None:
+        self.cfg = cfg
 
-    roots = [str(r) for r, _ in cfg.roots_with_prefix()]
-    _console.print(
-        f"[green]Watching[/] {len(roots)} root(s), debounce={debounce_ms}ms. "
-        "[dim]Ctrl-C to stop.[/]"
-    )
-    try:
-        for changes in watch(
-            *roots,
-            step=debounce_ms,
-            recursive=True,
-            watch_filter=_WatchFilter(cfg),
-        ):
-            relevant = [Path(p) for _, p in changes]
-            if not relevant:
-                continue
-            _console.rule(
-                f"[bold cyan]Reindex[/] — {len(relevant)} fs event(s)",
-                style="cyan",
-            )
-            try:
-                indexer.index_all(incremental=True)
-            except Exception as e:  # noqa: BLE001
-                _console.print(f"[red]Reindex failed:[/] {e}")
-                continue
-    except KeyboardInterrupt:
-        _console.print("[yellow]watcher stopped[/]")
+    def __call__(self, change: Change, path: str) -> bool:
+        return _is_relevant(self.cfg, Path(path))
 
 
-async def watch_and_serve(
-    cfg: Config,
-    debounce_ms: int = 500,
-    host: str = "127.0.0.1",
-    port: int = 5500,
+# ── per-root watcher coroutine ──────────────────────────────────────────────
+
+async def _watch_one(
+    workspace: Workspace,
+    root: Path,
+    debounce_ms: int,
+    serialize: asyncio.Semaphore,
+    on_reindex: callable | None = None,
 ) -> None:
-    """Run the watcher AND the web/JSON API in a single process.
+    """Watch one root forever (until cancelled). Holds the writer for that
+    root for the duration of each reindex pass; releases between passes so
+    the read-only slot can serve queries."""
+    slot = workspace.resolve(root)
+    cfg = slot.cfg
+    workspace.mark_watching(root, True)
 
-    Single Kuzu writer, swapped for a fresh read-only handle after each
-    reindex (writer-visibility quirk: a Connection that just performed
-    writes won't see them on subsequent fetch_all queries until the
-    Database is reopened). The API and the UI receive consistent reads
-    via `DBHolder` + an SSE `reindex_done` event after each swap.
-    """
-    import uvicorn
+    # Baseline incremental — just to make sure the on-disk DB is current.
+    try:
+        await asyncio.to_thread(_baseline_reindex, workspace, root)
+    except Exception as exc:
+        log.exception("baseline reindex failed for %s: %s", root, exc)
 
-    from docgraph.embed import Embedder, GPU_PROVIDERS
-    from docgraph.retrieve import Retriever
-    from docgraph.server import broadcast, make_app
-
-    # Bootstrap: writer DB for the baseline reindex. Closed afterward and
-    # replaced with a read-only handle that the API will share.
-    writer_db = GraphDB(cfg.db_path, embedding_dim=384)
-    writer_db.init_schema()
-    embedder = Embedder(
-        cfg.embedding_model,
-        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
-    )
-    indexer = Indexer(cfg, writer_db, embedder=embedder)
-
-    _console.rule(f"[bold cyan]Baseline index[/] — {cfg.repo_root}")
-    indexer.index_all(incremental=True)
-    writer_db.close()
-
-    ro_db = GraphDB(cfg.db_path, embedding_dim=384, read_only=True)
-    app = make_app(cfg, db=ro_db)
-    app.state.loop = asyncio.get_running_loop()
-
-    config = uvicorn.Config(
-        app, host=host, port=port, log_level="warning", lifespan="off",
-        # Cap graceful shutdown so Ctrl+C doesn't hang on the open SSE stream
-        # the browser keeps to /api/events.
-        timeout_graceful_shutdown=1,
-    )
-    server = uvicorn.Server(config)
-    server_task = asyncio.create_task(server.serve())
-
-    # Give uvicorn a tick to bind the port before we print the URL.
-    await asyncio.sleep(0.1)
-    _console.print(
-        f"[green]Serving[/] http://{host}:{port}/  "
-        f"[dim](live UI auto-redraws on reindex via /api/events)[/]"
-    )
     roots = [str(r) for r, _ in cfg.roots_with_prefix()]
     _console.print(
-        f"[green]Watching[/] {len(roots)} root(s), debounce={debounce_ms}ms. "
-        "[dim]Ctrl-C to stop.[/]"
+        f"[green]Watching[/] {slot.slug} ({len(roots)} fs root) "
+        f"debounce={debounce_ms}ms"
     )
 
     try:
@@ -179,65 +120,120 @@ async def watch_and_serve(
             if not relevant:
                 continue
             _console.rule(
-                f"[bold cyan]Reindex[/] - {len(relevant)} fs event(s)",
+                f"[cyan]Reindex {slot.slug}[/] — {len(relevant)} event(s)",
                 style="cyan",
             )
-            try:
-                # 1. Swap API to a writer DB so the read-only handle is
-                #    closed first (Kuzu file lock disallows two modes).
-                holder = app.state.db_holder
-                old_ro = holder.db
-                with holder.lock:
-                    try:
-                        old_ro.close()
-                    except Exception:
-                        pass
-                    writer = GraphDB(cfg.db_path, embedding_dim=384)
-                    writer.init_schema()
-                    holder.db = writer
-                    holder.retriever = Retriever(writer, embedder, cfg=cfg)
+            async with serialize:
+                try:
+                    await asyncio.to_thread(_reindex, workspace, root)
+                except Exception as exc:
+                    _console.print(f"[red]Reindex {slot.slug} failed:[/] {exc}")
+                    continue
+            workspace.mark_indexed(root, time.time())
+            if on_reindex is not None:
+                try:
+                    on_reindex(slot.slug, len(relevant))
+                except Exception as exc:
+                    log.exception("on_reindex callback failed: %s", exc)
+    except asyncio.CancelledError:
+        pass
+    finally:
+        workspace.mark_watching(root, False)
 
-                # 2. Reindex (sync, on a thread so SSE keepalives still flow)
-                indexer = Indexer(cfg, writer, embedder=embedder)
-                await asyncio.to_thread(indexer.index_all, True)
 
-                # 3. Close writer, reopen read-only so the freshly-written
-                #    rows become visible.
-                with holder.lock:
-                    try:
-                        writer.close()
-                    except Exception:
-                        pass
-                    new_ro = GraphDB(cfg.db_path, embedding_dim=384, read_only=True)
-                    holder.db = new_ro
-                    holder.retriever = Retriever(new_ro, embedder, cfg=cfg)
+def _baseline_reindex(workspace: Workspace, root: Path) -> None:
+    """Run an incremental index pass on `root`. Used to bring the on-disk
+    DB up to date before the watcher starts emitting deltas."""
+    slot = workspace.resolve(root)
+    writer = workspace.take_writer(root)
+    try:
+        embedder = Embedder(
+            slot.cfg.embedding_model,
+            providers=list(GPU_PROVIDERS) if slot.cfg.gpu else None,
+        )
+        indexer = Indexer(slot.cfg, writer, embedder=embedder)
+        indexer.index_all(incremental=True)
+    finally:
+        workspace.release_writer(root)
 
-                # 4. Tell the UI to refresh
-                broadcast(app, "reindex_done", {"ts": time.time(), "events": len(relevant)})
-            except Exception as e:  # noqa: BLE001
-                _console.print(f"[red]Reindex failed:[/] {e}")
-                continue
+
+def _reindex(workspace: Workspace, root: Path) -> None:
+    """Same as baseline; kept as a separate function so future logic can
+    diverge (e.g. a faster delta-only pass)."""
+    _baseline_reindex(workspace, root)
+
+
+# ── public entry points ─────────────────────────────────────────────────────
+
+async def watch_workspace(
+    workspace: Workspace,
+    roots: list[Path],
+    debounce_ms: int = 500,
+) -> None:
+    """Foreground multi-root watcher. No web/MCP — pure reindex loop."""
+    serialize = asyncio.Semaphore(1)
+    tasks = [
+        asyncio.create_task(_watch_one(workspace, r, debounce_ms, serialize, None))
+        for r in roots
+    ]
+    try:
+        await asyncio.gather(*tasks)
+    except asyncio.CancelledError:
+        for t in tasks:
+            t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+async def watch_and_serve_workspace(
+    workspace: Workspace,
+    app,
+    roots: list[Path],
+    *,
+    host: str = "127.0.0.1",
+    port: int = 5500,
+    debounce_ms: int = 500,
+    verbose: bool = False,
+) -> None:
+    """Run the FastAPI host AND per-root watchers on one event loop."""
+    import uvicorn
+    from docgraph.server import broadcast
+
+    app.state.loop = asyncio.get_running_loop()
+    config = uvicorn.Config(
+        app, host=host, port=port,
+        log_level="info" if verbose else "warning",
+        lifespan="off", timeout_graceful_shutdown=1,
+    )
+    server = uvicorn.Server(config)
+    server_task = asyncio.create_task(server.serve())
+    await asyncio.sleep(0.1)
+    _console.print(
+        f"[green]DocGraph host[/] http://{host}:{port}/  "
+        f"[dim](watching {len(roots)} root{'s' if len(roots) > 1 else ''})[/]"
+    )
+
+    serialize = asyncio.Semaphore(1)
+
+    def _emit(slug: str, n_events: int) -> None:
+        broadcast(app, "reindex_done", {
+            "repo_slug": slug, "ts": time.time(), "events": n_events,
+        })
+
+    watcher_tasks = [
+        asyncio.create_task(_watch_one(workspace, r, debounce_ms, serialize, _emit))
+        for r in roots
+    ]
+
+    try:
+        await server_task
     except (KeyboardInterrupt, asyncio.CancelledError):
-        _console.print("[yellow]watcher stopped[/]")
+        pass
     finally:
         server.should_exit = True
+        for t in watcher_tasks:
+            t.cancel()
+        await asyncio.gather(*watcher_tasks, return_exceptions=True)
         try:
             await asyncio.wait_for(server_task, timeout=5.0)
         except (asyncio.TimeoutError, asyncio.CancelledError):
             pass
-
-
-class _WatchFilter:
-    """watchfiles filter that drops irrelevant paths before they're emitted.
-
-    watchfiles passes (Change, str) to its filter. Returning False skips the
-    event entirely, which is what we want for ignore'd paths and unsupported
-    languages — otherwise a git checkout in a vendored dir would generate
-    thousands of events that all get debounced to a single reindex anyway.
-    """
-
-    def __init__(self, cfg: Config) -> None:
-        self.cfg = cfg
-
-    def __call__(self, change: Change, path: str) -> bool:
-        return _is_relevant(self.cfg, Path(path))

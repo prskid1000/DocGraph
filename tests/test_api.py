@@ -18,6 +18,7 @@ from fastapi.testclient import TestClient
 
 from docgraph.config import load_config
 from docgraph.server import make_app
+from docgraph.workspace import Workspace
 
 
 # --- App against the session-scoped indexed repo ----------------------
@@ -26,11 +27,14 @@ from docgraph.server import make_app
 @pytest.fixture(scope="module")
 def client(indexed):
     cfg, _db, _embedder, _stats = indexed
-    # make_app opens its own read-only connection — fine alongside the
-    # reader held by the `indexed` fixture (Kuzu allows multiple readers).
-    app = make_app(cfg)
+    # make_app opens its own read-only connections via the workspace.
+    # The reader held by the `indexed` fixture coexists fine — Kuzu allows
+    # multiple readers on the same DB file.
+    ws = Workspace([cfg])
+    app = make_app(ws)
     with TestClient(app) as c:
         yield c
+    ws.close()
 
 
 def test_index_html(client: TestClient):
@@ -263,7 +267,8 @@ def test_file_content_redacts_ai_blocked(tmp_path: Path):
     del db
     gc.collect()
 
-    app = make_app(cfg)
+    ws = Workspace([cfg])
+    app = make_app(ws)
     with TestClient(app) as c:
         r = c.get("/api/file_content", params={"file": "secrets.py"})
         assert r.status_code == 200

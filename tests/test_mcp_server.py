@@ -1,9 +1,9 @@
 """MCP tool surface tests.
 
-Verifies that `make_mcp(cfg)` registers all 15 tools and that each one is
-invokable via FastMCP's `call_tool` path. This protects against silent
-breakage of the MCP wiring layer (which the retriever-level tests don't
-cover).
+Verifies that `make_mcp(workspace)` registers all base tools + list_roots
+and that each one is invokable via FastMCP's `call_tool` path. Tools now
+take a `root` enum argument; the single-root case auto-defaults so call
+sites need not pass it.
 """
 from __future__ import annotations
 
@@ -13,6 +13,7 @@ import json
 import pytest
 
 from docgraph.mcp_tools import make_mcp
+from docgraph.workspace import Workspace
 
 
 EXPECTED_TOOLS = {
@@ -20,13 +21,16 @@ EXPECTED_TOOLS = {
     "explore", "impact_of", "test_impact", "cypher",
     "git_changes", "git_blame", "git_recent",
     "rules_for", "search_docs",
+    "list_roots",
 }
 
 
 @pytest.fixture(scope="module")
 def mcp(indexed):
     cfg, _db, _e, _stats = indexed
-    return make_mcp(cfg)
+    ws = Workspace([cfg])
+    yield make_mcp(ws)
+    ws.close()
 
 
 def _run(coro):
@@ -61,9 +65,42 @@ def test_all_tools_registered(mcp):
     assert not extra, f"unexpected MCP tools: {extra}"
 
 
-def test_tool_count_15(mcp):
+def test_tool_count(mcp):
     tools = _run(mcp.list_tools())
-    assert len(tools) == 15
+    # 15 retriever-backed tools + list_roots
+    assert len(tools) == 16
+
+
+def test_list_roots_tool(mcp):
+    tools = _run(mcp.list_tools())
+    assert "list_roots" in {t.name for t in tools}
+    out = _structured(_run(mcp.call_tool("list_roots", {})))
+    assert isinstance(out, list)
+    assert out
+    assert {"slug", "path", "default"} <= set(out[0].keys())
+
+
+def test_root_arg_is_enum_in_schema(mcp):
+    """Verify the `root` parameter shows up as a JSON Schema enum so the
+    LLM sees a closed value set rather than a free-form string."""
+    tools = _run(mcp.list_tools())
+    by_name = {t.name: t for t in tools}
+    schema = by_name["search"].parameters
+    props = schema.get("properties") or {}
+    root_prop = props.get("root")
+    assert root_prop is not None, f"search has no root prop: {props}"
+    # Pydantic emits enum either inline or via $ref to defs; allow both.
+    if "$ref" in root_prop:
+        defs = schema.get("$defs") or schema.get("definitions") or {}
+        ref_name = root_prop["$ref"].rsplit("/", 1)[-1]
+        target = defs.get(ref_name) or {}
+        assert "enum" in target, f"$ref'd schema missing enum: {target}"
+    else:
+        assert "enum" in root_prop, f"root prop missing enum: {root_prop}"
+    # Single-root case: exactly one allowed value, also set as default.
+    enum_vals = root_prop.get("enum") or []
+    assert len(enum_vals) == 1, f"expected single-root enum, got {enum_vals}"
+    assert root_prop.get("default") == enum_vals[0]
 
 
 def test_search_tool(mcp):

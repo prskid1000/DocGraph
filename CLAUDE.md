@@ -4,24 +4,27 @@ This file captures the things you can't infer from the code in 10 seconds. Read 
 
 ## What this project is
 
-A local code knowledge graph backed by a single embedded Kuzu file. Indexes any repo with tree-sitter, embeds entities with fastembed, and exposes everything via 15 MCP tools and a single-page web UI. As of 2.1.0, the UI also has process detection (entry-point → leaf call chains) and an LLM-grounded wiki of every top-level module.
+A local code knowledge graph. Indexes any repo with tree-sitter, embeds entities with fastembed, and exposes everything via MCP tools and a single-page web UI. As of 2.2.0, a single host process serves **multiple roots** (repos) at once — one uvicorn, one MCP endpoint, one log, with a closed-enum `root` argument on every tool/route so agents pick which repo per call.
 
 It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. The old code is preserved at tag `v1-legacy`. Do not resurrect any of those dependencies.
 
 ## Hard rules
 
-- **One Python package, one process, one DB file.** No new top-level dirs, no separate frontend builds, no microservices. (The optional embedding daemon at `docgraph daemon start` is a deliberate exception — opt-in, loopback-only, never required for any feature; the codepath always falls back to in-process embedding if the daemon is down.)
+- **One Python package, one process per machine, one DB file *per root*.** The `docgraph host` command runs the unified server (web UI + JSON API + MCP HTTP + optional watchers) for any number of roots. No new top-level dirs, no separate frontend builds, no microservices.
+- **Workspace is immutable for a host's lifetime.** Adding/removing roots requires a host restart (telecode does this automatically). This kept the design simple: no hot-reload endpoints, no synchronization on root membership, no dynamic schema regeneration mid-flight.
 - **Kuzu is the only data store.** Don't add SQLite, ChromaDB, Neo4j, Redis, etc.
 - **No npm.** The web UI is one HTML file at `docgraph/ui/index.html`. No build step.
 - **No torch dependency.** Embeddings go through `fastembed` (ONNX). Adding sentence-transformers/torch would 4× the install size. GPU support uses ONNX Runtime providers (`CUDAExecutionProvider` / `DmlExecutionProvider` / `CoreMLExecutionProvider`) — not torch CUDA. Users opt in by `pip install onnxruntime-gpu` (or `-directml` / `-silicon`); we never depend on those.
 - **Per-language processor classes are forbidden.** All language support comes from `parse.py::LANGUAGES` + `TAGS_QUERIES`. Adding a language = pip install `tree-sitter-<x>` and add two dict entries.
+- **Tools/routes use a closed-enum `root` parameter.** Built dynamically from the workspace's slugs at host startup. The LLM picks from a known set; typos rejected at the protocol layer; no free-form path matching needed at request time. Single-root case: enum has one value and is the default — callers don't need to think about it.
 
 ## File map
 
 | File | Purpose |
 |---|---|
-| `docgraph/cli.py` | Typer entry. Add subcommands here. |
-| `docgraph/config.py` | Auto-detects repo root + ecosystems, respects `.gitignore` + `.docgraphignore`. Multi-root via `extra_roots`; persisted in `.docgraph/repos.json`. |
+| `docgraph/cli.py` | Typer entry. `host` is the unified command (web UI + JSON API + MCP HTTP + optional watchers). `serve`/`mcp`/`watch` are thin shims that delegate to `host`. Each command takes positional `<path>` (single-root sugar) and/or repeatable `--root` flags (multi-root). |
+| `docgraph/workspace.py` | `Workspace` registry holding a `RootSlot` per registered root. Each slot owns its read-only Kuzu connection + Retriever; the watcher gets a writer on demand via `take_writer()` and releases it via `release_writer()` after each reindex (the workspace then reopens the read-only handle so subsequent queries see new data — Kuzu's writer-visibility quirk). 4-step lookup in `resolve()`: exact path → slug → file-prefix → default. Embedder pool deduped by `(model_name, gpu)`. |
+| `docgraph/config.py` | Auto-detects repo root + ecosystems, respects `.gitignore` + `.docgraphignore`. Single-root indexer-side multi-root via `Config.extra_roots` (different concept: indexes multiple paths into one DB). Persisted in `.docgraph/repos.json`. The host-level multi-root abstraction lives in `workspace.py`. |
 | `docgraph/ignores.py` | Universal ignore patterns + per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Swift / Ruby / Dart / Elixir / Scala / PHP / Terraform / Unity / Go). Universal layer also covers Jupyter / MLflow / wandb / DVC / Haskell / Zig / R / Scala tooling. Inline string lists, no template files. |
 | `docgraph/parse.py` | tree-sitter wrappers + tags queries per language. Method qname rescoping is keyed on `id(node)` not on the original qname string — methods sharing a base qname (`file::area` for both `Square.area` and `Circle.area`) used to collide and remap to one final qname. |
 | `docgraph/daemon.py` | Optional cross-CLI embedding daemon. Length-prefixed JSON on loopback TCP (default port 5577). `is_running()` checks the lock file at `~/.docgraph/daemon.lock` and pings the recorded port — stale locks (PID dead, port silent) are auto-cleared. `Embedder.embed()` consults `embed_via_daemon()` before loading its own ONNX session; daemon-side `_serve_one()` calls `embedder._ensure().embed(...)` directly to avoid recursing back through the wrapper. |
@@ -37,9 +40,10 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/llm.py` | Tiny urllib-based client for OpenAI- or Anthropic-compatible local servers. Used by `--llm-model <name>` to summarize entities lacking native docs. Off by default. Sends `reasoning_effort: "none"` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and a 150-token budget fits a one-sentence answer. |
 | `docgraph/docs.py` | URL fetch + HTML→text + chunking + Doc node ingestion. Cursor `@Docs` parity. |
 | `docgraph/wiki.py` | LLM-grounded module wiki. `build_wiki(cfg, db, llm)` walks the top-level dirs, gathers a fact sheet from Kuzu (top classes / functions / importers / tests by PageRank), prompts the LLM, writes Markdown to `<repo>/.docgraph/wiki/<slug>.md`. Falls back to a fact-sheet rendering when the LLM is unreachable so the wiki is never blank. CLI: `docgraph wiki [--module X]`. API: `/api/wiki/list`, `/api/wiki/page?slug=`, `POST /api/wiki/build`. The fact-gathering uses `c.body` (not `c.docstring` — that property doesn't exist on the schema) and joins File via `path` not `file`. |
-| `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. `watch_and_serve()` runs uvicorn + the watcher in one event loop and broadcasts SSE `reindex_done` on each cycle. |
-| `docgraph/mcp_tools.py` | 15 MCP tools (6 base + 9 differentiators). Keep this surface tight. |
-| `docgraph/server.py` | FastAPI: web UI + JSON API + SSE `/api/events`. `make_app(cfg, db=None)` accepts a pre-opened DB; `app.state.db_holder` is a swap-safe `(db, retriever)` wrapper used by `watch --serve`. |
+| `docgraph/watch.py` | `watchfiles` loop with pre-debounce ignore filter. `watch_workspace(workspace, roots)` runs N async `_watch_one` tasks (one per root) on the current event loop. `watch_and_serve_workspace` does the same but also boots uvicorn for the host app. A workspace-wide `asyncio.Semaphore(1)` serializes reindexes across roots so two CPU-bound passes don't fight. Each per-root task takes a writer, runs `Indexer.index_all(incremental=True)` via `to_thread()`, releases the writer (which reopens the workspace's RO slot), and broadcasts SSE `reindex_done {repo_slug, ts, events}`. |
+| `docgraph/mcp_tools.py` | 15 retriever-backed tools + `list_roots`. Each retriever-backed tool gets a `root: RootSlug = DEFAULT` argument typed as a dynamic `(str, Enum)` built at `make_mcp` time from the workspace's slugs. **No `from __future__ import annotations` here** — Pydantic's lazy `get_type_hints` can't resolve the closure-local `RootSlug` if annotations are stringified. |
+| `docgraph/mcp_stdio_proxy.py` | Strict stdio↔HTTP proxy for editors (Cursor, Claude Desktop). Probes `http://127.0.0.1:5500/api/roots`; if a host is up, exposes a stdio surface scoped to the editor's `<path>` (refuses if that path isn't a registered root — config-consistency over silent duplication). If no host is reachable, exits with a clear "start a host first" error. `--standalone` is the explicit opt-out for "I don't want host sharing". |
+| `docgraph/server.py` | FastAPI host: web UI + JSON API + SSE `/api/events`. `make_app(workspace)` builds a dynamic `RootSlug` enum from the workspace's slugs and threads it through every route as a closed-enum `root` query param. New: `GET /api/roots` for clients to discover registered roots. **No `from __future__ import annotations`** — same enum-evaluation concern as `mcp_tools.py`. |
 | `docgraph/ui/index.html` | Single-page graph viewer. Canvas 2D only — Sigma.js / WebGL was removed in 2.1.0 because it was unreliable on first paint. Performance comes from a Web Worker that runs **ForceAtlas2-lite** (linear repulsion, degree-weighted, on a spatial grid) + **label-propagation community detection**. Worker bootstrap is an inline `Blob([WORKER_SRC])`-backed Worker — no esm.sh, no CDN. Render batches edges/nodes by color and viewport-culls in world coords. New tabs: Processes (entry-point → call chains via `/api/processes`) and Wiki (LLM module pages via `/api/wiki/*`). Color-mode toggle (kind / community) lives in the Filters tab. |
 
 Runtime data: `<repo>/.docgraph/graph.kuzu/` (DB), `<repo>/.docgraph/cache.json` (per-file `{hash, entities, edges}`), `<repo>/.docgraph/repos.json` (multi-repo list).
@@ -126,7 +130,7 @@ diff /tmp/full_stats.txt /tmp/incremental_stats.txt
 
 If the diff is non-empty, your change broke incremental correctness.
 
-## MCP tool surface — 6 base + 9 differentiators
+## MCP tool surface — 15 retriever tools + `list_roots`
 
 Base: `search`, `definition`, `references`, `call_graph`, `file_map`, `neighborhood`.
 
@@ -142,28 +146,35 @@ Differentiators (the wedge against Cursor / Greptile / Sourcegraph):
 - `rules_for(file)` — Cursor-rules ecosystem compatibility: matches `.cursor/rules/*.mdc` by glob plus `AGENTS.md` / `CLAUDE.md` always-on.
 - `search_docs(query)` — semantic search across `docgraph docs add <url>`-ingested external docs (Cursor `@Docs` parity).
 - `search(rerank=True)` — opt-in cross-encoder rerank over the top 50 candidates. Falls back silently if the model can't load (offline, missing).
+- `list_roots()` — discover what roots the host was started with. Returns `[{slug, path, default, watching, last_indexed_at}, ...]`.
+
+**Every retriever-backed tool has a final `root: RootSlug` argument** typed as a dynamic `(str, Enum)` built from the workspace's slugs at host startup. Single-root host → enum has one value, defaulted; LLM doesn't see it. Multi-root host → LLM picks from a closed set; protocol-layer rejection on typos.
 
 Don't add more without a strong reason. `search` accepts `focus_file` / `focus_symbol` for personalized PageRank — prefer threading those through over adding new tools.
 
-## Multi-repo
+## Multi-root architecture
 
-`extra_roots: list[Path]` on `Config`, persisted in `.docgraph/repos.json`. Walker emits `(absolute_path, logical_rel)` where `logical_rel = "<repo>/<rel>"` in multi-root mode. Cross-repo `IMPORTS` resolve via the existing fuzzy substring match — no schema change. `_write_co_changed` runs `git log` per root and prefixes paths.
+The `Workspace` registry (in `workspace.py`) is the central abstraction. A host process owns one workspace; the workspace owns N `RootSlot` objects, each with its own `Config`, read-only Kuzu connection, and Retriever. The dynamic enum types in `mcp_tools.py` and `server.py` are derived from the workspace's slug list at boot.
+
+**Root resolution.** `Workspace.resolve(value)` does a 4-step lookup:
+1. None / "" → default (first registered).
+2. Exact match against any registered absolute path.
+3. Slug match (case-insensitive, against the lowercased basename).
+4. Path-prefix: if `value` is a file path, find the registered root that contains it.
+
+In practice MCP/API callers send slugs (the closed enum forces it). Path-prefix exists for direct Python callers and for the stdio proxy's path-to-slug resolution at startup.
+
+**Indexer-side `extra_roots`** still exists on `Config` — a different concept from workspace multi-root. `extra_roots` lets the indexer walk multiple paths into **one** `.docgraph/graph.kuzu` (for monorepos with sibling projects). The workspace's roots are independent indexes that sit side-by-side; each has its own DB file. Both shapes can coexist: a workspace can register one root whose Config carries `extra_roots`.
 
 ## Watch mode
 
-`docgraph watch` opens a writer connection for its lifetime — kill `serve` / `mcp` against the same DB first. Pre-debounce filter (`_WatchFilter`) drops ignored / unsupported-language paths *before* watchfiles emits them so `git checkout` of `node_modules` doesn't fire 5 k events.
+`docgraph host --watch <root>` starts the unified server with a per-root watcher task on the same event loop. Each watcher takes a writer connection from the workspace via `take_writer(root)` for the duration of one reindex pass, runs `Indexer.index_all(incremental=True)` via `asyncio.to_thread`, then releases the writer (which reopens the workspace's read-only handle for that root — Kuzu's writer-visibility quirk). Other roots keep serving from their unaffected RO handles throughout.
 
-`docgraph watch --serve` runs the watcher AND uvicorn in one asyncio loop (`watch.watch_and_serve`):
+A workspace-wide `asyncio.Semaphore(1)` serializes reindexes across roots; otherwise two CPU-bound passes would fight for cores. After each pass, an SSE `reindex_done {repo_slug, ts, events}` event goes out so the live UI refreshes only the affected slot.
 
-1. Opens a writer DB → does a baseline incremental reindex → closes the writer.
-2. Reopens read-only and starts uvicorn. The API uses `app.state.db_holder` (a `threading.Lock`-guarded `(db, retriever)` pair) so handlers always see a consistent snapshot.
-3. On each `awatch` change batch:
-   a. Acquire the holder lock; close the read-only DB; open writer; swap into the holder.
-   b. Run `Indexer.index_all(incremental=True)` via `asyncio.to_thread()` so SSE keepalives keep flowing.
-   c. Acquire lock again; close writer; reopen read-only; swap back. (Required because Kuzu writer connections don't see their own writes via subsequent `fetch_all` queries — the close+reopen forces visibility.)
-   d. `server.broadcast(app, "reindex_done", {...})` pushes to every active SSE subscriber. UI re-fetches `/api/graph` + `/api/stats`.
+The pre-debounce `_WatchFilter` per root drops `node_modules` / `.git` / non-source paths before `awatch` emits them, so a `git checkout` doesn't blow up.
 
-Single-process design avoids the Kuzu file-lock conflict that otherwise blocks `serve` from coexisting with `watch`.
+`docgraph watch <path>` (the legacy CLI alias) is now a thin wrapper that builds a single-root workspace and runs `watch_workspace`. `docgraph watch --serve` is equivalent to `docgraph host --watch <path>`.
 
 ## Ignore architecture
 
@@ -252,14 +263,20 @@ Anything that pushes past these needs a comment explaining why.
 ## Common dev commands
 
 ```bash
-.venv/Scripts/pip install -e .                 # editable install
-.venv/Scripts/docgraph index --full            # rebuild from scratch
-.venv/Scripts/docgraph serve                   # http://127.0.0.1:5500
-.venv/Scripts/docgraph stats                   # quick health check
+.venv/Scripts/pip install -e .                                # editable install
+.venv/Scripts/docgraph index --full                           # rebuild from scratch
+.venv/Scripts/docgraph host                                   # cwd as the only root → http://127.0.0.1:5500
+.venv/Scripts/docgraph host --root /repo-a --root /repo-b     # multi-root
+.venv/Scripts/docgraph host --root /repo-a --watch /repo-a    # also reindex on change
+.venv/Scripts/docgraph stats                                  # quick health check
 
-# Kill any running servers/MCPs holding the DB lock:
-taskkill //F //IM python.exe                   # Windows
-pkill -f docgraph                              # *nix
+# Editor stdio MCP (Cursor / Claude Desktop). Probes the running host.
+.venv/Scripts/docgraph mcp /repo-a --transport stdio          # proxy mode if host is up
+.venv/Scripts/docgraph mcp /repo-a --transport stdio --standalone  # explicit isolated mode
+
+# Kill any running host holding the DB lock:
+taskkill //F //IM python.exe                                  # Windows
+pkill -f docgraph                                             # *nix
 ```
 
 ## Things that have broken before — don't repeat
@@ -276,17 +293,20 @@ pkill -f docgraph                              # *nix
 - After `Indexer.index_all(incremental=False)`, the `GraphDB` you originally passed in is stale — `index_all` swaps `self.db` mid-run. Close `indexer.db`, not the original handle.
 - Relying on `del db; gc.collect()` to release the Kuzu file lock on Windows → flaky. Call `db.close()` explicitly. After COPY FROM in particular, internal Kuzu refs survive plain GC.
 - Sending a request to a reasoning-model endpoint without `reasoning_effort: "none"` → empty content because the model burned all 150 tokens on `reasoning_content`. Fix is the flag, not bumping max_tokens.
+- Using `from __future__ import annotations` in `mcp_tools.py` or `server.py` → Pydantic's lazy `get_type_hints` can't resolve the closure-local `RootSlug` enum and tools/routes blow up at request time with "TypeAdapter is not fully defined". Both files deliberately avoid the future import.
+- `str(enum_member)` on a `(str, Enum)` subclass returns `'RootSlug.X'`, not `'x'`. Use `member.value` when looking the slug up in the workspace.
 
-## Telecode integration (optional)
+## Telecode integration
 
-[Telecode](../.telecode)'s system-tray UI can supervise `docgraph index`, `docgraph watch`, `docgraph serve`, `docgraph daemon start`, and one or more `docgraph mcp <path> --transport http` processes (one child per configured repo, ports = `base_port + i` via `DOCGRAPH_PORT` env). Each child's tools get bridged into telecode's proxy as managed tools (`docgraph_<slug>_<tool>` for multi-repo, `docgraph_<tool>` for single-repo) so a local LLM speaking through the proxy can call DocGraph without a separate MCP client.
+[Telecode](../.telecode)'s system-tray UI supervises a single `docgraph host` child for all configured roots. The child's MCP tools get bridged into telecode's proxy as managed tools, namespaced as `docgraph_<tool>` (no per-root prefix — agents pass `root=<slug>` per call to scope queries).
 
-Implications when telecode owns the lifecycle:
-- **Don't run `docgraph watch` / `mcp` standalone against the same `.docgraph/`** — same lock-stomp risk as ever. Telecode's supervisor refuses to start Serve / MCP for a path while Watch holds it; if you want to manage a repo from the CLI, disable the corresponding telecode toggle first.
-- **Master toggles** in the telecode tray = full lifecycle (kill subprocesses + free ports + unregister bridge entries from the proxy registry). **Per-tool toggles** in the existing Managed list = injection-only.
-- **Auto-start.** `docgraph.{watch,serve,daemon,mcp}.auto_start: true` in telecode's `settings.json` brings the children up at `main.py:_post_init`.
+Implications:
+- **One child, one port, one log.** Telecode spawns `docgraph host --root A --root B [--watch …] --port <N>` and supervises that lifecycle. Adding/removing a root in telecode settings → restart the child. The workspace is immutable for a host's lifetime by design.
+- **Don't run `docgraph host` / stdio-mcp manually while telecode owns it** — they'd contend for the configured port. Use `docgraph mcp <path> --transport stdio` (it'll proxy through telecode's running host) or `--standalone` if you really need an isolated process.
+- **Auto-start.** `docgraph.host.auto_start: true` in telecode's `settings.json` brings the child up at `main.py:_post_init`.
+- **No daemon CLI anymore.** The embedding daemon ran as a separate `docgraph daemon start` process to share embedders across CLIs — pointless once everything lives inside one host. The daemon code is still there but only as an optional internal optimization; no CLI command surfaces it.
 
-No code changes required on the docgraph side — telecode just spawns the existing CLI commands. Pointer: `<telecode>/docgraph/` package + the **DocGraph integration** section in `<telecode>/CLAUDE.md` for the full design.
+No code changes required on the docgraph side — telecode just spawns the existing `host` CLI command. Pointer: `<telecode>/docgraph/` package + the **DocGraph integration** section in `<telecode>/CLAUDE.md` for the full design.
 
 ## Known limitations / next-up
 
@@ -295,4 +315,4 @@ No code changes required on the docgraph side — telecode just spawns the exist
 - Embedding model loads fresh per **process** (~1s cold). In-process duplication is solved (see `embed.py::_MODEL_CACHE`); pre-warming a daemon across CLI invocations would help further.
 - `IMPORTS_SYMBOL` is now extracted from `@import.symbol` captures in Python (`from x import Y`), JS (`import {Y} from "x"`), TS, and the JS default-import shape. Java's qualified imports (`import a.b.C;`) terminate in the symbol name — the resolver matches the final dotted segment against Class / Function names; no separate tag query needed.
 - `OVERRIDES` is derived in `index.py` from `INHERITS` + same-name methods via the inheritance closure (so a grandchild override of a grandparent method is also recorded). Cheap O(classes × methods); runs once per index pass with no embeddings touched.
-- The watcher holds a writer lock for its lifetime — kill `serve` / `mcp` first.
+- The watcher holds a writer lock per root for the duration of each reindex pass; the `Workspace.release_writer()` call after each pass reopens the read-only handle so other roots and the API stay live throughout.
