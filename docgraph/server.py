@@ -87,11 +87,15 @@ def make_app(workspace: Workspace) -> FastAPI:
     async def api_search(
         q: str, kind: str | None = None, limit: int = 10,
         focus_file: str | None = None, focus_symbol: str | None = None,
-        rerank: bool = False, root: RootSlug = DEFAULT,
+        rerank: bool | None = None, root: RootSlug = DEFAULT,
     ):
-        return _r(root).search(
+        slot = _slot(root)
+        # Per-call ?rerank= wins; otherwise fall back to cfg.rerank_default
+        # (set via DOCGRAPH_RERANK_DEFAULT env var or telecode tray toggle).
+        use_rerank = rerank if rerank is not None else bool(getattr(slot.cfg, "rerank_default", False))
+        return slot.retriever.search(
             q, kind=kind, limit=limit,
-            focus_file=focus_file, focus_symbol=focus_symbol, rerank=rerank,
+            focus_file=focus_file, focus_symbol=focus_symbol, rerank=use_rerank,
         )
 
     @app.get("/api/definition")

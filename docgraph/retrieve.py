@@ -33,7 +33,10 @@ class Retriever:
 
     def _reranker_(self) -> Reranker:
         if self._reranker is None:
-            self._reranker = Reranker()
+            # cfg.rerank_model may be "" — Reranker falls back to its env var
+            # default in that case (jinaai/jina-reranker-v1-tiny-en).
+            model = getattr(self.cfg, "rerank_model", "") or None
+            self._reranker = Reranker(model_name=model)
         return self._reranker
 
     def _ranker_(self) -> PersonalizedRanker:

@@ -41,12 +41,15 @@ def make_mcp(workspace: Workspace) -> FastMCP:
     RootSlug = _root_enum(workspace)
     DEFAULT = RootSlug(workspace.default_slug())
 
+    def _slot(root):
+        slug = root.value if hasattr(root, "value") else str(root)
+        return workspace.resolve(slug)
+
     def _retriever(root):
         # Members of `(str, Enum)` subclasses have a `.value` attribute
         # holding the actual slug. `str(member)` would give 'RootSlug.X'
         # instead, which is what we don't want.
-        slug = root.value if hasattr(root, "value") else str(root)
-        return workspace.resolve(slug).retriever
+        return _slot(root).retriever
 
     @mcp.tool()
     def list_roots() -> list[dict]:
@@ -62,7 +65,7 @@ def make_mcp(workspace: Workspace) -> FastMCP:
         limit: int = 10,
         focus_file: str | None = None,
         focus_symbol: str | None = None,
-        rerank: bool = False,
+        rerank: bool | None = None,
         root: RootSlug = DEFAULT,
     ) -> list[dict]:
         """Hybrid search for code entities by natural-language query.
@@ -70,12 +73,15 @@ def make_mcp(workspace: Workspace) -> FastMCP:
         focus_file / focus_symbol: bias ranking toward the agent's current
         location via personalized PageRank.
         rerank: run a cross-encoder over the top candidates for higher
-        precision (downloads a ~33 MB model on first use).
+        precision. None = follow cfg.rerank_default (DOCGRAPH_RERANK_DEFAULT
+        env var or telecode tray toggle); explicit True/False overrides.
         root: which registered root to query."""
-        return _retriever(root).search(
+        slot = _slot(root)
+        use_rerank = rerank if rerank is not None else bool(getattr(slot.cfg, "rerank_default", False))
+        return slot.retriever.search(
             query, kind=kind, limit=limit,
             focus_file=focus_file, focus_symbol=focus_symbol,
-            rerank=rerank,
+            rerank=use_rerank,
         )
 
     @mcp.tool()

@@ -23,6 +23,12 @@ class Config:
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_dim: int = 384
     embed_batch_size: int = 256
+    # Cross-encoder reranker (opt-in per search call). When `rerank_default`
+    # is True the API/MCP `search` endpoints default `rerank=True` so callers
+    # don't have to ask for it. `rerank_model` empty = use Reranker's default
+    # (jinaai/jina-reranker-v1-tiny-en).
+    rerank_default: bool = False
+    rerank_model: str = ""
     # GPU acceleration for embeddings (and reranker). Off by default; when
     # True, the Embedder asks ONNX Runtime to use CUDA / DirectML / CoreML
     # before falling back to CPU. Requires `onnxruntime-gpu` or
@@ -261,6 +267,8 @@ def load_config(
         # Explicit override; otherwise auto-derived from the model in
         # Config.__post_init__ via fastembed's catalog.
         embedding_dim=int(os.environ.get("DOCGRAPH_EMBED_DIM", "384")),
+        rerank_default=os.environ.get("DOCGRAPH_RERANK_DEFAULT", "").lower() in ("1", "true", "yes"),
+        rerank_model=os.environ.get("DOCGRAPH_RERANK_MODEL", ""),
         gpu=os.environ.get("DOCGRAPH_GPU", "").lower() in ("1", "true", "yes"),
         # Setting DOCGRAPH_LLM_MODEL is sufficient to enable; the boolean
         # DOCGRAPH_LLM_DOCSTRINGS still works as an explicit override.
