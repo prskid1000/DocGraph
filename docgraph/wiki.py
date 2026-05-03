@@ -19,7 +19,7 @@ from pathlib import Path
 
 from docgraph.config import Config
 from docgraph.db import GraphDB
-from docgraph.llm import LLMClient, LLMConfig, llm_config_from_env
+from docgraph.llm import LLMClient, LLMConfig
 
 log = logging.getLogger(__name__)
 
@@ -194,31 +194,22 @@ _DEFAULT_WIKI_TAIL = (
 )
 
 
+_WIKI_TAIL_OVERRIDE: str | None = None
+
+
+def set_wiki_prompt_tail(text: str | None) -> None:
+    """Install a process-wide override for the wiki output-format tail.
+    Pass None / "" to revert to the built-in. The override does NOT need
+    any placeholder substitution — the rendered facts sit above this
+    section, and the override is appended verbatim."""
+    global _WIKI_TAIL_OVERRIDE
+    _WIKI_TAIL_OVERRIDE = text if (text and text.strip()) else None
+
+
 def _wiki_output_format() -> str:
     """Tail of the wiki prompt — the "Output format" instruction block.
-
-    Override priority:
-    1) `DOCGRAPH_LLM_PROMPT_WIKI` (literal text) — replaces the tail wholesale.
-    2) `DOCGRAPH_LLM_PROMPT_WIKI_FILE` (path) — same, from a file.
-    3) Built-in default (`_DEFAULT_WIKI_TAIL`).
-
-    The override does NOT need any placeholder substitution — the rendered
-    facts already sit above this section. Override callers can ask for any
-    section structure / length / tone they want."""
-    import os
-    text = os.environ.get("DOCGRAPH_LLM_PROMPT_WIKI")
-    if text and text.strip():
-        return text
-    path = os.environ.get("DOCGRAPH_LLM_PROMPT_WIKI_FILE", "").strip()
-    if path:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            if content.strip():
-                return content
-        except OSError:
-            pass
-    return _DEFAULT_WIKI_TAIL
+    Returns the active override or the built-in default."""
+    return _WIKI_TAIL_OVERRIDE or _DEFAULT_WIKI_TAIL
 
 
 def wiki_prompt_tail() -> str:
@@ -248,7 +239,7 @@ def build_wiki(
     `depth=1` = top-level dirs only (old behavior). `depth=12` (default)
     = one page per leaf folder for any reasonable repo.
     """
-    llm = llm or LLMClient(llm_config_from_env())
+    llm = llm or LLMClient(LLMConfig())
     # Wiki pages need much more headroom than docstrings (150 tokens).
     # Bump for the wiki call only — the original LLMConfig stays unchanged
     # for any other caller sharing the same client instance.

@@ -25,7 +25,6 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -54,34 +53,24 @@ _PROMPT = (
 )
 
 
-def _load_prompt_override() -> str | None:
-    """Read a docstring-prompt override from env, in priority order:
-    1) `DOCGRAPH_LLM_PROMPT_DOCSTRING` (literal text)
-    2) `DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE` (path to file)
+# Process-wide override slot. The CLI populates this once at startup
+# from --llm-prompt-docstring-file (read once, no env reads at all).
+# Set via set_docstring_prompt(); read via docstring_prompt_template().
+_DOCSTRING_PROMPT_OVERRIDE: str | None = None
 
-    Returns None if neither is set or the file is missing/unreadable.
-    Caller is responsible for ensuring the override still contains the
-    `{kind}` / `{name}` / `{language}` / `{body}` placeholders — if any
-    are missing, `.format()` will raise KeyError and `summarize()` swallows
-    it as a generic LLM failure. We don't validate up front because env
-    vars may be set ahead of any indexer call."""
-    text = os.environ.get("DOCGRAPH_LLM_PROMPT_DOCSTRING")
-    if text and text.strip():
-        return text
-    path = os.environ.get("DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE", "").strip()
-    if path:
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                content = f.read()
-            return content if content.strip() else None
-        except OSError:
-            return None
-    return None
+
+def set_docstring_prompt(text: str | None) -> None:
+    """Install a process-wide override for the docstring prompt template.
+    Pass None / "" to revert to the built-in. Callers must keep the
+    {kind}/{name}/{language}/{body} placeholders — `.format()` will raise
+    KeyError otherwise and `summarize()` falls back to the built-in."""
+    global _DOCSTRING_PROMPT_OVERRIDE
+    _DOCSTRING_PROMPT_OVERRIDE = text if (text and text.strip()) else None
 
 
 def docstring_prompt_template() -> str:
     """Return the active docstring prompt template (override or default)."""
-    return _load_prompt_override() or _PROMPT
+    return _DOCSTRING_PROMPT_OVERRIDE or _PROMPT
 
 
 @dataclass
@@ -244,20 +233,3 @@ class LLMClient:
         return first[:300]
 
 
-# --- Env helpers ------------------------------------------------------
-
-
-def llm_config_from_env() -> LLMConfig:
-    """Build LLMConfig from DOCGRAPH_LLM_* env vars. Used as the baseline
-    that CLI flags override. Always returns a valid config — callers
-    decide whether to actually call out based on `cfg.llm_docstrings`."""
-    import os
-    return LLMConfig(
-        host=os.environ.get("DOCGRAPH_LLM_HOST", "localhost"),
-        port=int(os.environ.get("DOCGRAPH_LLM_PORT", DEFAULT_PORT)),
-        model=os.environ.get("DOCGRAPH_LLM_MODEL", DEFAULT_MODEL),
-        format=os.environ.get("DOCGRAPH_LLM_FORMAT", DEFAULT_FORMAT),
-        api_key=os.environ.get("DOCGRAPH_LLM_API_KEY") or None,
-        max_tokens=int(os.environ.get("DOCGRAPH_LLM_MAX_TOKENS", DEFAULT_MAX_TOKENS)),
-        timeout=int(os.environ.get("DOCGRAPH_LLM_TIMEOUT", DEFAULT_TIMEOUT_SECS)),
-    )

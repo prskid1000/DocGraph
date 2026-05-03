@@ -238,11 +238,50 @@ def find_repo_root(start: Path | None = None) -> Path:
     return cur
 
 
+_DEFAULT_TEXT_EXTENSIONS = ("md", "markdown", "txt", "rst", "csv")
+_DEFAULT_ASSET_EXTENSIONS = (
+    "pdf", "xlsx", "xls", "docx", "doc", "ppt", "pptx",
+    "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tiff",
+    "mp4", "mov", "webm", "avi", "mkv", "mp3", "wav", "flac", "ogg", "m4a",
+    "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz",
+    "parquet", "feather", "arrow", "h5", "hdf5", "pkl", "pickle", "npz", "npy",
+    "ttf", "woff", "woff2", "otf", "eot",
+    "gltf", "glb", "fbx", "obj", "stl", "blend",
+)
+
+
 def load_config(
     repo_root: Path | None = None,
     extra_roots: list[Path] | None = None,
+    *,
+    host: str = "127.0.0.1",
+    port: int = 5500,
+    embedding_model: str = "BAAI/bge-small-en-v1.5",
+    embedding_dim: int = 384,
+    rerank_default: bool = False,
+    rerank_model: str = "",
+    rerank_gpu: bool = False,
+    gpu: bool = False,
+    llm_docstrings: bool = False,
+    llm_host: str = "localhost",
+    llm_port: int = 1235,
+    llm_model: str = "qwen3.6-35b",
+    llm_format: str = "openai",
+    llm_max_tokens: int = 150,
+    index_documents: bool = False,
+    text_extensions: tuple[str, ...] | None = None,
+    asset_extensions: tuple[str, ...] | None = None,
 ) -> Config:
-    """Load config. extra_roots, when given, overrides any persisted list and is saved."""
+    """Build a Config from explicit kwargs.
+
+    Every knob is a parameter — no DOCGRAPH_* env vars are read. Setting
+    `llm_model` to a non-default value implies `llm_docstrings=True`
+    (kept for parity with the historical "set the model = enable the
+    feature" behaviour); pass `llm_docstrings=False` to override.
+
+    `extra_roots`, when given, overrides any persisted list and is saved
+    to .docgraph/repos.json.
+    """
     root = (repo_root or find_repo_root()).resolve()
     data = root / ".docgraph"
     data.mkdir(exist_ok=True)
@@ -261,50 +300,30 @@ def load_config(
     else:
         extras = persisted
 
+    if llm_model and llm_model != "qwen3.6-35b":
+        llm_docstrings = True
+
     return Config(
         repo_root=root,
         extra_roots=extras,
         data_dir=data,
         db_path=data / "graph.kuzu",
         cache_path=data / "cache.json",
-        host=os.environ.get("DOCGRAPH_HOST", "127.0.0.1"),
-        port=int(os.environ.get("DOCGRAPH_PORT", "5500")),
-        embedding_model=os.environ.get("DOCGRAPH_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
-        # Explicit override; otherwise auto-derived from the model in
-        # Config.__post_init__ via fastembed's catalog.
-        embedding_dim=int(os.environ.get("DOCGRAPH_EMBED_DIM", "384")),
-        rerank_default=os.environ.get("DOCGRAPH_RERANK_DEFAULT", "").lower() in ("1", "true", "yes"),
-        rerank_model=os.environ.get("DOCGRAPH_RERANK_MODEL", ""),
-        rerank_gpu=os.environ.get("DOCGRAPH_RERANK_GPU", "").lower() in ("1", "true", "yes"),
-        gpu=os.environ.get("DOCGRAPH_GPU", "").lower() in ("1", "true", "yes"),
-        # Setting DOCGRAPH_LLM_MODEL is sufficient to enable; the boolean
-        # DOCGRAPH_LLM_DOCSTRINGS still works as an explicit override.
-        llm_docstrings=(
-            os.environ.get("DOCGRAPH_LLM_DOCSTRINGS", "").lower() in ("1", "true", "yes")
-            or bool(os.environ.get("DOCGRAPH_LLM_MODEL"))
-        ),
-        llm_host=os.environ.get("DOCGRAPH_LLM_HOST", "localhost"),
-        llm_port=int(os.environ.get("DOCGRAPH_LLM_PORT", "1235")),
-        llm_model=os.environ.get("DOCGRAPH_LLM_MODEL", "qwen3.6-35b"),
-        llm_format=os.environ.get("DOCGRAPH_LLM_FORMAT", "openai"),
-        llm_max_tokens=int(os.environ.get("DOCGRAPH_LLM_MAX_TOKENS", "150")),
-        index_documents=os.environ.get("DOCGRAPH_INDEX_DOCUMENTS", "").lower() in ("1", "true", "yes"),
-        text_extensions=tuple(
-            e.strip().lstrip(".").lower()
-            for e in os.environ.get("DOCGRAPH_TEXT_EXTS", "").split(",")
-            if e.strip()
-        ) or ("md", "markdown", "txt", "rst", "csv"),
-        asset_extensions=tuple(
-            e.strip().lstrip(".").lower()
-            for e in os.environ.get("DOCGRAPH_ASSET_EXTS", "").split(",")
-            if e.strip()
-        ) or (
-            "pdf", "xlsx", "xls", "docx", "doc", "ppt", "pptx",
-            "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tiff",
-            "mp4", "mov", "webm", "avi", "mkv", "mp3", "wav", "flac", "ogg", "m4a",
-            "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz",
-            "parquet", "feather", "arrow", "h5", "hdf5", "pkl", "pickle", "npz", "npy",
-            "ttf", "woff", "woff2", "otf", "eot",
-            "gltf", "glb", "fbx", "obj", "stl", "blend",
-        ),
+        host=host,
+        port=port,
+        embedding_model=embedding_model,
+        embedding_dim=embedding_dim,
+        rerank_default=rerank_default,
+        rerank_model=rerank_model,
+        rerank_gpu=rerank_gpu,
+        gpu=gpu,
+        llm_docstrings=llm_docstrings,
+        llm_host=llm_host,
+        llm_port=llm_port,
+        llm_model=llm_model,
+        llm_format=llm_format,
+        llm_max_tokens=llm_max_tokens,
+        index_documents=index_documents,
+        text_extensions=tuple(text_extensions) if text_extensions else _DEFAULT_TEXT_EXTENSIONS,
+        asset_extensions=tuple(asset_extensions) if asset_extensions else _DEFAULT_ASSET_EXTENSIONS,
     )

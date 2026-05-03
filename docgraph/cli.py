@@ -56,6 +56,18 @@ console = Console()
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
 
+def _parse_ext_csv(raw: str | None) -> tuple[str, ...] | None:
+    """Parse a CSV extension list into a normalized tuple. None / empty
+    returns None so load_config falls back to its defaults."""
+    if not raw:
+        return None
+    out = tuple(
+        e.strip().lstrip(".").lower()
+        for e in raw.split(",") if e.strip()
+    )
+    return out or None
+
+
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -121,7 +133,7 @@ def index(
         help="Also index repo documents (.md/.txt/.rst/small CSVs) and "
              "register heavy / binary files (.pdf/.xlsx/.png/.mp4/etc.) "
              "as Asset nodes with REFERENCES_ edges from any code/doc that "
-             "mentions them by path. Off by default. Env: DOCGRAPH_INDEX_DOCUMENTS=1.",
+             "mentions them by path. Off by default.",
     ),
     text_exts: str = typer.Option(
         "", "--text-exts",
@@ -136,13 +148,12 @@ def index(
     ),
     embed_model: str | None = typer.Option(
         None, "--embed-model",
-        help="HF id of the embedding model. Sets DOCGRAPH_EMBED_MODEL.",
+        help="HF id of the embedding model.",
     ),
     llm_prompt_docstring_file: Path | None = typer.Option(
         None, "--llm-prompt-docstring-file",
         help="Path to a custom docstring prompt template "
-             "(must keep {kind}/{name}/{language}/{body} placeholders). "
-             "Sets DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE.",
+             "(must keep {kind}/{name}/{language}/{body} placeholders). ",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -154,10 +165,9 @@ def index(
 
     LLM docstrings (opt-in): pass `--llm-model <name>` to ask a local LLM to
     write a one-sentence summary for each entity that has no native docstring.
-    Adjust the endpoint via `--llm-port` / `--llm-format` / `--llm-max-tokens`
-    or the matching `DOCGRAPH_LLM_*` env vars. Generated summaries are cached
-    by body hash in `.docgraph/llm_docstrings.json` so incrementals don't
-    re-call the model.
+    Adjust the endpoint via `--llm-port` / `--llm-format` / `--llm-max-tokens`.
+    Generated summaries are cached by body hash in
+    `.docgraph/llm_docstrings.json` so incrementals don't re-call the model.
 
     GPU (opt-in): with `--gpu`, embeddings run on the GPU via ONNX Runtime.
     No torch dependency — install `onnxruntime-gpu` (NVIDIA / CUDA),
@@ -165,50 +175,41 @@ def index(
     (Apple Silicon) to light it up. Silently falls back to CPU otherwise.
     """
     _setup_logging(verbose)
-    cfg = load_config(path, extra_roots=repo if repo else None)
-    # CLI flags win over env vars. Setting --llm-model enables the feature.
-    if llm_model is not None:
-        cfg.llm_docstrings = True
-        cfg.llm_model = llm_model
-        cfg.llm_host = llm_host
-        cfg.llm_port = llm_port
-        cfg.llm_format = llm_format
-        cfg.llm_max_tokens = llm_max_tokens
+    text_exts_t = _parse_ext_csv(text_exts)
+    asset_exts_t = _parse_ext_csv(asset_exts)
+    cfg = load_config(
+        path,
+        extra_roots=repo if repo else None,
+        gpu=gpu,
+        embedding_model=embed_model or "BAAI/bge-small-en-v1.5",
+        llm_docstrings=bool(llm_model),
+        llm_host=llm_host,
+        llm_port=llm_port,
+        llm_model=llm_model or "qwen3.6-35b",
+        llm_format=llm_format,
+        llm_max_tokens=llm_max_tokens,
+        index_documents=bool(documents or text_exts or asset_exts),
+        text_extensions=text_exts_t,
+        asset_extensions=asset_exts_t,
+    )
     if workers > 0:
         cfg.workers = workers
-    # Embedding model + prompt-file overrides — set env so any sub-helpers
-    # (e.g. embed daemon) see the same values via Config.from_env.
-    if embed_model:
-        cfg.embedding_model = embed_model
-        os.environ["DOCGRAPH_EMBED_MODEL"] = embed_model
+    # Install the docstring-prompt override (if any) before the indexer runs.
     if llm_prompt_docstring_file:
-        os.environ["DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE"] = str(llm_prompt_docstring_file)
+        try:
+            text = Path(llm_prompt_docstring_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[yellow]Could not read prompt file: {exc}[/yellow]")
+        else:
+            from docgraph.llm import set_docstring_prompt
+            set_docstring_prompt(text)
     if gpu:
-        cfg.gpu = True
         # DirectML can hang the GPU at the default batch size of 256 on
         # consumer cards. Auto-pick a safer default unless the user overrode it.
         if embed_batch_size is None:
             embed_batch_size = 32
     if embed_batch_size is not None:
         cfg.embed_batch_size = embed_batch_size
-
-    # Document indexing toggles. Either flag (--documents / extension
-    # overrides) OR env var enables the pass; CLI wins if both set.
-    env_docs = os.environ.get("DOCGRAPH_INDEX_DOCUMENTS", "").lower() in ("1", "true", "yes")
-    if documents or text_exts or asset_exts or env_docs:
-        cfg.index_documents = True
-    if not text_exts:
-        text_exts = os.environ.get("DOCGRAPH_TEXT_EXTS", "").strip()
-    if text_exts:
-        cfg.text_extensions = tuple(
-            e.strip().lstrip(".").lower() for e in text_exts.split(",") if e.strip()
-        )
-    if not asset_exts:
-        asset_exts = os.environ.get("DOCGRAPH_ASSET_EXTS", "").strip()
-    if asset_exts:
-        cfg.asset_extensions = tuple(
-            e.strip().lstrip(".").lower() for e in asset_exts.split(",") if e.strip()
-        )
 
     console.print(f"[cyan]Indexing[/cyan] {cfg.repo_root}")
     if cfg.extra_roots:
@@ -232,13 +233,14 @@ def index(
     console.print(table)
 
 
-def _build_workspace(roots: list[Path]) -> "Workspace":
+def _build_workspace(roots: list[Path], **overrides) -> "Workspace":
     """Resolve roots → list[Config] → Workspace. Errors clearly if any
-    root has no index yet."""
+    root has no index yet. `overrides` is forwarded verbatim to load_config
+    so every workspace slot picks up the same CLI-flag values."""
     from docgraph.workspace import Workspace
     configs = []
     for r in roots:
-        cfg = load_config(r)
+        cfg = load_config(r, **overrides)
         if not cfg.db_path.exists():
             console.print(
                 f"[yellow]Root {cfg.repo_root} has no index yet. "
@@ -290,87 +292,77 @@ def host(
     # the host's per-slot Embedder + Retriever.
     gpu: bool = typer.Option(
         False, "--gpu",
-        help="Run embeddings on GPU (CUDA, DirectML, CoreML, ROCm, then CPU). "
-             "Sets DOCGRAPH_GPU=1.",
+        help="Run embeddings on GPU (CUDA, DirectML, CoreML, ROCm, then CPU). ",
     ),
     embed_model: str | None = typer.Option(
         None, "--embed-model",
-        help="HF id of the embedding model (default: BAAI/bge-small-en-v1.5). "
-             "Sets DOCGRAPH_EMBED_MODEL.",
+        help="HF id of the embedding model (default: BAAI/bge-small-en-v1.5). ",
     ),
     embed_dim: int | None = typer.Option(
         None, "--embed-dim",
-        help="Force the embedding dim (rare — auto-derived from the model). "
-             "Sets DOCGRAPH_EMBED_DIM.",
+        help="Force the embedding dim (rare — auto-derived from the model). ",
     ),
     rerank_default: bool = typer.Option(
         False, "--rerank-default",
-        help="Default rerank=True on /api/search + MCP search. "
-             "Sets DOCGRAPH_RERANK_DEFAULT=1.",
+        help="Default rerank=True on /api/search + MCP search. ",
     ),
     rerank_model: str | None = typer.Option(
         None, "--rerank-model",
-        help="HF id of the cross-encoder reranker. "
-             "Sets DOCGRAPH_RERANK_MODEL.",
+        help="HF id of the cross-encoder reranker. ",
     ),
     rerank_gpu: bool = typer.Option(
         False, "--rerank-gpu",
-        help="Run the cross-encoder reranker on GPU. Independent of --gpu. "
-             "Sets DOCGRAPH_RERANK_GPU=1.",
+        help="Run the cross-encoder reranker on GPU. Independent of --gpu. ",
     ),
     # LLM augmentation knobs (used by index / wiki paths run via API).
     llm_model: str | None = typer.Option(
         None, "--llm-model",
         help="LLM id for docstring augmentation. Setting this implies "
-             "llm_docstrings=True. Sets DOCGRAPH_LLM_MODEL.",
+             "llm_docstrings=True.",
     ),
     llm_host: str | None = typer.Option(
-        None, "--llm-host", help="LLM server host. Sets DOCGRAPH_LLM_HOST.",
+        None, "--llm-host", help="LLM server host.",
     ),
     llm_port: int | None = typer.Option(
-        None, "--llm-port", help="LLM server port. Sets DOCGRAPH_LLM_PORT.",
+        None, "--llm-port", help="LLM server port.",
     ),
     llm_format: str | None = typer.Option(
         None, "--llm-format",
-        help="openai | anthropic. Sets DOCGRAPH_LLM_FORMAT.",
+        help="openai | anthropic.",
     ),
     llm_max_tokens: int | None = typer.Option(
         None, "--llm-max-tokens",
-        help="Per-call token budget. Sets DOCGRAPH_LLM_MAX_TOKENS.",
+        help="Per-call token budget.",
     ),
     llm_api_key: str | None = typer.Option(
         None, "--llm-api-key",
-        help="API key for the LLM server. Sets DOCGRAPH_LLM_API_KEY.",
+        help="API key for the LLM server.",
     ),
     llm_timeout: int | None = typer.Option(
         None, "--llm-timeout",
-        help="Per-request timeout (s). Sets DOCGRAPH_LLM_TIMEOUT.",
+        help="Per-request timeout (s).",
     ),
     llm_prompt_docstring_file: Path | None = typer.Option(
         None, "--llm-prompt-docstring-file",
-        help="Path to a custom docstring prompt template. "
-             "Sets DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE.",
+        help="Path to a custom docstring prompt template. ",
     ),
     llm_prompt_wiki_file: Path | None = typer.Option(
         None, "--llm-prompt-wiki-file",
-        help="Path to a custom wiki output-format tail. "
-             "Sets DOCGRAPH_LLM_PROMPT_WIKI_FILE.",
+        help="Path to a custom wiki output-format tail. ",
     ),
     # Document + asset indexing (opt-in, mirrors `docgraph index`).
     documents: bool = typer.Option(
         False, "--documents",
         help="Enable the tier-2/3 document + asset pass on indexes "
-             "triggered through this host. Sets DOCGRAPH_INDEX_DOCUMENTS=1.",
+             "triggered through this host.",
     ),
     text_exts: str | None = typer.Option(
         None, "--text-exts",
-        help="Comma-separated text extensions. Implies --documents. "
-             "Sets DOCGRAPH_TEXT_EXTS.",
+        help="Comma-separated text extensions. Implies --documents. ",
     ),
     asset_exts: str | None = typer.Option(
         None, "--asset-exts",
-        help="Comma-separated asset extensions. Implies --documents. "
-             "Sets DOCGRAPH_ASSET_EXTS.",
+        help="Comma-separated asset extensions. Implies --documents. ",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -383,35 +375,50 @@ def host(
         docgraph host --root /repo-a --root /repo-b --watch /repo-a
     """
     _setup_logging(verbose)
-    # Translate flags into env vars BEFORE building the workspace; Config
-    # is loaded by Workspace via Config.from_env, which reads os.environ
-    # snapshots. Only set when the user passed something — leaves the
-    # built-in defaults / pre-existing env intact otherwise.
-    _flag_env: dict[str, str | None] = {
-        "DOCGRAPH_GPU":                    "1" if gpu else None,
-        "DOCGRAPH_EMBED_MODEL":            embed_model,
-        "DOCGRAPH_EMBED_DIM":              str(embed_dim) if embed_dim else None,
-        "DOCGRAPH_RERANK_DEFAULT":         "1" if rerank_default else None,
-        "DOCGRAPH_RERANK_MODEL":           rerank_model,
-        "DOCGRAPH_RERANK_GPU":             "1" if rerank_gpu else None,
-        "DOCGRAPH_LLM_MODEL":              llm_model,
-        "DOCGRAPH_LLM_HOST":               llm_host,
-        "DOCGRAPH_LLM_PORT":               str(llm_port) if llm_port else None,
-        "DOCGRAPH_LLM_FORMAT":             llm_format,
-        "DOCGRAPH_LLM_MAX_TOKENS":         str(llm_max_tokens) if llm_max_tokens else None,
-        "DOCGRAPH_LLM_API_KEY":            llm_api_key,
-        "DOCGRAPH_LLM_TIMEOUT":            str(llm_timeout) if llm_timeout else None,
-        "DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE": str(llm_prompt_docstring_file) if llm_prompt_docstring_file else None,
-        "DOCGRAPH_LLM_PROMPT_WIKI_FILE":   str(llm_prompt_wiki_file) if llm_prompt_wiki_file else None,
-        "DOCGRAPH_INDEX_DOCUMENTS":        "1" if (documents or text_exts or asset_exts) else None,
-        "DOCGRAPH_TEXT_EXTS":              text_exts,
-        "DOCGRAPH_ASSET_EXTS":             asset_exts,
+    # Install LLM prompt overrides, if any, before building the workspace —
+    # the indexer + wiki call paths consult these via the in-process getters.
+    if llm_prompt_docstring_file:
+        try:
+            txt = Path(llm_prompt_docstring_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[yellow]docstring prompt unreadable: {exc}[/yellow]")
+        else:
+            from docgraph.llm import set_docstring_prompt
+            set_docstring_prompt(txt)
+    if llm_prompt_wiki_file:
+        try:
+            txt = Path(llm_prompt_wiki_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[yellow]wiki prompt unreadable: {exc}[/yellow]")
+        else:
+            from docgraph.wiki import set_wiki_prompt_tail
+            set_wiki_prompt_tail(txt)
+
+    overrides: dict = {
+        "host": bind_host,
+        "port": bind_port,
+        "gpu": gpu,
+        "rerank_default": rerank_default,
+        "rerank_gpu": rerank_gpu,
+        "index_documents": bool(documents or text_exts or asset_exts),
     }
-    for k, v in _flag_env.items():
-        if v is not None:
-            os.environ[k] = v
+    if embed_model:                overrides["embedding_model"] = embed_model
+    if embed_dim:                  overrides["embedding_dim"] = embed_dim
+    if rerank_model:               overrides["rerank_model"] = rerank_model
+    if llm_model:
+        overrides["llm_model"] = llm_model
+        overrides["llm_docstrings"] = True
+    if llm_host:                   overrides["llm_host"] = llm_host
+    if llm_port:                   overrides["llm_port"] = llm_port
+    if llm_format:                 overrides["llm_format"] = llm_format
+    if llm_max_tokens:             overrides["llm_max_tokens"] = llm_max_tokens
+    text_exts_t = _parse_ext_csv(text_exts)
+    asset_exts_t = _parse_ext_csv(asset_exts)
+    if text_exts_t:                overrides["text_extensions"] = text_exts_t
+    if asset_exts_t:               overrides["asset_extensions"] = asset_exts_t
+
     roots = _resolve_roots(path, root)
-    workspace = _build_workspace(roots)
+    workspace = _build_workspace(roots, **overrides)
     watch_paths = [p.resolve() for p in (watch or [])]
     # Validate that every --watch points at a registered root.
     registered = set(workspace.roots())
@@ -657,8 +664,7 @@ def wiki(
     llm_prompt_wiki_file: Path | None = typer.Option(
         None, "--llm-prompt-wiki-file",
         help="Path to a custom wiki output-format tail. Replaces the built-in "
-             "tail; the rendered fact block above it stays. "
-             "Sets DOCGRAPH_LLM_PROMPT_WIKI_FILE.",
+             "tail; the rendered fact block above it stays. ",
     ),
 ) -> None:
     """Generate (or rebuild) the LLM-grounded wiki for the indexed repo.
@@ -667,27 +673,27 @@ def wiki(
     LLM to write a 200-word page. Falls back to a plain rendering of the
     facts when no LLM is reachable, so the wiki is never blank.
 
-    Uses the same LLM config as `docgraph index --llm-model`. All
-    `DOCGRAPH_LLM_*` env vars work too (host / port / model / format / api key).
+    Uses the same LLM config as `docgraph index --llm-model`.
     """
-    from docgraph.wiki import build_wiki
-    from docgraph.llm import LLMClient, LLMConfig, llm_config_from_env
+    from docgraph.wiki import build_wiki, set_wiki_prompt_tail
+    from docgraph.llm import LLMClient, LLMConfig
 
     if llm_prompt_wiki_file:
-        os.environ["DOCGRAPH_LLM_PROMPT_WIKI_FILE"] = str(llm_prompt_wiki_file)
+        try:
+            txt = Path(llm_prompt_wiki_file).read_text(encoding="utf-8")
+        except OSError as exc:
+            console.print(f"[yellow]wiki prompt unreadable: {exc}[/yellow]")
+        else:
+            set_wiki_prompt_tail(txt)
     cfg = load_config(path)
     if not cfg.db_path.exists():
         console.print("[yellow]No index yet — run `docgraph index` first.[/yellow]")
         raise typer.Exit(1)
     db = GraphDB(cfg.db_path, read_only=True)
-    # Layer CLI flags on top of env defaults so a user with DOCGRAPH_LLM_API_KEY
-    # set doesn't have to re-type it every command.
-    base = llm_config_from_env()
-    base.host = llm_host
-    base.port = llm_port
-    base.model = llm_model
-    base.format = llm_format
-    base.max_tokens = llm_max_tokens
+    base = LLMConfig(
+        host=llm_host, port=llm_port, model=llm_model,
+        format=llm_format, max_tokens=llm_max_tokens,
+    )
     llm = LLMClient(base)
     console.print(f"[cyan]Building wiki for {cfg.repo_root}…[/cyan]")
     console.print(f"  LLM: {base.format} @ {base.host}:{base.port} (model={base.model})")

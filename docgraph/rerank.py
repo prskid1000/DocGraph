@@ -29,19 +29,7 @@ class Reranker:
         model_name: str | None = None,
         providers: list[str] | None = None,
     ) -> None:
-        self.model_name = (
-            model_name
-            or os.environ.get("DOCGRAPH_RERANK_MODEL")
-            or DEFAULT_RERANK_MODEL
-        )
-        # Mirrors Embedder: explicit `providers` wins; otherwise honour the
-        # DOCGRAPH_RERANK_GPU env var (set by Config / the host launcher) and
-        # use the shared GPU_PROVIDERS chain. None → fastembed's CPU default.
-        if providers is None and os.environ.get(
-            "DOCGRAPH_RERANK_GPU", ""
-        ).lower() in ("1", "true", "yes"):
-            from .embed import GPU_PROVIDERS
-            providers = list(GPU_PROVIDERS)
+        self.model_name = model_name or DEFAULT_RERANK_MODEL
         self.providers = providers
         self._lock = Lock()
         self._encoder = None

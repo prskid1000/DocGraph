@@ -10,7 +10,7 @@ from unittest.mock import patch
 
 import pytest
 
-from docgraph.llm import LLMClient, LLMConfig, llm_config_from_env
+from docgraph.llm import LLMClient, LLMConfig
 
 
 # --- Config -----------------------------------------------------------
@@ -34,12 +34,12 @@ def test_invalid_format_raises():
         LLMConfig(format="cohere")
 
 
-def test_env_loader(monkeypatch):
-    monkeypatch.setenv("DOCGRAPH_LLM_PORT", "9999")
-    monkeypatch.setenv("DOCGRAPH_LLM_MODEL", "qwen-2.5-coder-7b")
-    monkeypatch.setenv("DOCGRAPH_LLM_FORMAT", "anthropic")
-    monkeypatch.setenv("DOCGRAPH_LLM_API_KEY", "sk-test")
-    cfg = llm_config_from_env()
+def test_explicit_config_kwargs():
+    """LLMConfig is built from explicit kwargs — there is no env loader."""
+    cfg = LLMConfig(
+        port=9999, model="qwen-2.5-coder-7b",
+        format="anthropic", api_key="sk-test",
+    )
     assert cfg.port == 9999
     assert cfg.model == "qwen-2.5-coder-7b"
     assert cfg.format == "anthropic"
@@ -146,21 +146,24 @@ def test_api_key_sets_authorization_header():
 # --- Config plumbing in Config dataclass ------------------------------
 
 
-def test_config_picks_up_llm_env(monkeypatch, tmp_path):
+def test_config_picks_up_llm_kwargs(tmp_path):
+    """Setting llm_model on load_config is enough to enable docstring
+    augmentation — same convention as `docgraph index --llm-model X`."""
     from docgraph.config import load_config
-    monkeypatch.setenv("DOCGRAPH_LLM_DOCSTRINGS", "1")
-    monkeypatch.setenv("DOCGRAPH_LLM_PORT", "11434")
-    monkeypatch.setenv("DOCGRAPH_LLM_MODEL", "qwen2.5-coder")
-    monkeypatch.setenv("DOCGRAPH_LLM_FORMAT", "openai")
-    cfg = load_config(tmp_path)
+    cfg = load_config(
+        tmp_path,
+        llm_docstrings=True,
+        llm_port=11434,
+        llm_model="qwen2.5-coder",
+        llm_format="openai",
+    )
     assert cfg.llm_docstrings is True
     assert cfg.llm_port == 11434
     assert cfg.llm_model == "qwen2.5-coder"
     assert cfg.llm_format == "openai"
 
 
-def test_config_default_llm_off(tmp_path, monkeypatch):
+def test_config_default_llm_off(tmp_path):
     from docgraph.config import load_config
-    monkeypatch.delenv("DOCGRAPH_LLM_DOCSTRINGS", raising=False)
     cfg = load_config(tmp_path)
     assert cfg.llm_docstrings is False

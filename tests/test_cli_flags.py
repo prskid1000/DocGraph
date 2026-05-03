@@ -63,61 +63,60 @@ def test_host_accepts_telecode_flag(host_help: str, flag: str) -> None:
     assert flag in host_help, f"docgraph host missing {flag}"
 
 
-# ── Env vars docgraph reads ────────────────────────────────────────────────
+# ── Config kwargs propagate ────────────────────────────────────────────────
 
 
-@pytest.mark.parametrize("var,attr,expected", [
-    ("DOCGRAPH_GPU", "gpu", True),
-    ("DOCGRAPH_EMBED_MODEL", "embedding_model", "test/model"),
-    ("DOCGRAPH_PORT", "port", 1234),
-    ("DOCGRAPH_HOST", "host", "0.0.0.0"),
-    ("DOCGRAPH_LLM_MODEL", "llm_model", "my-model"),
-    ("DOCGRAPH_LLM_HOST", "llm_host", "remote-host"),
-    ("DOCGRAPH_LLM_PORT", "llm_port", 9999),
-    ("DOCGRAPH_LLM_FORMAT", "llm_format", "anthropic"),
-    ("DOCGRAPH_LLM_MAX_TOKENS", "llm_max_tokens", 256),
+@pytest.mark.parametrize("kwarg,attr,expected", [
+    ("gpu", "gpu", True),
+    ("embedding_model", "embedding_model", "test/model"),
+    ("port", "port", 1234),
+    ("host", "host", "0.0.0.0"),
+    ("llm_model", "llm_model", "my-model"),
+    ("llm_host", "llm_host", "remote-host"),
+    ("llm_port", "llm_port", 9999),
+    ("llm_format", "llm_format", "anthropic"),
+    ("llm_max_tokens", "llm_max_tokens", 256),
 ])
-def test_env_var_propagates_to_config(monkeypatch, tmp_path: Path,
-                                       var: str, attr: str, expected) -> None:
-    """telecode controls docgraph host behavior partly via env vars
-    (DOCGRAPH_GPU, DOCGRAPH_EMBED_MODEL). Verify every env var the
-    config layer reads still propagates to the resulting Config object."""
-    # Clear all DOCGRAPH_* vars first so the test isn't polluted by host env.
-    for key in list(os.environ):
-        if key.startswith("DOCGRAPH_"):
-            monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv(var, str(expected))
+def test_kwarg_propagates_to_config(tmp_path: Path,
+                                     kwarg: str, attr: str, expected) -> None:
+    """Every config knob is a load_config() kwarg. No DOCGRAPH_* env vars
+    are read anywhere in docgraph — the host/index CLI commands forward
+    flag values to load_config directly."""
     from docgraph.config import load_config
-    cfg = load_config(tmp_path)
+    cfg = load_config(tmp_path, **{kwarg: expected})
     actual = getattr(cfg, attr)
     if isinstance(expected, bool):
-        assert bool(actual) is expected, f"{var} did not flip {attr}"
+        assert bool(actual) is expected, f"{kwarg} did not flip {attr}"
     else:
-        assert actual == expected, f"{var} did not propagate to {attr}"
+        assert actual == expected, f"{kwarg} did not propagate to {attr}"
 
 
-def test_llm_disabled_when_model_unset(monkeypatch, tmp_path: Path) -> None:
-    """LLM augmentation must be optional. With no DOCGRAPH_LLM_* vars set
-    and no --llm-model on the CLI, `cfg.llm_docstrings` must be False."""
-    for key in list(os.environ):
-        if key.startswith("DOCGRAPH_LLM_"):
-            monkeypatch.delenv(key, raising=False)
+def test_llm_disabled_when_model_unset(tmp_path: Path) -> None:
+    """LLM augmentation must be optional. With no `--llm-model`,
+    `cfg.llm_docstrings` is False by default."""
     from docgraph.config import load_config
     cfg = load_config(tmp_path)
-    assert cfg.llm_docstrings is False, (
-        "LLM augmentation should default off when no DOCGRAPH_LLM_* vars are set"
-    )
+    assert cfg.llm_docstrings is False
 
 
-def test_llm_enabled_when_only_model_set(monkeypatch, tmp_path: Path) -> None:
-    """Setting DOCGRAPH_LLM_MODEL alone is enough to flip llm_docstrings on
-    (the docstring contract from config.py)."""
-    for key in list(os.environ):
-        if key.startswith("DOCGRAPH_LLM_"):
-            monkeypatch.delenv(key, raising=False)
-    monkeypatch.setenv("DOCGRAPH_LLM_MODEL", "my-model")
+def test_load_config_reads_no_env(monkeypatch, tmp_path: Path) -> None:
+    """Lock in the env-free contract: setting any DOCGRAPH_* env var
+    must not change the Config produced by load_config()."""
+    monkeypatch.setenv("DOCGRAPH_GPU", "1")
+    monkeypatch.setenv("DOCGRAPH_EMBED_MODEL", "ghost/model")
+    monkeypatch.setenv("DOCGRAPH_LLM_MODEL", "ghost-llm")
     from docgraph.config import load_config
     cfg = load_config(tmp_path)
+    assert cfg.gpu is False, "load_config must ignore DOCGRAPH_GPU"
+    assert cfg.embedding_model == "BAAI/bge-small-en-v1.5"
+    assert cfg.llm_model == "qwen3.6-35b"
+
+
+def test_llm_enabled_when_only_model_set(tmp_path: Path) -> None:
+    """Setting load_config(llm_model="...") alone is enough to flip
+    llm_docstrings on — same convention as `docgraph index --llm-model X`."""
+    from docgraph.config import load_config
+    cfg = load_config(tmp_path, llm_model="my-model")
     assert cfg.llm_docstrings is True
 
 
