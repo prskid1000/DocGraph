@@ -201,11 +201,11 @@ def run_daemon(
 ) -> int:
     """Start the daemon in the calling process. Blocks until shutdown.
     Returns 0 on clean exit, non-zero on bind failure."""
-    from docgraph.embed import Embedder, GPU_PROVIDERS
+    from docgraph.embed import Embedder, resolve_providers
 
     embedder = Embedder(
         model_name=model_name,
-        providers=list(GPU_PROVIDERS) if gpu else None,
+        providers=resolve_providers(gpu, -1),
     )
     embedder._ensure()  # warm up before we accept clients
 

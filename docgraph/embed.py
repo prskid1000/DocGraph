@@ -67,15 +67,36 @@ def dim_for_model(model_name: str, default: int = 384) -> int:
     return default
 
 
+def resolve_providers(gpu: bool, directml_device_id: int = -1) -> list | None:
+    """Build the ORT provider list given the host's GPU + DirectML adapter
+    config. Returns None (= CPU) when gpu is False. When directml_device_id
+    is >= 0 the DmlExecutionProvider entry is wrapped in a tuple with
+    `device_id` — this is what lets users force the embedder onto the
+    discrete NVIDIA on hybrid-graphics laptops where Windows otherwise
+    routes windowless processes to the integrated GPU."""
+    if not gpu:
+        return None
+    base: list = list(GPU_PROVIDERS)
+    if directml_device_id >= 0:
+        return [
+            ("DmlExecutionProvider", {"device_id": directml_device_id})
+            if p == "DmlExecutionProvider" else p
+            for p in base
+        ]
+    return base
+
+
 class Embedder:
     def __init__(
         self,
         model_name: str = "BAAI/bge-small-en-v1.5",
-        providers: list[str] | None = None,
+        providers: list | None = None,
     ):
         self.model_name = model_name
         # When None, fastembed picks its default (CPU). When given, the list
         # is passed straight through to the underlying onnxruntime session.
+        # Entries may be plain strings ("CPUExecutionProvider") or
+        # (name, options_dict) tuples for adapter-id selection.
         self.providers = providers
         self._model: TextEmbedding | None = None
 
@@ -129,16 +150,18 @@ class Embedder:
         return self._model
 
     @staticmethod
-    def _available_providers(requested: list[str]) -> list[str]:
+    def _available_providers(requested: list) -> list:
         """Filter requested ORT providers against what's actually installed.
         ORT errors hard if you list an unavailable provider (e.g. CUDA without
-        onnxruntime-gpu) instead of skipping it, so we pre-filter."""
+        onnxruntime-gpu) instead of skipping it, so we pre-filter. Entries
+        may be plain strings or `(name, options_dict)` tuples; we match on
+        the name half."""
         try:
             import onnxruntime as ort
             available = set(ort.get_available_providers())
         except Exception:
             return []
-        kept = [p for p in requested if p in available]
+        kept = [p for p in requested if (p[0] if isinstance(p, tuple) else p) in available]
         # Drop the all-CPU case so the caller takes the no-providers code path
         # (which lets fastembed apply its own default session options).
         if kept == ["CPUExecutionProvider"]:

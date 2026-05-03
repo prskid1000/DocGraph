@@ -20,7 +20,7 @@ from rich.console import Console
 from docgraph.cancel import CancelToken
 from docgraph.config import Config
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder, GPU_PROVIDERS
+from docgraph.embed import Embedder, GPU_PROVIDERS, resolve_providers
 from docgraph.index import _bar
 from docgraph.summary import chunk_body
 
@@ -187,7 +187,7 @@ def add_doc(
     _ck()
     embedder = Embedder(
         cfg.embedding_model,
-        providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+        providers=resolve_providers(cfg.gpu, getattr(cfg, "directml_device_id", -1)),
     )
     with _bar() as prog:
         task = prog.add_task(f"Embedding doc chunks ({title or url})", total=len(pieces))

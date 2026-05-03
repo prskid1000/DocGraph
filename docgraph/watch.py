@@ -28,7 +28,7 @@ from rich.console import Console
 from watchfiles import Change, awatch
 
 from docgraph.config import Config, MAX_FILE_BYTES
-from docgraph.embed import Embedder, GPU_PROVIDERS
+from docgraph.embed import Embedder, GPU_PROVIDERS, resolve_providers
 from docgraph.index import Indexer
 from docgraph.parse import detect_language
 from docgraph.workspace import Workspace, slug_for_root
@@ -149,7 +149,7 @@ def _baseline_reindex(workspace: Workspace, root: Path) -> None:
     try:
         embedder = Embedder(
             slot.cfg.embedding_model,
-            providers=list(GPU_PROVIDERS) if slot.cfg.gpu else None,
+            providers=resolve_providers(slot.cfg.gpu, getattr(slot.cfg, "directml_device_id", -1)),
         )
         indexer = Indexer(slot.cfg, writer, embedder=embedder)
         indexer.index_all(incremental=True)

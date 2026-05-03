@@ -84,9 +84,10 @@ class Workspace:
         key = (cfg.embedding_model, cfg.gpu)
         emb = self._embedders.get(key)
         if emb is None:
+            from docgraph.embed import resolve_providers
             emb = Embedder(
                 cfg.embedding_model,
-                providers=list(GPU_PROVIDERS) if cfg.gpu else None,
+                providers=resolve_providers(cfg.gpu, getattr(cfg, "directml_device_id", -1)),
             )
             self._embedders[key] = emb
         return emb

@@ -316,7 +316,9 @@ def build_wiki(
         # Use chat() not _call_openai — _call_openai routes through _clean()
         # which truncates to a single line (correct for one-sentence
         # docstrings, fatal for multi-paragraph wiki pages).
-        body = llm.chat(prompt)
+        # cfg.llm_wiki=False forces the fact-sheet path even if the LLM is
+        # reachable — useful when the user wants docstring LLM but not wiki LLM.
+        body = llm.chat(prompt) if getattr(cfg, "llm_wiki", True) else ""
         if not body or not body.strip():
             # Fall back to a plain rendering of the facts so the wiki is never blank.
             body = _facts_to_markdown(facts)

@@ -55,7 +55,7 @@ def _bar() -> Progress:
 
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder, GPU_PROVIDERS
+from docgraph.embed import Embedder, GPU_PROVIDERS, resolve_providers
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
 from docgraph.summary import build_embedding_text, chunk_body
@@ -155,7 +155,7 @@ class Indexer:
         self.db = db
         self.embedder = embedder or Embedder(
             cfg.embedding_model,
-            providers=_gpu_providers() if cfg.gpu else None,
+            providers=resolve_providers(cfg.gpu, getattr(cfg, "directml_device_id", -1)),
         )
         self._next_id = 1
 
@@ -1624,7 +1624,7 @@ class Indexer:
         if text_docs:
             embedder = self.embedder or Embedder(
                 self.cfg.embedding_model,
-                providers=list(GPU_PROVIDERS) if self.cfg.gpu else None,
+                providers=resolve_providers(self.cfg.gpu, getattr(self.cfg, "directml_device_id", -1)),
             )
             doc_rows: list[dict] = []
             with _bar() as prog:

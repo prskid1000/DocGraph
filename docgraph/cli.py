@@ -314,11 +314,28 @@ def host(
         False, "--rerank-gpu",
         help="Run the cross-encoder reranker on GPU. Independent of --gpu. ",
     ),
+    directml_device_id: int = typer.Option(
+        -1, "--directml-device-id",
+        help="DirectML adapter index for GPU embeddings. -1 = let DirectML "
+             "pick (adapter 0, usually iGPU on hybrid laptops). Set to the "
+             "discrete dGPU's index (often 1) to force the embedder onto NVIDIA.",
+    ),
     # LLM augmentation knobs (used by index / wiki paths run via API).
     llm_model: str | None = typer.Option(
         None, "--llm-model",
-        help="LLM id for docstring augmentation. Setting this implies "
-             "llm_docstrings=True.",
+        help="LLM id used by docstring augmentation and wiki generation. "
+             "Setting it does NOT enable either feature on its own — pass "
+             "--llm-docstrings and/or --llm-wiki explicitly.",
+    ),
+    llm_docstrings: bool = typer.Option(
+        False, "--llm-docstrings/--no-llm-docstrings",
+        help="Use the LLM to generate docstrings during indexing. "
+             "Off by default — must be enabled explicitly.",
+    ),
+    llm_wiki: bool = typer.Option(
+        False, "--llm-wiki/--no-llm-wiki",
+        help="Use the LLM when building wiki pages. Off by default — wiki "
+             "falls back to the fact-sheet renderer unless this is enabled.",
     ),
     llm_host: str | None = typer.Option(
         None, "--llm-host", help="LLM server host.",
@@ -400,6 +417,7 @@ def host(
         "gpu": gpu,
         "rerank_default": rerank_default,
         "rerank_gpu": rerank_gpu,
+        "directml_device_id": directml_device_id,
         "index_documents": bool(documents or text_exts or asset_exts),
     }
     if embed_model:                overrides["embedding_model"] = embed_model
@@ -407,7 +425,8 @@ def host(
     if rerank_model:               overrides["rerank_model"] = rerank_model
     if llm_model:
         overrides["llm_model"] = llm_model
-        overrides["llm_docstrings"] = True
+    overrides["llm_docstrings"] = llm_docstrings
+    overrides["llm_wiki"] = llm_wiki
     if llm_host:                   overrides["llm_host"] = llm_host
     if llm_port:                   overrides["llm_port"] = llm_port
     if llm_format:                 overrides["llm_format"] = llm_format

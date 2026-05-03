@@ -35,6 +35,11 @@ class Config:
     # passes is usually higher than the speedup. Independent from `gpu` so
     # users can keep embeddings on GPU and reranking on CPU (or vice versa).
     rerank_gpu: bool = False
+    # DirectML adapter selection for hybrid-GPU laptops (Intel iGPU + NVIDIA
+    # dGPU). Default -1 = let DirectML pick adapter 0, which on Windows 11
+    # for windowless processes is usually the iGPU. Set to the dGPU's index
+    # (often 1) to force embeddings onto the discrete card.
+    directml_device_id: int = -1
     # GPU acceleration for embeddings (and reranker). Off by default; when
     # True, the Embedder asks ONNX Runtime to use CUDA / DirectML / CoreML
     # before falling back to CPU. Requires `onnxruntime-gpu` or
@@ -45,8 +50,11 @@ class Config:
     port: int = 5500
     similar_top_k: int = 5  # SIMILAR_TO edges per node
     co_change_window: int = 200  # last N commits scanned for CO_CHANGED_WITH
-    # LLM docstring augmentation (off by default — opt in via CLI or env var)
+    # LLM docstring augmentation (off by default — opt in via CLI flag)
     llm_docstrings: bool = False
+    # LLM wiki generation. When False, build_wiki skips the LLM call and
+    # renders the fact-sheet fallback even if the LLM is reachable.
+    llm_wiki: bool = True
     llm_host: str = "localhost"
     llm_port: int = 1235
     llm_model: str = "qwen3.6-35b"
@@ -261,8 +269,10 @@ def load_config(
     rerank_default: bool = False,
     rerank_model: str = "",
     rerank_gpu: bool = False,
+    directml_device_id: int = -1,
     gpu: bool = False,
     llm_docstrings: bool = False,
+    llm_wiki: bool = True,
     llm_host: str = "localhost",
     llm_port: int = 1235,
     llm_model: str = "qwen3.6-35b",
@@ -300,9 +310,6 @@ def load_config(
     else:
         extras = persisted
 
-    if llm_model and llm_model != "qwen3.6-35b":
-        llm_docstrings = True
-
     return Config(
         repo_root=root,
         extra_roots=extras,
@@ -316,8 +323,10 @@ def load_config(
         rerank_default=rerank_default,
         rerank_model=rerank_model,
         rerank_gpu=rerank_gpu,
+        directml_device_id=directml_device_id,
         gpu=gpu,
         llm_docstrings=llm_docstrings,
+        llm_wiki=llm_wiki,
         llm_host=llm_host,
         llm_port=llm_port,
         llm_model=llm_model,

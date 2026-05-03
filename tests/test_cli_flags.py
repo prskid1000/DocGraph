@@ -112,12 +112,15 @@ def test_load_config_reads_no_env(monkeypatch, tmp_path: Path) -> None:
     assert cfg.llm_model == "qwen3.6-35b"
 
 
-def test_llm_enabled_when_only_model_set(tmp_path: Path) -> None:
-    """Setting load_config(llm_model="...") alone is enough to flip
-    llm_docstrings on — same convention as `docgraph index --llm-model X`."""
+def test_llm_model_alone_does_not_enable_docstrings(tmp_path: Path) -> None:
+    """Setting only `llm_model` no longer auto-enables docstring or wiki
+    LLM use — both must be turned on explicitly via their kwargs / flags."""
     from docgraph.config import load_config
     cfg = load_config(tmp_path, llm_model="my-model")
-    assert cfg.llm_docstrings is True
+    assert cfg.llm_docstrings is False
+    cfg2 = load_config(tmp_path, llm_model="my-model",
+                       llm_docstrings=True, llm_wiki=False)
+    assert cfg2.llm_docstrings is True and cfg2.llm_wiki is False
 
 
 # ── Smoke: every CLI command can be invoked at all ─────────────────────────
