@@ -159,10 +159,11 @@ def make_app(workspace: Workspace) -> FastAPI:
         p = payload or {}
         only = p.get("module") if isinstance(p, dict) else None
         force = bool(p.get("force")) if isinstance(p, dict) else False
+        default_depth = int(getattr(slot.cfg, "wiki_depth", 12) or 12)
         try:
-            depth = int(p.get("depth", 12)) if isinstance(p, dict) else 12
+            depth = int(p.get("depth", default_depth)) if isinstance(p, dict) else default_depth
         except (TypeError, ValueError):
-            depth = 12
+            depth = default_depth
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
 

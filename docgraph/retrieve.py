@@ -123,7 +123,7 @@ class Retriever:
         # for any qname, the best score across its sub-chunks rivals the
         # entity-level score so a query that matches a small piece of a
         # 500-line function still surfaces it.
-        chunk_max = self._chunk_max_sims(self.embedder.embed([query])[0])
+        chunk_max = self._chunk_max_sims(qvec)
 
         # Tokenize the query once for the BM25 leg; if every token is too short
         # to clear BM25Index's min length, we silently skip the keyword fuse.

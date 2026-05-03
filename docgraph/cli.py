@@ -314,6 +314,21 @@ def host(
         False, "--rerank-gpu",
         help="Run the cross-encoder reranker on GPU. Independent of --gpu. ",
     ),
+    workers: int = typer.Option(
+        0, "--workers",
+        help="Indexer parallelism. 0 = max(2, cpu_count - 1). Used by the "
+             "host's /api/admin/index path.",
+    ),
+    embed_batch_size: int = typer.Option(
+        0, "--embed-batch-size",
+        help="Texts per ONNX session call. 0 = 256 (CPU sweet spot, 32 is "
+             "often better on GPU). Lower if --gpu saturates VRAM.",
+    ),
+    wiki_depth: int = typer.Option(
+        12, "--wiki-depth",
+        help="Default depth for /api/wiki/build when the request payload "
+             "omits it. 1 = top-level dirs only, 12 = leaf folders.",
+    ),
     # LLM augmentation knobs (used by index / wiki paths run via API).
     llm_model: str | None = typer.Option(
         None, "--llm-model",
@@ -343,7 +358,11 @@ def host(
     ),
     llm_max_tokens: int | None = typer.Option(
         None, "--llm-max-tokens",
-        help="Per-call token budget.",
+        help="Per-call token budget for indexing-time docstring generation.",
+    ),
+    llm_max_tokens_wiki: int | None = typer.Option(
+        None, "--llm-max-tokens-wiki",
+        help="Per-call token budget for wiki page generation. Default 4096.",
     ),
     llm_api_key: str | None = typer.Option(
         None, "--llm-api-key",
@@ -405,17 +424,25 @@ def host(
             from docgraph.wiki import set_wiki_prompt_tail
             set_wiki_prompt_tail(txt)
 
+    if gpu:
+        # DirectML can hang at 256; use 32 if we're on GPU.
+        if embed_batch_size == 0:
+            embed_batch_size = 32
+
     overrides: dict = {
         "host": bind_host,
         "port": bind_port,
         "gpu": gpu,
         "rerank_default": rerank_default,
         "rerank_gpu": rerank_gpu,
+        "wiki_depth": wiki_depth,
         "index_documents": bool(documents or text_exts or asset_exts),
     }
     if embed_model:                overrides["embedding_model"] = embed_model
     if embed_dim:                  overrides["embedding_dim"] = embed_dim
     if rerank_model:               overrides["rerank_model"] = rerank_model
+    if workers > 0:                overrides["workers"] = workers
+    if embed_batch_size > 0:       overrides["embed_batch_size"] = embed_batch_size
     if llm_model:
         overrides["llm_model"] = llm_model
     overrides["llm_docstrings"] = llm_docstrings
@@ -424,6 +451,9 @@ def host(
     if llm_port:                   overrides["llm_port"] = llm_port
     if llm_format:                 overrides["llm_format"] = llm_format
     if llm_max_tokens:             overrides["llm_max_tokens"] = llm_max_tokens
+    if llm_max_tokens_wiki:        overrides["llm_max_tokens_wiki"] = llm_max_tokens_wiki
+    if llm_api_key:                overrides["llm_api_key"] = llm_api_key
+    if llm_timeout:                overrides["llm_timeout"] = llm_timeout
     text_exts_t = _parse_ext_csv(text_exts)
     asset_exts_t = _parse_ext_csv(asset_exts)
     if text_exts_t:                overrides["text_extensions"] = text_exts_t

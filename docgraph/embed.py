@@ -184,7 +184,7 @@ class Embedder:
     def embed(
         self,
         texts: Iterable[str],
-        batch_size: int = 256,
+        batch_size: int | None = None,
         on_progress: Callable[[int], None] | None = None,
     ) -> np.ndarray:
         """Embed a list of texts. Returns float32 ndarray of shape (N, dim).
@@ -202,6 +202,10 @@ class Embedder:
         malformed; never fails the caller's request.
         """
         texts_list = list(texts)
+        if batch_size is None:
+            # DirectML can hang at 256; use 32 if we're on GPU.
+            batch_size = 32 if self.providers else 256
+
         if on_progress is None and texts_list:
             try:
                 from docgraph import daemon as _daemon
@@ -276,13 +280,17 @@ class Embedder:
         self._model = None
         self.providers = None
 
-    def embed_iter(self, texts: Iterable[str], batch_size: int = 256) -> Iterator[np.ndarray]:
+    def embed_iter(self, texts: Iterable[str], batch_size: int | None = None) -> Iterator[np.ndarray]:
         """Streaming variant: yield one float32 ndarray at a time."""
+        if batch_size is None:
+            # DirectML can hang at 256; use 32 if we're on GPU.
+            batch_size = 32 if self.providers else 256
         model = self._ensure()
         for vec in model.embed(list(texts), batch_size=batch_size):
             yield np.asarray(vec, dtype=np.float32)
 
     @property
     def dim(self) -> int:
-        # BGE-small = 384
-        return 384
+        """The embedding dimension of the loaded model.
+        BGE-small = 384, mpnet = 768, etc."""
+        return dim_for_model(self.model_name, default=384)

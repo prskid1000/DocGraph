@@ -310,6 +310,8 @@ class Indexer:
             model=self.cfg.llm_model,
             format=self.cfg.llm_format,
             max_tokens=self.cfg.llm_max_tokens,
+            api_key=getattr(self.cfg, "llm_api_key", "") or None,
+            timeout=int(getattr(self.cfg, "llm_timeout", 60) or 60),
         ))
 
         def _task(item):

@@ -175,7 +175,9 @@ def _serve_one(conn: socket.socket, ctx: dict) -> bool:
             # Bypass Embedder.embed() — that wrapper's daemon-detection path
             # would route this call right back to us. Hit fastembed directly.
             model = ctx["embedder"]._ensure()
-            vecs = [list(map(float, v)) for v in model.embed(list(texts), batch_size=256)]
+            # DirectML can hang at 256; use 32 if we're on GPU.
+            batch = 32 if ctx.get("gpu") else 256
+            vecs = [list(map(float, v)) for v in model.embed(list(texts), batch_size=batch)]
             payload: dict[str, Any] = {"embeddings": vecs}
         except Exception as e:
             payload = {"error": str(e)}

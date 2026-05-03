@@ -55,6 +55,20 @@ class Config:
     llm_model: str = "qwen3.6-35b"
     llm_format: str = "openai"  # "openai" | "anthropic"
     llm_max_tokens: int = 150  # reasoning is disabled via reasoning_effort=none
+    # Wiki generation needs more headroom than docstring augmentation. Kept
+    # separate so users can tune the two independently — e.g. 150 for
+    # docstrings, 4096+ for wiki page bodies.
+    llm_max_tokens_wiki: int = 4096
+    # API key for the LLM server (forwarded as Authorization / x-api-key
+    # depending on `llm_format`). Empty = no auth header.
+    llm_api_key: str = ""
+    # Per-request HTTP timeout in seconds for LLM calls. Wiki page generation
+    # on large modules can take 30s+ on local servers.
+    llm_timeout: int = 60
+    # Wiki module-grouping depth used by the host's /api/wiki/build when the
+    # request payload doesn't override it. 1 = top-level dirs only,
+    # 12 = one page per leaf folder.
+    wiki_depth: int = 12
     # Document + asset indexing — opt-in. When True, the indexer adds a
     # second pass that:
     #  - extracts text content from .md/.txt/.rst/small CSVs and writes
@@ -272,6 +286,12 @@ def load_config(
     llm_model: str = "qwen3.6-35b",
     llm_format: str = "openai",
     llm_max_tokens: int = 150,
+    llm_max_tokens_wiki: int = 4096,
+    llm_api_key: str = "",
+    llm_timeout: int = 60,
+    wiki_depth: int = 12,
+    workers: int | None = None,
+    embed_batch_size: int = 256,
     index_documents: bool = False,
     text_extensions: tuple[str, ...] | None = None,
     asset_extensions: tuple[str, ...] | None = None,
@@ -325,7 +345,13 @@ def load_config(
         llm_model=llm_model,
         llm_format=llm_format,
         llm_max_tokens=llm_max_tokens,
+        llm_max_tokens_wiki=llm_max_tokens_wiki,
+        llm_api_key=llm_api_key,
+        llm_timeout=llm_timeout,
+        wiki_depth=wiki_depth,
+        embed_batch_size=embed_batch_size,
         index_documents=index_documents,
         text_extensions=tuple(text_extensions) if text_extensions else _DEFAULT_TEXT_EXTENSIONS,
         asset_extensions=tuple(asset_extensions) if asset_extensions else _DEFAULT_ASSET_EXTENSIONS,
+        **({"workers": workers} if workers is not None else {}),
     )

@@ -239,12 +239,23 @@ def build_wiki(
     `depth=1` = top-level dirs only (old behavior). `depth=12` (default)
     = one page per leaf folder for any reasonable repo.
     """
-    llm = llm or LLMClient(LLMConfig())
+    llm = llm or LLMClient(LLMConfig(
+        host=getattr(cfg, "llm_host", "localhost"),
+        port=int(getattr(cfg, "llm_port", 1235) or 1235),
+        model=getattr(cfg, "llm_model", "qwen3.6-35b") or "qwen3.6-35b",
+        format=getattr(cfg, "llm_format", "openai") or "openai",
+        max_tokens=int(getattr(cfg, "llm_max_tokens", 150) or 150),
+        api_key=getattr(cfg, "llm_api_key", "") or None,
+        timeout=int(getattr(cfg, "llm_timeout", 60) or 60),
+    ))
     # Wiki pages need much more headroom than docstrings (150 tokens).
     # Bump for the wiki call only — the original LLMConfig stays unchanged
-    # for any other caller sharing the same client instance.
-    if llm.cfg.max_tokens < 4096:
-        llm.cfg.max_tokens = 4096
+    # for any other caller sharing the same client instance. Honors the
+    # per-host override if Config carries one (telecode forwards
+    # `--llm-max-tokens-wiki` through `host`).
+    wiki_budget = int(getattr(cfg, "llm_max_tokens_wiki", 4096) or 4096)
+    if llm.cfg.max_tokens < wiki_budget:
+        llm.cfg.max_tokens = wiki_budget
     wiki_dir = cfg.data_dir / WIKI_DIRNAME
     wiki_dir.mkdir(parents=True, exist_ok=True)
 

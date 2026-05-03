@@ -58,9 +58,62 @@ def host_help() -> str:
     return _help_text("host")
 
 
-@pytest.mark.parametrize("flag", ["--root", "--watch", "--host", "--port"])
+@pytest.mark.parametrize("flag", ["--root", "--watch", "--host", "--port", "--gpu", "--embed-batch-size", "--llm-model"])
 def test_host_accepts_telecode_flag(host_help: str, flag: str) -> None:
     assert flag in host_help, f"docgraph host missing {flag}"
+
+
+def test_embed_batch_size_auto_tuning(monkeypatch):
+    """Verify that --gpu in host/index commands auto-sets batch_size to 32
+    if it was left at default (0/None)."""
+    from docgraph.cli import host, index
+    import docgraph.cli
+    
+    # We don't want to actually start a server or indexer, just check the overrides
+    captured_overrides = {}
+    def fake_build_workspace(roots, **overrides):
+        captured_overrides.update(overrides)
+        # Raise Exit to stop the command before it calls uvicorn
+        raise typer.Exit(0)
+    
+    import typer
+    monkeypatch.setattr(docgraph.cli, "_build_workspace", fake_build_workspace)
+    # Mock _resolve_roots to return something valid
+    monkeypatch.setattr(docgraph.cli, "_resolve_roots", lambda *a: [Path(".")])
+    # Mock make_app and _setup_logging
+    monkeypatch.setattr(docgraph.cli, "_setup_logging", lambda *a: None)
+
+    # Use a dummy app and context to invoke the command via Typer's runner
+    from typer.testing import CliRunner
+    runner = CliRunner()
+    
+    # Check host command
+    runner.invoke(docgraph.cli.app, ["host", "--gpu"])
+    assert captured_overrides.get("embed_batch_size") == 32
+    
+    # Check index command
+    captured_overrides.clear()
+    # Mock load_config to return a Config we can inspect
+    from docgraph.config import load_config
+    original_load_config = load_config
+    def fake_load_config(*args, **kwargs):
+        cfg = original_load_config(*args, **kwargs)
+        # Capture the cfg so we can check it
+        captured_overrides["cfg"] = cfg
+        # Mock index_all on the indexer to exit early
+        return cfg
+        
+    monkeypatch.setattr(docgraph.cli, "load_config", fake_load_config)
+    monkeypatch.setattr(docgraph.cli, "GraphDB", lambda *a, **kw: None)
+    
+    # We need to mock Indexer entirely because it tries to do work
+    class FakeIndexer:
+        def __init__(self, cfg, db): self.cfg = cfg
+        def index_all(self, **kw): return {}
+    monkeypatch.setattr(docgraph.cli, "Indexer", FakeIndexer)
+
+    runner.invoke(docgraph.cli.app, ["index", "--gpu"])
+    assert captured_overrides["cfg"].embed_batch_size == 32
 
 
 # ── Config kwargs propagate ────────────────────────────────────────────────
