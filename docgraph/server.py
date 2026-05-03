@@ -519,6 +519,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             "model": getattr(cfg, "llm_model", "") or "",
             "format": getattr(cfg, "llm_format", "openai") or "openai",
             "max_tokens": int(getattr(cfg, "llm_max_tokens", 512) or 512),
+            "max_tokens_chat": int(getattr(cfg, "llm_max_tokens_chat", 0) or 0),
             "has_key": bool(getattr(cfg, "llm_api_key", "") or ""),
         }
 
@@ -544,13 +545,17 @@ def make_app(workspace: Workspace) -> FastAPI:
                 f"```{lang}\n{snippet}\n```"
             )
             messages = [{"role": "system", "content": sys_note}] + list(messages)
-        # Chat doesn't cap output — the docstring/wiki budgets are for those
-        # fixed-length use cases, not free-form Q&A. For OpenAI-compatible
-        # servers we omit max_tokens entirely so the model writes until it's
-        # done (or hits the server's context ceiling). Anthropic's Messages
-        # API requires a number, so use a generous default there only.
-        # Caller may still pin a hard cap via payload.max_tokens.
+        # Chat doesn't cap output by default — the docstring/wiki budgets
+        # are for fixed-length use cases, not free-form Q&A. Cap order:
+        #   1. payload.max_tokens (per-request override from the UI)
+        #   2. cfg.llm_max_tokens_chat (host CLI flag / settings)
+        #   3. None  → omit max_tokens for openai (server decides);
+        #              anthropic falls back to 8192 since its API requires it.
         explicit_cap = payload.get("max_tokens")
+        if not explicit_cap:
+            cfg_cap = int(getattr(cfg, "llm_max_tokens_chat", 0) or 0)
+            if cfg_cap > 0:
+                explicit_cap = cfg_cap
         from docgraph.llm import LLMClient, LLMConfig
         client = LLMClient(LLMConfig(
             host=cfg.llm_host, port=int(cfg.llm_port), model=cfg.llm_model,

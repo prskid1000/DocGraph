@@ -364,6 +364,14 @@ def host(
         None, "--llm-max-tokens-wiki",
         help="Per-call token budget for wiki page generation. Default 4096.",
     ),
+    llm_max_tokens_chat: int | None = typer.Option(
+        None, "--llm-max-tokens-chat",
+        help=(
+            "Per-call token budget for the right-panel Chat tab. "
+            "0 (default) = unlimited on OpenAI-compatible servers; Anthropic "
+            "uses an 8192 fallback when 0 is passed (its API requires a value)."
+        ),
+    ),
     llm_api_key: str | None = typer.Option(
         None, "--llm-api-key",
         help="API key for the LLM server.",
@@ -452,6 +460,7 @@ def host(
     if llm_format:                 overrides["llm_format"] = llm_format
     if llm_max_tokens:             overrides["llm_max_tokens"] = llm_max_tokens
     if llm_max_tokens_wiki:        overrides["llm_max_tokens_wiki"] = llm_max_tokens_wiki
+    if llm_max_tokens_chat is not None: overrides["llm_max_tokens_chat"] = llm_max_tokens_chat
     if llm_api_key:                overrides["llm_api_key"] = llm_api_key
     if llm_timeout:                overrides["llm_timeout"] = llm_timeout
     text_exts_t = _parse_ext_csv(text_exts)

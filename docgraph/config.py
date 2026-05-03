@@ -59,6 +59,12 @@ class Config:
     # separate so users can tune the two independently — e.g. 150 for
     # docstrings, 4096+ for wiki page bodies.
     llm_max_tokens_wiki: int = 4096
+    # Right-panel chat budget. 0 means "let the server decide" — for
+    # OpenAI-compatible endpoints we omit max_tokens entirely so the model
+    # writes until done. Anthropic format always sends a cap (its API
+    # requires the field); when 0, the server falls back to its own
+    # generous default (8192). Set explicitly to pin a hard limit.
+    llm_max_tokens_chat: int = 0
     # API key for the LLM server (forwarded as Authorization / x-api-key
     # depending on `llm_format`). Empty = no auth header.
     llm_api_key: str = ""
@@ -287,6 +293,7 @@ def load_config(
     llm_format: str = "openai",
     llm_max_tokens: int = 150,
     llm_max_tokens_wiki: int = 4096,
+    llm_max_tokens_chat: int = 0,
     llm_api_key: str = "",
     llm_timeout: int = 60,
     wiki_depth: int = 12,
@@ -346,6 +353,7 @@ def load_config(
         llm_format=llm_format,
         llm_max_tokens=llm_max_tokens,
         llm_max_tokens_wiki=llm_max_tokens_wiki,
+        llm_max_tokens_chat=llm_max_tokens_chat,
         llm_api_key=llm_api_key,
         llm_timeout=llm_timeout,
         wiki_depth=wiki_depth,
