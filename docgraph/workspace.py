@@ -16,6 +16,7 @@ Raises `KeyError` if nothing matches and the value is non-empty.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 import threading
@@ -26,6 +27,7 @@ from docgraph.cancel import CancelToken
 from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder, GPU_PROVIDERS
+from docgraph.locks import DBLock, LockTimeouts
 from docgraph.retrieve import Retriever
 
 log = logging.getLogger(__name__)
@@ -49,6 +51,10 @@ class RootSlot:
     # Writer is owned by an active watcher; None when no watcher is running
     # for this root. Kept here so the host can introspect it.
     db_writer: GraphDB | None = field(default=None, repr=False)
+    # Per-root async lock manager. Writers queue here; readers wait for
+    # idle. One per RootSlot today; with the group refactor it'll move
+    # to DBHandle (one per shared db_path).
+    lock: DBLock = field(default_factory=lambda: DBLock(name="root"), repr=False)
 
 
 class Workspace:
@@ -60,7 +66,7 @@ class Workspace:
     (de-duped further inside `embed.py::_MODEL_CACHE`).
     """
 
-    def __init__(self, configs: list[Config]) -> None:
+    def __init__(self, configs: list[Config], lock_timeouts: LockTimeouts | None = None) -> None:
         if not configs:
             raise ValueError("Workspace needs at least one Config")
         self._lock = threading.Lock()
@@ -72,8 +78,20 @@ class Workspace:
         # docs-add — only one runs at a time per root because they all
         # take the writer lock).
         self._cancel_tokens: dict[Path, CancelToken] = {}
+        # Lock timeouts (read gate / writer queue / wiki) — surfaced via
+        # CLI flags + telecode settings. The host caches the running
+        # event loop on startup so sync callers (the watcher thread) can
+        # bridge into the async DBLock via run_coroutine_threadsafe.
+        self.lock_timeouts = lock_timeouts or LockTimeouts()
+        self._loop: asyncio.AbstractEventLoop | None = None
         for cfg in configs:
             self._add_locked(cfg)
+
+    def attach_loop(self, loop: asyncio.AbstractEventLoop) -> None:
+        """Called once on host startup. Sync callers (watcher thread)
+        bridge their take_writer into this loop's DBLock.acquire_write
+        via run_coroutine_threadsafe. Async callers ignore it."""
+        self._loop = loop
 
     # ── construction helpers ────────────────────────────────────────────
     def embedder_for(self, cfg: Config) -> Embedder:
@@ -112,9 +130,11 @@ class Workspace:
         db_ro = GraphDB(cfg.db_path, read_only=True)
         embedder = self._embedder_for(cfg)
         retriever = Retriever(db_ro, embedder, cfg=cfg)
+        slug = slug_for_root(root)
         slot = RootSlot(
             cfg=cfg, db_ro=db_ro, retriever=retriever,
-            slug=slug_for_root(root),
+            slug=slug,
+            lock=DBLock(name=slug),
         )
         self._slots[root] = slot
         self._order.append(root)
@@ -183,25 +203,29 @@ class Workspace:
             return list(self._order)
 
     # ── watcher integration ─────────────────────────────────────────────
-    def take_writer(self, root: str | Path) -> GraphDB:
-        """Open a writer connection for `root`. Caller (the watcher) must
-        eventually call `release_writer()` so the read-only slot can
-        reopen and pick up the writes."""
+    async def take_writer_async(self, root: str | Path, label: str = "api",
+                                 timeout: float | None = None) -> GraphDB:
+        """Async writer acquisition. Queues behind active writer + drains
+        readers. `label` flows into LockStatus so /api/locks shows who's
+        holding (e.g. 'api:index', 'api:wiki', 'watch')."""
         slot = self.resolve(root)
-        with self._lock:
-            if slot.db_writer is not None:
-                raise RuntimeError(f"writer already taken for {slot.cfg.repo_root}")
-            # Closing the read-only handle is required because Kuzu's
-            # per-file lock is exclusive vs a writer in another connection.
-            slot.db_ro.close()
-            slot.db_writer = GraphDB(slot.cfg.db_path, embedding_dim=slot.cfg.embedding_dim)
-            return slot.db_writer
+        if timeout is None:
+            timeout = self.lock_timeouts.for_label(label)
+        await slot.lock.acquire_write(label, timeout=timeout)
+        try:
+            with self._lock:
+                # Closing RO is required so Kuzu releases the file lock
+                # for the writer instance we're about to open.
+                slot.db_ro.close()
+                slot.db_writer = GraphDB(
+                    slot.cfg.db_path, embedding_dim=slot.cfg.embedding_dim,
+                )
+                return slot.db_writer
+        except Exception:
+            await slot.lock.release_write()
+            raise
 
-    def release_writer(self, root: str | Path) -> None:
-        """Close the writer and reopen the slot's read-only handle.
-        Required after a reindex so subsequent reads see the new state.
-        Kuzu writer connections don't see their own writes via subsequent
-        `fetch_all` queries — close+reopen is the documented escape hatch."""
+    async def release_writer_async(self, root: str | Path) -> None:
         slot = self.resolve(root)
         with self._lock:
             if slot.db_writer is not None:
@@ -213,6 +237,60 @@ class Workspace:
             slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
             embedder = self._embedder_for(slot.cfg)
             slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
+        await slot.lock.release_write()
+
+    def take_writer(self, root: str | Path, label: str = "api",
+                    timeout: float | None = None) -> GraphDB:
+        """Sync writer acquisition. The watcher thread calls this from
+        outside the event loop; we bridge into DBLock.acquire_write via
+        run_coroutine_threadsafe so the queue stays consistent across
+        async + sync callers. If no loop is attached (e.g. CLI subprocess
+        with no host) we fall back to the legacy "raise if held" path."""
+        slot = self.resolve(root)
+        loop = self._loop
+        if loop is not None and loop.is_running():
+            if timeout is None:
+                timeout = self.lock_timeouts.for_label(label)
+            fut = asyncio.run_coroutine_threadsafe(
+                slot.lock.acquire_write(label, timeout=timeout), loop,
+            )
+            # Pad the wait by 1s so BusyTimeout from inside the coroutine
+            # surfaces before our own threadsafe-future timeout.
+            wait = (timeout if timeout != float("inf") else None)
+            wait = (wait + 1.0) if wait is not None else None
+            fut.result(timeout=wait)
+            with self._lock:
+                slot.db_ro.close()
+                slot.db_writer = GraphDB(
+                    slot.cfg.db_path, embedding_dim=slot.cfg.embedding_dim,
+                )
+                return slot.db_writer
+        # No event loop attached — single-shot CLI usage. Keep prior
+        # contract: refuse if already held, otherwise grant immediately.
+        with self._lock:
+            if slot.db_writer is not None:
+                raise RuntimeError(f"writer already taken for {slot.cfg.repo_root}")
+            slot.db_ro.close()
+            slot.db_writer = GraphDB(slot.cfg.db_path, embedding_dim=slot.cfg.embedding_dim)
+            return slot.db_writer
+
+    def release_writer(self, root: str | Path) -> None:
+        """Sync release. Mirrors take_writer — bridges into the async
+        lock when a loop is attached, otherwise legacy behaviour."""
+        slot = self.resolve(root)
+        loop = self._loop
+        with self._lock:
+            if slot.db_writer is not None:
+                try:
+                    slot.db_writer.close()
+                except Exception:
+                    log.exception("failed closing writer for %s", slot.cfg.repo_root)
+                slot.db_writer = None
+            slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
+            embedder = self._embedder_for(slot.cfg)
+            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
+        if loop is not None and loop.is_running():
+            asyncio.run_coroutine_threadsafe(slot.lock.release_write(), loop)
 
     def clear_data(self, root: str | Path) -> None:
         """Wipe a root's `.docgraph/` (graph DB, cache, wiki, state) and

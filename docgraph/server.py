@@ -30,6 +30,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from docgraph.cancel import OperationCancelled
 from docgraph.db import DatabaseBusy
+from docgraph.locks import BusyTimeout
 from docgraph.workspace import Workspace, RootSlot
 
 log = logging.getLogger(__name__)
@@ -92,6 +93,11 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI):
+        # Cache the running loop so sync callers (the watcher thread) can
+        # bridge their take_writer/release_writer into DBLock via
+        # run_coroutine_threadsafe. Must happen before the watcher is
+        # spawned so there's no window where the loop is missing.
+        workspace.attach_loop(asyncio.get_running_loop())
         async with mcp_http.lifespan(_app):
             yield
 
@@ -114,6 +120,73 @@ def make_app(workspace: Workspace) -> FastAPI:
             headers={"Retry-After": "2"},
         )
 
+    @app.exception_handler(BusyTimeout)
+    async def _busy_timeout_handler(_request: Request, exc: BusyTimeout):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "lock_timeout", "detail": str(exc)},
+            headers={"Retry-After": "2"},
+        )
+
+    # Paths that don't touch the graph DB — skip the read gate so a
+    # status poll (e.g. /api/jobs/<id> while an index is running) doesn't
+    # block on the very lock the caller is waiting to clear. Also skips
+    # SSE (would deadlock — consumer waits for events emitted AFTER the
+    # write completes) and the chat endpoint (LLM-only, no DB).
+    _GATE_SKIP_PREFIXES = (
+        "/api/jobs/", "/api/admin/cancel", "/api/locks",
+        "/api/roots", "/api/llm_config", "/api/events",
+        "/api/chat", "/api/file_content",
+    )
+
+    # Read gate. Every GET /api/* request that targets a specific root
+    # blocks briefly if a writer is currently held — the watcher reindex /
+    # API index / wiki op finishes (typically <2s for incrementals,
+    # <30s for wiki). Gate-times-out → 503 + Retry-After. While a request
+    # is in flight we increment reads_in_flight so a queued writer waits
+    # for clean drain instead of cancelling mid-query.
+    @app.middleware("http")
+    async def _read_gate(request: Request, call_next):
+        path = request.url.path
+        method = request.method.upper()
+        # Only gate GET /api/* on graph-touching routes. POST/DELETE writes
+        # have their own queueing via workspace.take_writer_async.
+        if method != "GET" or not path.startswith("/api/"):
+            return await call_next(request)
+        if any(path.startswith(p) for p in _GATE_SKIP_PREFIXES):
+            return await call_next(request)
+        slug = request.query_params.get("root")
+        try:
+            slot = workspace.resolve(slug) if slug else workspace.default()
+        except KeyError:
+            return await call_next(request)
+        try:
+            await slot.lock.wait_idle(timeout=workspace.lock_timeouts.read_wait)
+        except BusyTimeout as exc:
+            return JSONResponse(
+                status_code=503,
+                content={"error": "lock_timeout", "detail": str(exc),
+                         "lock": _lock_status_dict(slot)},
+                headers={"Retry-After": "2"},
+            )
+        await slot.lock.enter_read()
+        try:
+            return await call_next(request)
+        finally:
+            await slot.lock.leave_read()
+
+    def _lock_status_dict(slot: RootSlot) -> dict:
+        s = slot.lock.status()
+        return {
+            "slug": slot.slug,
+            "held": s.held,
+            "holder_label": s.holder_label,
+            "holder_age": s.holder_age,
+            "queue_depth": s.queue_depth,
+            "queued_labels": s.queued_labels,
+            "reads_in_flight": s.reads_in_flight,
+        }
+
     def _slot(root) -> RootSlot:
         if root is None:
             return workspace.resolve(None)
@@ -132,6 +205,22 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.get("/api/roots")
     async def api_roots():
         return workspace.list()
+
+    # Lock observability — show what's holding writers / queue depths.
+    # Useful for debugging "why is /api/stats slow" or "why is the UI
+    # showing 503 retries"; the UI's status badge reads this.
+    @app.get("/api/locks")
+    async def api_locks():
+        out = []
+        for slot in (workspace.resolve(s) for s in workspace.slugs()):
+            out.append(_lock_status_dict(slot))
+        return {"locks": out, "timeouts": {
+            "read_wait": workspace.lock_timeouts.read_wait,
+            "write_wait": workspace.lock_timeouts.write_wait,
+            "wiki_write": workspace.lock_timeouts.wiki_write,
+            "watcher_write": workspace.lock_timeouts.watcher_write,
+            "force_free_after": workspace.lock_timeouts.force_free_after,
+        }}
 
     # --- JSON API (every route accepts ?root=<slug>) ---
     @app.get("/api/search")

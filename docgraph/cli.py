@@ -402,6 +402,31 @@ def host(
         None, "--asset-exts",
         help="Comma-separated asset extensions. Implies --documents. ",
     ),
+    # Lock manager timeouts. Reads block briefly when a writer is held;
+    # writers queue. Tuning these trades 503-bounces for client-side
+    # latency. Watcher writes always queue (no timeout).
+    read_wait_timeout: float = typer.Option(
+        5.0, "--read-wait-timeout",
+        help="Seconds a read request waits for a writer to release before "
+             "503'ing with Retry-After: 2. Default 5s.",
+    ),
+    write_wait_timeout: float = typer.Option(
+        60.0, "--write-wait-timeout",
+        help="Seconds an API index/docs writer waits in queue before "
+             "503'ing. Watcher writes ignore this (always queue).",
+    ),
+    wiki_write_timeout: float = typer.Option(
+        180.0, "--wiki-write-timeout",
+        help="Wiki builds are longer than incremental indexes; separate "
+             "queue timeout. Default 180s.",
+    ),
+    writer_force_free_after: float = typer.Option(
+        300.0, "--writer-force-free-after",
+        help="Log + cancel a writer that's held for longer than this. "
+             "Doesn't yank the lock (Kuzu mid-COPY would corrupt) — "
+             "only flips the cancel token so the holder bails at next "
+             "checkpoint.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Run the unified DocGraph host: web UI + JSON API + MCP HTTP, multi-root.
@@ -470,6 +495,16 @@ def host(
 
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
+    # Apply lock-timeout overrides directly on the workspace's LockTimeouts
+    # struct (workspace built before this point so it already has defaults
+    # via LockTimeouts()).
+    from docgraph.locks import LockTimeouts
+    workspace.lock_timeouts = LockTimeouts(
+        read_wait=read_wait_timeout,
+        write_wait=write_wait_timeout,
+        wiki_write=wiki_write_timeout,
+        force_free_after=writer_force_free_after,
+    )
     watch_paths = [p.resolve() for p in (watch or [])]
     # Validate that every --watch points at a registered root.
     registered = set(workspace.roots())
