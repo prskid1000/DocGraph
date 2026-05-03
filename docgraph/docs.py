@@ -145,15 +145,20 @@ def chunk_doc(text: str) -> list[str]:
 # --- Public API -------------------------------------------------------
 
 
-def add_doc(cfg: Config, url: str) -> dict:
+def add_doc(cfg: Config, url: str, db: GraphDB | None = None) -> dict:
     """Fetch `url`, chunk, embed, write Doc rows. Replaces any existing Doc
-    rows for the same source URL (so re-running is idempotent)."""
+    rows for the same source URL (so re-running is idempotent).
+
+    Pass an existing writer `db` to reuse it (the host's `/api/docs/add`
+    route does this so it doesn't fight the workspace's writer-lock dance
+    by opening a parallel GraphDB)."""
     with _console.status(f"[cyan]Fetching[/] {url}"):
         title, text = fetch_url(url)
     if not text.strip():
         return {"url": url, "chunks": 0, "title": title, "error": "empty body"}
 
-    db = GraphDB(cfg.db_path, embedding_dim=384)
+    if db is None:
+        db = GraphDB(cfg.db_path, embedding_dim=384)
     db.init_schema()
 
     # Remove existing chunks for this URL
@@ -222,9 +227,12 @@ def list_docs(cfg: Config) -> list[dict]:
     return rows
 
 
-def remove_doc(cfg: Config, url: str) -> int:
-    """Delete all Doc chunks for a given source URL. Returns count removed."""
-    db = GraphDB(cfg.db_path, embedding_dim=384)
+def remove_doc(cfg: Config, url: str, db: GraphDB | None = None) -> int:
+    """Delete all Doc chunks for a given source URL. Returns count removed.
+
+    Pass an existing writer `db` to reuse it (host route)."""
+    if db is None:
+        db = GraphDB(cfg.db_path, embedding_dim=384)
     db.init_schema()
     rows = db.fetch_all(
         "MATCH (d:Doc) WHERE d.source = $u RETURN count(d) AS c", {"u": url}

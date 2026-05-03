@@ -320,6 +320,99 @@ def make_app(workspace: Workspace) -> FastAPI:
             return {"file": file, "content": "[redacted by .cursorignore]", "redacted": True}
         return {"file": file, "content": full.read_text(encoding="utf-8", errors="replace")}
 
+    # Admin: wipe a root's index. Same writer-lock dance as /api/admin/index.
+    @app.post("/api/admin/clear")
+    async def api_admin_clear(root: RootSlug = DEFAULT):
+        slot = _slot(root)
+
+        def _do() -> dict:
+            writer = workspace.take_writer(slot.cfg.repo_root)
+            try:
+                writer.wipe(keep_schema=False)
+                writer.init_schema()
+            finally:
+                workspace.release_writer(slot.cfg.repo_root)
+            # Also drop the per-file delta cache so the next index pass
+            # is treated as a full rebuild rather than an incremental no-op.
+            cache = slot.cfg.data_dir / "cache.json"
+            try:
+                if cache.exists():
+                    cache.unlink()
+            except OSError:
+                pass
+            wiki_dir = slot.cfg.data_dir / "wiki"
+            try:
+                if wiki_dir.exists():
+                    import shutil as _sh
+                    _sh.rmtree(wiki_dir, ignore_errors=True)
+            except OSError:
+                pass
+            return {"slug": slot.slug, "cleared": True}
+
+        try:
+            out = await asyncio.to_thread(_do)
+        except Exception as exc:
+            log.exception("api_admin_clear failed: %s", exc)
+            raise HTTPException(500, f"clear failed: {exc}") from exc
+        broadcast(app, "reindex_done", {
+            "repo_slug": slot.slug, "ts": __import__("time").time(), "events": -1,
+        })
+        return out
+
+    # External docs (`@Docs` parity). Add takes the writer; list reads from
+    # the slot's existing RO handle; remove takes the writer briefly.
+    @app.get("/api/docs/list")
+    async def api_docs_list(root: RootSlug = DEFAULT):
+        from docgraph.docs import list_docs
+        slot = _slot(root)
+        return await asyncio.to_thread(list_docs, slot.cfg)
+
+    @app.post("/api/docs/add")
+    async def api_docs_add(payload: dict, root: RootSlug = DEFAULT):
+        from docgraph.docs import add_doc
+        slot = _slot(root)
+        url = (payload or {}).get("url", "").strip()
+        if not url:
+            raise HTTPException(400, "url is required")
+
+        def _do() -> dict:
+            writer = workspace.take_writer(slot.cfg.repo_root)
+            try:
+                return add_doc(slot.cfg, url, db=writer)
+            finally:
+                workspace.release_writer(slot.cfg.repo_root)
+
+        try:
+            out = await asyncio.to_thread(_do)
+        except Exception as exc:
+            log.exception("api_docs_add failed: %s", exc)
+            raise HTTPException(500, f"docs add failed: {exc}") from exc
+        if isinstance(out, dict) and out.get("error"):
+            raise HTTPException(400, out["error"])
+        return out
+
+    @app.post("/api/docs/remove")
+    async def api_docs_remove(payload: dict, root: RootSlug = DEFAULT):
+        from docgraph.docs import remove_doc
+        slot = _slot(root)
+        url = (payload or {}).get("url", "").strip()
+        if not url:
+            raise HTTPException(400, "url is required")
+
+        def _do() -> int:
+            writer = workspace.take_writer(slot.cfg.repo_root)
+            try:
+                return remove_doc(slot.cfg, url, db=writer)
+            finally:
+                workspace.release_writer(slot.cfg.repo_root)
+
+        try:
+            removed = await asyncio.to_thread(_do)
+        except Exception as exc:
+            log.exception("api_docs_remove failed: %s", exc)
+            raise HTTPException(500, f"docs remove failed: {exc}") from exc
+        return {"url": url, "removed_chunks": removed}
+
     # Mount the FastMCP HTTP app under /mcp. Telecode's bridge does
     # POST http://host:port/mcp; Starlette redirects /mcp → /mcp/ which
     # the mcp.client.streamable_http transport (httpx-backed) follows.

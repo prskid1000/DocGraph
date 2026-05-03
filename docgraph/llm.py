@@ -12,6 +12,12 @@ Configurable via CLI flags or env vars (no settings file):
     --llm-format  openai|anthropic / DOCGRAPH_LLM_FORMAT (default: "openai")
     (api key)               / DOCGRAPH_LLM_API_KEY (optional)
 
+Prompt overrides (env-only, no CLI flag — telecode tray edits them):
+    DOCGRAPH_LLM_PROMPT_DOCSTRING / _FILE — replaces the docstring template.
+        Must keep the `{kind}`, `{name}`, `{language}`, `{body}` placeholders.
+    DOCGRAPH_LLM_PROMPT_WIKI / _FILE — replaces the wiki "Output format" tail.
+        Read by `wiki.build_wiki`, not here.
+
 Stdlib urllib only — no extra deps. Off by default; the indexer skips
 this entire step unless `cfg.llm_docstrings` is true.
 """
@@ -19,6 +25,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -45,6 +52,36 @@ _PROMPT = (
     "Return only the sentence — no quotes, no markdown, no preamble.\n\n"
     "```{language}\n{body}\n```"
 )
+
+
+def _load_prompt_override() -> str | None:
+    """Read a docstring-prompt override from env, in priority order:
+    1) `DOCGRAPH_LLM_PROMPT_DOCSTRING` (literal text)
+    2) `DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE` (path to file)
+
+    Returns None if neither is set or the file is missing/unreadable.
+    Caller is responsible for ensuring the override still contains the
+    `{kind}` / `{name}` / `{language}` / `{body}` placeholders — if any
+    are missing, `.format()` will raise KeyError and `summarize()` swallows
+    it as a generic LLM failure. We don't validate up front because env
+    vars may be set ahead of any indexer call."""
+    text = os.environ.get("DOCGRAPH_LLM_PROMPT_DOCSTRING")
+    if text and text.strip():
+        return text
+    path = os.environ.get("DOCGRAPH_LLM_PROMPT_DOCSTRING_FILE", "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            return content if content.strip() else None
+        except OSError:
+            return None
+    return None
+
+
+def docstring_prompt_template() -> str:
+    """Return the active docstring prompt template (override or default)."""
+    return _load_prompt_override() or _PROMPT
 
 
 @dataclass
@@ -82,7 +119,12 @@ class LLMClient:
         """Generate a one-sentence docstring. Returns "" on any failure —
         callers treat the LLM as best-effort augmentation."""
         snippet = body[:3000]
-        prompt = _PROMPT.format(kind=kind, name=name, language=language, body=snippet)
+        template = docstring_prompt_template()
+        try:
+            prompt = template.format(kind=kind, name=name, language=language, body=snippet)
+        except (KeyError, IndexError) as e:
+            log.warning("LLM docstring prompt override is malformed (%s) — falling back to default", e)
+            prompt = _PROMPT.format(kind=kind, name=name, language=language, body=snippet)
         try:
             if self.cfg.format == "anthropic":
                 return self._call_anthropic(prompt)

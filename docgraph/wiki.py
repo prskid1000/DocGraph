@@ -180,16 +180,50 @@ def _wiki_prompt(facts: dict) -> str:
     if facts.get("tests"):
         tests = ", ".join(sorted({t.get("file", "") for t in facts["tests"]}))
         parts.append(f"- Tests covering it: {tests}")
-    parts += [
-        "",
-        "## Output format",
-        "Write a Markdown page with these sections:",
-        "1. **Summary** — 2-3 sentences on the module's purpose.",
-        "2. **Key entities** — bulleted list of the most important classes/functions and what each is for.",
-        "3. **How it's used** — who imports it, in plain language.",
-        "Total length: 200-300 words. No code blocks. Do not list every file. Only state what the facts support.",
-    ]
+    parts += ["", "## Output format", _wiki_output_format()]
     return "\n".join(parts)
+
+
+_DEFAULT_WIKI_TAIL = (
+    "Write a Markdown page with these sections:\n"
+    "1. **Summary** — 2-3 sentences on the module's purpose.\n"
+    "2. **Key entities** — bulleted list of the most important classes/functions and what each is for.\n"
+    "3. **How it's used** — who imports it, in plain language.\n"
+    "Total length: 200-300 words. No code blocks. Do not list every file. "
+    "Only state what the facts support."
+)
+
+
+def _wiki_output_format() -> str:
+    """Tail of the wiki prompt — the "Output format" instruction block.
+
+    Override priority:
+    1) `DOCGRAPH_LLM_PROMPT_WIKI` (literal text) — replaces the tail wholesale.
+    2) `DOCGRAPH_LLM_PROMPT_WIKI_FILE` (path) — same, from a file.
+    3) Built-in default (`_DEFAULT_WIKI_TAIL`).
+
+    The override does NOT need any placeholder substitution — the rendered
+    facts already sit above this section. Override callers can ask for any
+    section structure / length / tone they want."""
+    import os
+    text = os.environ.get("DOCGRAPH_LLM_PROMPT_WIKI")
+    if text and text.strip():
+        return text
+    path = os.environ.get("DOCGRAPH_LLM_PROMPT_WIKI_FILE", "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            if content.strip():
+                return content
+        except OSError:
+            pass
+    return _DEFAULT_WIKI_TAIL
+
+
+def wiki_prompt_tail() -> str:
+    """Public alias for the active wiki-tail prompt (default or override)."""
+    return _wiki_output_format()
 
 
 def build_wiki(
