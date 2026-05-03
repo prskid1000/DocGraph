@@ -25,6 +25,7 @@ from typing import AsyncIterator
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
 
+from docgraph.cancel import OperationCancelled
 from docgraph.workspace import Workspace, RootSlot
 
 log = logging.getLogger(__name__)
@@ -158,9 +159,16 @@ def make_app(workspace: Workspace) -> FastAPI:
             depth = int(p.get("depth", 12)) if isinstance(p, dict) else 12
         except (TypeError, ValueError):
             depth = 12
-        pages = await asyncio.to_thread(
-            build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
-        )
+        workspace.reset_cancel(slot.cfg.repo_root)
+        token = workspace.cancel_token_for(slot.cfg.repo_root)
+        try:
+            pages = await asyncio.to_thread(
+                build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
+                token,
+            )
+        except OperationCancelled:
+            workspace.reset_cancel(slot.cfg.repo_root)
+            raise HTTPException(499, "wiki build cancelled") from None
         return {"built": len(pages), "modules": [pg.module for pg in pages]}
 
     @app.post("/api/cypher")
@@ -255,6 +263,10 @@ def make_app(workspace: Workspace) -> FastAPI:
         from docgraph.embed import Embedder, GPU_PROVIDERS
         slot = _slot(root)
         full = bool((payload or {}).get("full", False))
+        # Reset before kicking off so a stale cancel from a previous run
+        # doesn't immediately abort.
+        workspace.reset_cancel(slot.cfg.repo_root)
+        token = workspace.cancel_token_for(slot.cfg.repo_root)
 
         def _do() -> tuple[dict, str]:
             # Indexer.index_all() prints Rich progress bars. We capture
@@ -276,7 +288,8 @@ def make_app(workspace: Workspace) -> FastAPI:
                 embedder = workspace._embedder_for(slot.cfg)
                 indexer = Indexer(slot.cfg, writer, embedder=embedder)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                    stats = indexer.index_all(incremental=not full)
+                    stats = indexer.index_all(incremental=not full,
+                                               cancel_token=token)
                 # Indexer.index_all(incremental=False) swaps `self.db` for a
                 # fresh GraphDB after wipe — close that one, not the original.
                 try:
@@ -289,6 +302,11 @@ def make_app(workspace: Workspace) -> FastAPI:
 
         try:
             stats, captured = await asyncio.to_thread(_do)
+        except OperationCancelled:
+            # 499 = "Client Closed Request" (nginx convention). Telecode
+            # treats this as a clean cancel rather than a failure.
+            workspace.reset_cancel(slot.cfg.repo_root)
+            raise HTTPException(499, "index cancelled") from None
         except Exception as exc:
             log.exception("api_admin_index failed: %s", exc)
             raise HTTPException(500, f"index failed: {exc}") from exc
@@ -298,6 +316,15 @@ def make_app(workspace: Workspace) -> FastAPI:
             "repo_slug": slot.slug, "ts": _time.time(), "events": -1,
         })
         return {"slug": slot.slug, "full": full, "stats": stats, "log": captured}
+
+    # Admin: cancel the currently-running long-op (index / wiki) for a
+    # root. Cooperative — the long op polls a per-root token at safe
+    # checkpoints and raises `OperationCancelled` when it fires. Idempotent.
+    @app.post("/api/admin/cancel")
+    async def api_admin_cancel(root: RootSlug = DEFAULT):
+        slot = _slot(root)
+        workspace.request_cancel(slot.cfg.repo_root)
+        return {"slug": slot.slug, "cancel_requested": True}
 
     @app.get("/api/file_content")
     async def api_file_content(file: str, root: RootSlug = DEFAULT):
@@ -375,15 +402,21 @@ def make_app(workspace: Workspace) -> FastAPI:
         if not url:
             raise HTTPException(400, "url is required")
 
+        workspace.reset_cancel(slot.cfg.repo_root)
+        token = workspace.cancel_token_for(slot.cfg.repo_root)
+
         def _do() -> dict:
             writer = workspace.take_writer(slot.cfg.repo_root)
             try:
-                return add_doc(slot.cfg, url, db=writer)
+                return add_doc(slot.cfg, url, db=writer, cancel_token=token)
             finally:
                 workspace.release_writer(slot.cfg.repo_root)
 
         try:
             out = await asyncio.to_thread(_do)
+        except OperationCancelled:
+            workspace.reset_cancel(slot.cfg.repo_root)
+            raise HTTPException(499, "docs add cancelled") from None
         except Exception as exc:
             log.exception("api_docs_add failed: %s", exc)
             raise HTTPException(500, f"docs add failed: {exc}") from exc

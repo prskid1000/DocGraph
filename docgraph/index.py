@@ -25,9 +25,12 @@ from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 from rich.console import Console
+
+if TYPE_CHECKING:
+    from docgraph.cancel import CancelToken
 from rich.progress import (
     BarColumn, MofNCompleteColumn, Progress, SpinnerColumn,
     TaskProgressColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn,
@@ -181,6 +184,7 @@ class Indexer:
         plan: list[tuple[dict, str]],
         prog_label: str,
         insert_batch: int = 5000,
+        cancel_token: "CancelToken | None" = None,
     ) -> None:
         """Stream-embed and insert. plan: [(row_dict, embed_text), ...].
 
@@ -223,6 +227,11 @@ class Indexer:
                 while plan:
                     if errors:
                         break
+                    # Per-batch cancel checkpoint: between batches is
+                    # safe (last batch's writes already committed via
+                    # the writer thread's queue handoff).
+                    if cancel_token is not None:
+                        cancel_token.raise_if_set()
                     batch = plan[:insert_batch]
                     del plan[:insert_batch]
                     texts = [t for _, t in batch]
@@ -248,7 +257,8 @@ class Indexer:
             raise errors[0]
 
     # ---- DB delete ----
-    def _augment_llm_docstrings(self, parsed: dict) -> None:
+    def _augment_llm_docstrings(self, parsed: dict,
+                                 cancel_token: "CancelToken | None" = None) -> None:
         """For entities lacking a native docstring, ask the local LLM to
         write a one-sentence summary. Cached by body hash in
         `.docgraph/llm_docstrings.json` so incrementals don't re-call.
@@ -304,6 +314,8 @@ class Indexer:
             ptask = prog.add_task("LLM docstrings", total=len(targets))
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
                 for ent, h, text in ex.map(_task, targets):
+                    if cancel_token is not None:
+                        cancel_token.raise_if_set()
                     if text:
                         if isinstance(ent.extra, dict):
                             ent.extra["llm_doc"] = text
@@ -343,7 +355,16 @@ class Indexer:
         # Module nodes left alone (cheap, may be reused; orphans tolerated)
 
     # ---- Main entrypoint ----
-    def index_all(self, incremental: bool = True, progress_cb: ProgressCb = None) -> dict:
+    def index_all(self, incremental: bool = True, progress_cb: ProgressCb = None,
+                  cancel_token: "CancelToken | None" = None) -> dict:
+        # Cooperative cancel: poll `cancel_token.raise_if_set()` at major
+        # phase boundaries. Mid-phase cancellation is unsafe (inside Kuzu
+        # COPY or an ONNX embed call would corrupt state); between phases
+        # is fine because each phase commits before the next starts.
+        def _ck():
+            if cancel_token is not None:
+                cancel_token.raise_if_set()
+        _ck()
         t0 = time.perf_counter()
         cache = load_cache(self.cfg) if incremental else {}
         # If the cache was empty AND we're "incremental", treat the run as a
@@ -399,12 +420,14 @@ class Indexer:
             changed = list(files_on_disk)
 
         # ---- Step 1: delete affected nodes from DB ----
+        _ck()
         affected = [rel for _path, rel in changed]
         self._delete_files_from_db(affected + deleted_rels)
         for rel in deleted_rels:
             cache.pop(rel, None)
 
         # ---- Step 2: parse changed files in parallel ----
+        _ck()
         parsed: dict[str, FileParse] = {}
         errors: list[str] = []
         if changed:
@@ -423,6 +446,11 @@ class Indexer:
                 with ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
                     for result in ex.map(_parse_worker, args_iter, chunksize=8):
                         prog.advance(ptask)
+                        # Per-file checkpoint: parse can be the slowest
+                        # phase on big repos; this lets a cancel land
+                        # within a few hundred ms instead of waiting for
+                        # the whole pool to drain.
+                        _ck()
                         if result is None:
                             continue
                         if "_error" in result:
@@ -446,10 +474,12 @@ class Indexer:
                         }
 
         # ---- Step 3a: optional LLM docstring augmentation ----
+        _ck()
         if self.cfg.llm_docstrings and parsed:
-            self._augment_llm_docstrings(parsed)
+            self._augment_llm_docstrings(parsed, cancel_token=cancel_token)
 
         # ---- Step 3: seed ID allocator ----
+        _ck()
         self._seed_ids_from_db()
 
         # ---- Step 4: build node rows for newly-parsed files ----
@@ -552,14 +582,17 @@ class Indexer:
         # Warm up the embedder once before any progress bar opens, so the
         # "Loading embedding model" log doesn't punch through the live display.
         if class_plan or function_plan:
+            _ck()
             self.embedder._ensure()
 
         # ---- Step 5b: stream embed + insert classes/functions ----
         if class_plan:
-            self._stream_embed_insert("Class", class_plan, "Embedding entities (classes)")
+            self._stream_embed_insert("Class", class_plan, "Embedding entities (classes)",
+                                       cancel_token=cancel_token)
             class_plan.clear()
         if function_plan:
-            self._stream_embed_insert("Function", function_plan, "Embedding entities (functions)")
+            self._stream_embed_insert("Function", function_plan, "Embedding entities (functions)",
+                                       cancel_token=cancel_token)
             function_plan.clear()
 
         # ---- Step 5c: build chunk plan, then stream embed + insert ----
@@ -595,7 +628,9 @@ class Indexer:
                         chunk_contains_class.append({"from_id": eid, "to_id": cid})
 
         if chunk_plan:
-            self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks")
+            _ck()
+            self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks",
+                                       cancel_token=cancel_token)
             chunk_plan.clear()
 
         # ---- Step 5d: CONTAINS_CHUNK edges ----
@@ -621,6 +656,7 @@ class Indexer:
         n_parsed = len(parsed)
         parsed.clear()
 
+        _ck()
         # ---- Step 7: build full symbol table from DB ----
         # qname → (label, id); name → list[(label, id, file)]
         qname_index: dict[str, tuple[str, int]] = {}
@@ -721,6 +757,7 @@ class Indexer:
                     pool = pref
             return pool[0]
 
+        _ck()
         # ---- Step 8: re-resolve and write edges ----
         # Combine RawEdges from cache (covers both unchanged and just-parsed files).
         # For each edge, decide if it needs DB insertion.
@@ -974,6 +1011,7 @@ class Indexer:
                 self.db.insert_edges("IMPORTS_SYMBOL", "File", "Function", imports_symbol_func_rows, on_progress=cb)
                 self.db.insert_edges("OVERRIDES", "Function", "Function", overrides_rows, on_progress=cb)
 
+        _ck()
         # ---- Step 9: Tier 4 + PageRank (incremental-aware) ----
         # Skip entirely on no-op runs (no parsed, no deleted) so a `docgraph
         # index` against an unchanged repo doesn't rewrite ~M of edges +
@@ -996,6 +1034,7 @@ class Indexer:
         # Persist state (last-known git HEAD per root, etc.)
         self._save_state(state)
 
+        _ck()
         # ---- Step 9b: optional document + asset pass (tier 2 + 3) ----
         doc_stats = {"text_docs": 0, "doc_chunks": 0, "assets": 0, "ref_edges": 0}
         if self.cfg.index_documents:

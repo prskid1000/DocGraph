@@ -170,6 +170,18 @@ In practice MCP/API callers send slugs (the closed enum forces it). Path-prefix 
 
 **Indexer-side `extra_roots`** still exists on `Config` — a different concept from workspace multi-root. `extra_roots` lets the indexer walk multiple paths into **one** `.docgraph/graph.kuzu` (for monorepos with sibling projects). The workspace's roots are independent indexes that sit side-by-side; each has its own DB file. Both shapes can coexist: a workspace can register one root whose Config carries `extra_roots`.
 
+## Cancellation
+
+Long-running host operations (`/api/admin/index`, `/api/wiki/build`) are cooperatively cancellable via `POST /api/admin/cancel?root=<slug>`.
+
+- One `CancelToken` per root (`docgraph/cancel.py`), owned by `Workspace.cancel_token_for(root)`.
+- Long ops accept `cancel_token=...` and call `token.raise_if_set()` at major phase boundaries (between parse / embed / symbol-table / edge / tier-4 / pagerank / documents passes), plus per-file in the parse loop and per-batch in the embed pipeline. Mid-phase cancellation is **unsafe** — checking inside Kuzu COPY or an ONNX embed call would corrupt state — so checkpoints are at known-clean points only.
+- The route handler resets the token before kicking off (so a stale prior cancel doesn't immediately abort), supplies it to the long op, and translates `OperationCancelled` into HTTP 499 ("Client Closed Request" per nginx convention).
+- Telecode's runners POST `/api/admin/cancel` *before* cancelling their local asyncio task — otherwise the in-flight HTTP connection drops first and the server never sees the cancel signal. The 499 response triggers `CancelledError` on the client; the runner's `try/finally` clears `current_path` so the row pill returns to "idle".
+- Subprocess route (when no host is alive) is killed via `kill_process_tree` — same path as before.
+
+If you add a new long-op endpoint, follow the same pattern: `reset_cancel(root)` → `cancel_token_for(root)` → pass into the op → `except OperationCancelled` → HTTP 499.
+
 ## Watch mode
 
 `docgraph host --watch <root>` starts the unified server with a per-root watcher task on the same event loop. Each watcher takes a writer connection from the workspace via `take_writer(root)` for the duration of one reindex pass, runs `Indexer.index_all(incremental=True)` via `asyncio.to_thread`, then releases the writer (which reopens the workspace's read-only handle for that root — Kuzu's writer-visibility quirk). Other roots keep serving from their unaffected RO handles throughout.

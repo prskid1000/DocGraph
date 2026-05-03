@@ -22,6 +22,7 @@ import threading
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from docgraph.cancel import CancelToken
 from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder, GPU_PROVIDERS
@@ -66,6 +67,11 @@ class Workspace:
         self._slots: dict[Path, RootSlot] = {}
         self._order: list[Path] = []
         self._embedders: dict[tuple[str, bool], Embedder] = {}
+        # One cooperative-cancel token per root, shared across whatever
+        # long-op is currently running for that root (index / wiki /
+        # docs-add — only one runs at a time per root because they all
+        # take the writer lock).
+        self._cancel_tokens: dict[Path, CancelToken] = {}
         for cfg in configs:
             self._add_locked(cfg)
 
@@ -106,6 +112,7 @@ class Workspace:
         )
         self._slots[root] = slot
         self._order.append(root)
+        self._cancel_tokens[root] = CancelToken()
         return slot
 
     # ── lookup ──────────────────────────────────────────────────────────
@@ -210,6 +217,25 @@ class Workspace:
         slot = self.resolve(root)
         with self._lock:
             slot.last_indexed_at = float(ts)
+
+    # ── cancellation ────────────────────────────────────────────────────
+    def cancel_token_for(self, root: str | Path) -> CancelToken:
+        """Per-root cooperative-cancel token. The long op polls
+        `token.raise_if_set()` at safe checkpoints; another request
+        flips it via `request_cancel()`."""
+        slot = self.resolve(root)
+        with self._lock:
+            return self._cancel_tokens[slot.cfg.repo_root.resolve()]
+
+    def request_cancel(self, root: str | Path) -> None:
+        """Set the cancel flag for `root`'s currently running long op.
+        Idempotent — flipping a no-op token is harmless."""
+        self.cancel_token_for(root).request()
+
+    def reset_cancel(self, root: str | Path) -> None:
+        """Clear the cancel flag. Call before kicking off a new long op
+        so a stale prior cancel doesn't immediately abort the new run."""
+        self.cancel_token_for(root).reset()
 
     # ── lifecycle ───────────────────────────────────────────────────────
     def close(self) -> None:

@@ -17,6 +17,7 @@ from urllib.parse import urlparse
 
 from rich.console import Console
 
+from docgraph.cancel import CancelToken
 from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder, GPU_PROVIDERS
@@ -145,15 +146,30 @@ def chunk_doc(text: str) -> list[str]:
 # --- Public API -------------------------------------------------------
 
 
-def add_doc(cfg: Config, url: str, db: GraphDB | None = None) -> dict:
+def add_doc(
+    cfg: Config,
+    url: str,
+    db: GraphDB | None = None,
+    cancel_token: CancelToken | None = None,
+) -> dict:
     """Fetch `url`, chunk, embed, write Doc rows. Replaces any existing Doc
     rows for the same source URL (so re-running is idempotent).
 
     Pass an existing writer `db` to reuse it (the host's `/api/docs/add`
     route does this so it doesn't fight the workspace's writer-lock dance
-    by opening a parallel GraphDB)."""
+    by opening a parallel GraphDB).
+
+    Pass `cancel_token` to make the op cooperatively cancellable. Checkpoints
+    are at safe boundaries (before fetch, after fetch, before embed, before
+    insert) — never mid-embed (ONNX batch) or mid-COPY (Kuzu)."""
+    def _ck() -> None:
+        if cancel_token is not None:
+            cancel_token.raise_if_set()
+
+    _ck()
     with _console.status(f"[cyan]Fetching[/] {url}"):
         title, text = fetch_url(url)
+    _ck()
     if not text.strip():
         return {"url": url, "chunks": 0, "title": title, "error": "empty body"}
 
@@ -168,6 +184,7 @@ def add_doc(cfg: Config, url: str, db: GraphDB | None = None) -> dict:
         pass
 
     pieces = chunk_doc(text)
+    _ck()
     embedder = Embedder(
         cfg.embedding_model,
         providers=list(GPU_PROVIDERS) if cfg.gpu else None,
@@ -179,6 +196,7 @@ def add_doc(cfg: Config, url: str, db: GraphDB | None = None) -> dict:
             batch_size=cfg.embed_batch_size,
             on_progress=lambda n: prog.advance(task, n),
         )
+    _ck()
 
     # Continue id allocation past max(id) across all node tables
     max_id = 0
@@ -202,6 +220,7 @@ def add_doc(cfg: Config, url: str, db: GraphDB | None = None) -> dict:
             "body": piece[:6000],
             "embedding": vec,
         })
+    _ck()
     db.insert_nodes("Doc", rows)
     return {"url": url, "title": title, "chunks": len(rows)}
 

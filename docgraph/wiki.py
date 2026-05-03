@@ -234,6 +234,7 @@ def build_wiki(
     progress=None,
     force: bool = False,
     depth: int = 12,
+    cancel_token=None,
 ) -> list[WikiPage]:
     """Generate (or re-generate) wiki pages for every module (one per
     directory, capped at `depth` directory levels). Saves to
@@ -264,6 +265,12 @@ def build_wiki(
 
     pages: list[WikiPage] = []
     for i, g in enumerate(groups):
+        # Cancel checkpoint between modules. Each page is its own LLM
+        # call (~5-30s with reasoning models); checking here means a
+        # cancel lands on the next module boundary, not after the whole
+        # repo. Already-written pages stay on disk → resumable.
+        if cancel_token is not None:
+            cancel_token.raise_if_set()
         module = g["module"]
         slug = _slugify(module)
         title = module if module != "(root)" else "Repository root"
