@@ -33,8 +33,20 @@ _MODEL_CACHE: dict[tuple, TextEmbedding] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
 
-def _cache_key(model_name: str, providers: list[str] | None) -> tuple:
-    return (model_name, tuple(providers) if providers else ())
+def _cache_key(model_name: str, providers: list | None) -> tuple:
+    """Cache key is hashable. ORT provider entries can be plain strings or
+    `(name, options_dict)` tuples; dicts aren't hashable, so freeze the
+    options-dict half into a sorted-items tuple before stuffing it into
+    the key."""
+    if not providers:
+        return (model_name, ())
+    frozen: list = []
+    for p in providers:
+        if isinstance(p, tuple) and len(p) == 2 and isinstance(p[1], dict):
+            frozen.append((p[0], tuple(sorted(p[1].items()))))
+        else:
+            frozen.append(p)
+    return (model_name, tuple(frozen))
 
 
 def clear_model_cache() -> None:

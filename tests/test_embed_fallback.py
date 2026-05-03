@@ -101,3 +101,22 @@ def test_no_fallback_when_already_on_cpu(monkeypatch):
     emb = Embedder("dummy-model")  # no providers → CPU-only
     with pytest.raises(RuntimeError, match="ONNXRuntimeError"):
         emb.embed(["x"])
+
+
+def test_cache_key_handles_provider_with_options_dict():
+    """Regression: the DirectML adapter-id path passes
+    ``("DmlExecutionProvider", {"device_id": 1})`` in the providers list.
+    Earlier ``_cache_key`` did ``tuple(providers)``, which left the inner
+    dict in the key — unhashable, so dict lookup raised TypeError before
+    the embedder could even load. Lock in that the key is hashable."""
+    from docgraph.embed import _cache_key, resolve_providers
+
+    providers = resolve_providers(True, 1)
+    assert any(isinstance(p, tuple) for p in providers), (
+        "resolve_providers should wrap DmlExecutionProvider as a tuple"
+    )
+    key = _cache_key("BAAI/bge-small-en-v1.5", providers)
+    # Must be hashable — store it as a dict key as a smoke test.
+    {key: 1}
+    # Same providers must produce the same key (cache must hit on reuse).
+    assert _cache_key("BAAI/bge-small-en-v1.5", providers) == key
