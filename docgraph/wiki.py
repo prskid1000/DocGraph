@@ -235,6 +235,7 @@ def build_wiki(
     force: bool = False,
     depth: int = 12,
     cancel_token=None,
+    progress_cb=None,
 ) -> list[WikiPage]:
     """Generate (or re-generate) wiki pages for every module (one per
     directory, capped at `depth` directory levels). Saves to
@@ -263,6 +264,16 @@ def build_wiki(
             log.warning("wiki: no module matched %r", only_module)
             return []
 
+    def _emit(phase: str, current: int = 0, total: int = 0,
+              module: str = "") -> None:
+        if progress_cb is None:
+            return
+        try:
+            progress_cb(phase, current, total, module)
+        except Exception:
+            log.debug("wiki progress_cb raised; ignoring", exc_info=True)
+
+    _emit("start", 0, len(groups))
     pages: list[WikiPage] = []
     for i, g in enumerate(groups):
         # Cancel checkpoint between modules. Each page is its own LLM
@@ -272,6 +283,7 @@ def build_wiki(
         if cancel_token is not None:
             cancel_token.raise_if_set()
         module = g["module"]
+        _emit("module", i, len(groups), module)
         slug = _slugify(module)
         title = module if module != "(root)" else "Repository root"
         body_path = wiki_dir / f"{slug}.md"
@@ -348,6 +360,7 @@ def build_wiki(
     else:
         index_payload = list(new_entries.values())
     index_path.write_text(json.dumps(index_payload, indent=2), encoding="utf-8")
+    _emit("done", len(pages), len(pages))
     return pages
 
 

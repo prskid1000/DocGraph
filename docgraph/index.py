@@ -364,7 +364,22 @@ class Indexer:
         def _ck():
             if cancel_token is not None:
                 cancel_token.raise_if_set()
+
+        # Progress emit — fires the user-supplied callback at each phase
+        # boundary so external supervisors (telecode SSE) can mirror the
+        # same status the CLI prints. Callback signature: (phase, current,
+        # total). For phases without a count both are 0. Wraps in try so a
+        # broken callback can't kill the index pass.
+        def _emit(phase: str, current: int = 0, total: int = 0) -> None:
+            if progress_cb is None:
+                return
+            try:
+                progress_cb(phase, current, total)
+            except Exception:
+                log.debug("progress_cb raised; ignoring", exc_info=True)
+
         _ck()
+        _emit("start")
         t0 = time.perf_counter()
         cache = load_cache(self.cfg) if incremental else {}
         # If the cache was empty AND we're "incremental", treat the run as a
@@ -421,6 +436,7 @@ class Indexer:
 
         # ---- Step 1: delete affected nodes from DB ----
         _ck()
+        _emit("delete", 0, len(changed) + len(deleted_rels))
         affected = [rel for _path, rel in changed]
         self._delete_files_from_db(affected + deleted_rels)
         for rel in deleted_rels:
@@ -428,6 +444,7 @@ class Indexer:
 
         # ---- Step 2: parse changed files in parallel ----
         _ck()
+        _emit("parse", 0, len(changed))
         parsed: dict[str, FileParse] = {}
         errors: list[str] = []
         if changed:
@@ -476,10 +493,12 @@ class Indexer:
         # ---- Step 3a: optional LLM docstring augmentation ----
         _ck()
         if self.cfg.llm_docstrings and parsed:
+            _emit("llm_augment", 0, len(parsed))
             self._augment_llm_docstrings(parsed, cancel_token=cancel_token)
 
         # ---- Step 3: seed ID allocator ----
         _ck()
+        _emit("seed_ids")
         self._seed_ids_from_db()
 
         # ---- Step 4: build node rows for newly-parsed files ----
@@ -583,6 +602,7 @@ class Indexer:
         # "Loading embedding model" log doesn't punch through the live display.
         if class_plan or function_plan:
             _ck()
+            _emit("embed_entities", 0, len(class_plan) + len(function_plan))
             self.embedder._ensure()
 
         # ---- Step 5b: stream embed + insert classes/functions ----
@@ -629,6 +649,7 @@ class Indexer:
 
         if chunk_plan:
             _ck()
+            _emit("embed_chunks", 0, len(chunk_plan))
             self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks",
                                        cancel_token=cancel_token)
             chunk_plan.clear()
@@ -657,6 +678,7 @@ class Indexer:
         parsed.clear()
 
         _ck()
+        _emit("symbol_table")
         # ---- Step 7: build full symbol table from DB ----
         # qname → (label, id); name → list[(label, id, file)]
         qname_index: dict[str, tuple[str, int]] = {}
@@ -758,6 +780,7 @@ class Indexer:
             return pool[0]
 
         _ck()
+        _emit("edges")
         # ---- Step 8: re-resolve and write edges ----
         # Combine RawEdges from cache (covers both unchanged and just-parsed files).
         # For each edge, decide if it needs DB insertion.
@@ -1012,6 +1035,7 @@ class Indexer:
                 self.db.insert_edges("OVERRIDES", "Function", "Function", overrides_rows, on_progress=cb)
 
         _ck()
+        _emit("tier4_pagerank")
         # ---- Step 9: Tier 4 + PageRank (incremental-aware) ----
         # Skip entirely on no-op runs (no parsed, no deleted) so a `docgraph
         # index` against an unchanged repo doesn't rewrite ~M of edges +
@@ -1038,6 +1062,7 @@ class Indexer:
         # ---- Step 9b: optional document + asset pass (tier 2 + 3) ----
         doc_stats = {"text_docs": 0, "doc_chunks": 0, "assets": 0, "ref_edges": 0}
         if self.cfg.index_documents:
+            _emit("documents")
             try:
                 doc_stats = self._index_documents()
                 _console.print(
@@ -1070,6 +1095,7 @@ class Indexer:
             f"{len(on_disk_rel)} files, {total_entities} entities, "
             f"{n_parsed} reparsed, {len(deleted_rels)} deleted, {len(errors)} errors"
         )
+        _emit("done", n_parsed, len(on_disk_rel))
         return {
             "files": len(on_disk_rel),
             "changed": n_parsed,

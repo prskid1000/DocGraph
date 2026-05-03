@@ -165,10 +165,25 @@ def make_app(workspace: Workspace) -> FastAPI:
             depth = 12
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
+
+        # Per-module progress → SSE so telecode mirrors CLI status into
+        # docgraph_wiki.log. Payload: {repo_slug, phase, current, total, module, ts}.
+        import time as _time_progress
+        def _progress_cb(phase: str, current: int = 0, total: int = 0,
+                         module: str = "") -> None:
+            broadcast(app, "wiki_progress", {
+                "repo_slug": slot.slug,
+                "phase": phase,
+                "current": int(current),
+                "total": int(total),
+                "module": module,
+                "ts": _time_progress.time(),
+            })
+
         try:
             pages = await asyncio.to_thread(
                 build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
-                token,
+                token, _progress_cb,
             )
         except OperationCancelled:
             workspace.reset_cancel(slot.cfg.repo_root)
@@ -272,6 +287,19 @@ def make_app(workspace: Workspace) -> FastAPI:
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
 
+        # Phase progress → SSE so telecode (or any subscriber) can mirror
+        # the same status the CLI prints. Sent on the existing `index_progress`
+        # event with `{repo_slug, phase, current, total, ts}`.
+        import time as _time_progress
+        def _progress_cb(phase: str, current: int = 0, total: int = 0) -> None:
+            broadcast(app, "index_progress", {
+                "repo_slug": slot.slug,
+                "phase": phase,
+                "current": int(current),
+                "total": int(total),
+                "ts": _time_progress.time(),
+            })
+
         def _do() -> tuple[dict, str]:
             # Indexer.index_all() prints Rich progress bars. We capture
             # them so the response can return both the stats dict AND a
@@ -293,7 +321,8 @@ def make_app(workspace: Workspace) -> FastAPI:
                 indexer = Indexer(slot.cfg, writer, embedder=embedder)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     stats = indexer.index_all(incremental=not full,
-                                               cancel_token=token)
+                                               cancel_token=token,
+                                               progress_cb=_progress_cb)
                 # Indexer.index_all(incremental=False) swaps `self.db` for a
                 # fresh GraphDB after wipe — close that one, not the original.
                 try:
