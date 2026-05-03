@@ -208,6 +208,37 @@ class Workspace:
             embedder = self._embedder_for(slot.cfg)
             slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
 
+    def clear_data(self, root: str | Path) -> None:
+        """Wipe a root's `.docgraph/` (graph DB, cache, wiki, state) and
+        reopen a fresh empty schema. Closes the slot's RO handle, removes
+        the directory, recreates an empty DB, and reopens RO. The CLI's
+        `docgraph clear` does the same thing — just with the host alive."""
+        import gc
+        import shutil
+        slot = self.resolve(root)
+        with self._lock:
+            if slot.db_writer is not None:
+                raise RuntimeError(f"writer is currently held for {slot.cfg.repo_root}")
+            try:
+                slot.db_ro.close()
+            except Exception:
+                log.exception("failed closing RO before clear for %s", slot.cfg.repo_root)
+            # Kuzu's COPY-FROM internals can hold extra refs that survive
+            # close on Windows; force a GC pass before rmtree to release.
+            gc.collect()
+            data_dir = slot.cfg.data_dir
+            if data_dir.exists():
+                shutil.rmtree(data_dir, ignore_errors=False)
+            data_dir.mkdir(parents=True, exist_ok=True)
+            tmp = GraphDB(slot.cfg.db_path, embedding_dim=slot.cfg.embedding_dim)
+            try:
+                tmp.init_schema()
+            finally:
+                tmp.close()
+            slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
+            embedder = self._embedder_for(slot.cfg)
+            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
+
     def mark_watching(self, root: str | Path, watching: bool) -> None:
         slot = self.resolve(root)
         with self._lock:

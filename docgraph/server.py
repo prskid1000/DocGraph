@@ -308,10 +308,12 @@ def make_app(workspace: Workspace) -> FastAPI:
             # related crashes if the host runs in a non-utf-8 console.
             import io, contextlib
             sink = io.StringIO()
+            # Full-reindex wipe is handled inside Indexer.index_all
+            # (close → wipe → fresh GraphDB → init_schema → continue), so
+            # we don't redo it here. init_schema is idempotent (IF NOT
+            # EXISTS) and harmless on the incremental path.
             writer = workspace.take_writer(slot.cfg.repo_root)
             try:
-                if full:
-                    writer.wipe(keep_schema=False)
                 writer.init_schema()
                 # Reuse the workspace's embedder pool. DirectML / CUDA
                 # don't take kindly to two ONNX sessions sharing one GPU
@@ -380,33 +382,16 @@ def make_app(workspace: Workspace) -> FastAPI:
             return {"file": file, "content": "[redacted by .cursorignore]", "redacted": True}
         return {"file": file, "content": full.read_text(encoding="utf-8", errors="replace")}
 
-    # Admin: wipe a root's index. Same writer-lock dance as /api/admin/index.
+    # Admin: wipe a root's index. rmtrees the entire .docgraph/ — same as
+    # the `docgraph clear` CLI — then opens a fresh empty schema. The
+    # workspace handles the close-RO → rmtree → reopen-RO dance so other
+    # in-flight reads against this slot don't crash.
     @app.post("/api/admin/clear")
     async def api_admin_clear(root: RootSlug = DEFAULT):
         slot = _slot(root)
 
         def _do() -> dict:
-            writer = workspace.take_writer(slot.cfg.repo_root)
-            try:
-                writer.wipe(keep_schema=False)
-                writer.init_schema()
-            finally:
-                workspace.release_writer(slot.cfg.repo_root)
-            # Also drop the per-file delta cache so the next index pass
-            # is treated as a full rebuild rather than an incremental no-op.
-            cache = slot.cfg.data_dir / "cache.json"
-            try:
-                if cache.exists():
-                    cache.unlink()
-            except OSError:
-                pass
-            wiki_dir = slot.cfg.data_dir / "wiki"
-            try:
-                if wiki_dir.exists():
-                    import shutil as _sh
-                    _sh.rmtree(wiki_dir, ignore_errors=True)
-            except OSError:
-                pass
+            workspace.clear_data(slot.cfg.repo_root)
             return {"slug": slot.slug, "cleared": True}
 
         try:
