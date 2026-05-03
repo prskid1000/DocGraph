@@ -237,6 +237,27 @@ def make_app(workspace: Workspace) -> FastAPI:
         for label in ("File", "Function", "Class", "Variable", "Module"):
             r = d.fetch_all(f"MATCH (n:{label}) RETURN count(n) AS c")
             out[label] = r[0]["c"] if r else 0
+        # Edge counts per REL table. show_tables() rows have a `type` column
+        # equal to "REL" for relationship tables; iterate those and count.
+        edges_by_type: dict[str, int] = {}
+        total_edges = 0
+        for row in rows or []:
+            if not isinstance(row, dict):
+                continue
+            if str(row.get("type", "")).upper() != "REL":
+                continue
+            name = str(row.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                r = d.fetch_all(f"MATCH ()-[r:{name}]->() RETURN count(r) AS c")
+                c = int(r[0]["c"]) if r else 0
+            except Exception:
+                c = 0
+            edges_by_type[name] = c
+            total_edges += c
+        out["edges"] = total_edges
+        out["edges_by_type"] = edges_by_type
         return out
 
     # --- SSE: live reindex events ---
