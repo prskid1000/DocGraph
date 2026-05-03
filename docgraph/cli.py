@@ -243,10 +243,10 @@ def _build_workspace(roots: list[Path], **overrides) -> "Workspace":
         cfg = load_config(r, **overrides)
         if not cfg.db_path.exists():
             console.print(
-                f"[yellow]Root {cfg.repo_root} has no index yet. "
-                f"Run `docgraph index {cfg.repo_root}` first.[/yellow]"
+                f"[yellow]Root {cfg.repo_root} has no index yet — "
+                f"initializing empty DB. Index from the UI or run "
+                f"`docgraph index {cfg.repo_root}`.[/yellow]"
             )
-            raise typer.Exit(1)
         configs.append(cfg)
     return Workspace(configs)
 

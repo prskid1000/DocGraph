@@ -100,10 +100,15 @@ class Workspace:
         if root in self._slots:
             return self._slots[root]
         if not cfg.db_path.exists():
-            raise FileNotFoundError(
-                f"Root {root} has no index at {cfg.db_path}. "
-                f"Run `docgraph index {root}` first."
-            )
+            # Fresh root — initialize an empty graph DB so the host can
+            # serve queries (returning empty results) until the user
+            # triggers an index. Writer is closed before opening RO so
+            # Kuzu releases the file lock on Windows.
+            log.info("Initializing empty graph DB for unindexed root %s", root)
+            cfg.db_path.parent.mkdir(parents=True, exist_ok=True)
+            db_w = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
+            db_w.init_schema()
+            db_w.close()
         db_ro = GraphDB(cfg.db_path, read_only=True)
         embedder = self._embedder_for(cfg)
         retriever = Retriever(db_ro, embedder, cfg=cfg)
