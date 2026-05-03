@@ -66,6 +66,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent.
 - **LLM-augmented docstrings (opt-in)** — `--llm-model <name>` enables it; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash.
 - **LLM-grounded wiki (opt-in)** — `docgraph wiki` walks every top-level module, builds a fact sheet from Kuzu, and asks the same local LLM to write a 200-300 word Markdown page per module. Saved to `.docgraph/wiki/<slug>.md` and shown in the Web UI.
+- **Right-panel Chat tab (opt-in)** — when `--llm-model` is set, the Web UI's right panel adds a **Chat** tab next to **Detail**. It POSTs `/api/chat` against the same configured local LLM, renders Markdown + JSON in replies, and — when an entity is selected in the graph — automatically attaches that entity's snippet/file/language as a system-message preamble so the model has the source without any copy-paste. Chat output isn't capped on OpenAI-compatible servers (the model writes until done); the meta line tracks the active root and re-pulls config when you switch the root selector. The tab stays hidden when no LLM is configured.
 
 ## Performance
 
@@ -360,6 +361,8 @@ Every retriever route accepts a `root=<slug>` query parameter. The slug is one o
 | `GET /api/file_content?file=...` | Source text for inspection (sandboxed; redacts `.cursorignore`'d files) |
 | `GET /api/processes?limit=&max_chain_len=` | Detected entry-point → call chains |
 | `GET /api/wiki/list`, `?slug=`, `POST /api/wiki/build` | Wiki pages (resumable; `force=true` rebuilds) |
+| `GET /api/llm_config` | Reports the active root's LLM augmentation knobs — `{configured, host, port, model, format, max_tokens, has_key}`. The web UI uses this to gate the right-panel **Chat** tab. |
+| `POST /api/chat` (`{messages, context?, max_tokens?}`) | Multi-turn chat through the configured LLM. `messages` is an OpenAI-shaped `[{role, content}, …]` list. `context` (optional) is `{name, file, language, snippet}` and is injected as a system-message preamble so the model sees the entity's source. `max_tokens` is optional — omitted by default for OpenAI-compatible servers (model writes until done); Anthropic format forces a generous default since the API requires one. Returns `{content, model}`. |
 | `GET /api/events` | SSE stream. Emits `reindex_done` after every reindex; the bundled UI uses it to auto-refresh. Keepalive every 15 s. |
 
 ## Comparison

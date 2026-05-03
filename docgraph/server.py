@@ -544,28 +544,28 @@ def make_app(workspace: Workspace) -> FastAPI:
                 f"```{lang}\n{snippet}\n```"
             )
             messages = [{"role": "system", "content": sys_note}] + list(messages)
-        # Chat outputs are prose, not docstring one-liners — use the wiki
-        # budget (typically 4096) so long answers aren't truncated. Caller
-        # may still override per-request via payload.max_tokens.
-        chat_budget = int(payload.get("max_tokens")
-                          or getattr(cfg, "llm_max_tokens_wiki", 4096) or 4096)
+        # Chat doesn't cap output — the docstring/wiki budgets are for those
+        # fixed-length use cases, not free-form Q&A. For OpenAI-compatible
+        # servers we omit max_tokens entirely so the model writes until it's
+        # done (or hits the server's context ceiling). Anthropic's Messages
+        # API requires a number, so use a generous default there only.
+        # Caller may still pin a hard cap via payload.max_tokens.
+        explicit_cap = payload.get("max_tokens")
         from docgraph.llm import LLMClient, LLMConfig
         client = LLMClient(LLMConfig(
             host=cfg.llm_host, port=int(cfg.llm_port), model=cfg.llm_model,
             format=cfg.llm_format,
             api_key=getattr(cfg, "llm_api_key", "") or None,
-            max_tokens=chat_budget,
+            # max_tokens here is only used as the Anthropic fallback below.
+            max_tokens=int(explicit_cap or 8192),
             timeout=int(getattr(cfg, "llm_timeout", 60) or 60),
         ))
-        # The existing _post helper handles both openai + anthropic shapes
-        # but only takes a single prompt. Build the right payload here so we
-        # can pass the full message list through.
         try:
             if client.cfg.format == "anthropic":
                 body = {
                     "model": client.cfg.model,
                     "messages": messages,
-                    "max_tokens": client.cfg.max_tokens,
+                    "max_tokens": client.cfg.max_tokens,  # required by Anthropic
                     "temperature": 0.4,
                 }
                 data = await asyncio.to_thread(client._post, client.cfg.endpoint, body)
@@ -578,11 +578,12 @@ def make_app(workspace: Workspace) -> FastAPI:
                 body = {
                     "model": client.cfg.model,
                     "messages": messages,
-                    "max_tokens": client.cfg.max_tokens,
                     "temperature": 0.4,
                     "stream": False,
                     "reasoning_effort": "none",
                 }
+                if explicit_cap:
+                    body["max_tokens"] = int(explicit_cap)
                 data = await asyncio.to_thread(client._post, client.cfg.endpoint, body)
                 try:
                     content = (data["choices"][0]["message"]["content"] or "").strip()
