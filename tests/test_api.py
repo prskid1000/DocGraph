@@ -136,7 +136,23 @@ def test_admin_index_runs_in_process(tmp_path: Path):
             r = c.post("/api/admin/index", json={"full": False})
             assert r.status_code == 200, r.text
             body = r.json()
-            assert "stats" in body
+            assert "job_id" in body
+            job_id = body["job_id"]
+            
+            import time
+            for _ in range(20):
+                time.sleep(0.5)
+                rj = c.get(f"/api/jobs/{job_id}")
+                assert rj.status_code == 200
+                jb = rj.json()
+                if jb["status"] == "completed":
+                    break
+                elif jb["status"] in ("failed", "cancelled"):
+                    pytest.fail(f"job failed: {jb}")
+            
+            assert jb["status"] == "completed"
+            assert "result" in jb
+            assert jb["result"].get("files") == 1
             assert body.get("full") is False
             assert "slug" in body
     finally:

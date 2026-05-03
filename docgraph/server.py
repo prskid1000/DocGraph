@@ -19,8 +19,11 @@ import contextlib
 import enum
 import json
 import logging
+import uuid
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import AsyncIterator
+from typing import AsyncIterator, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.responses import HTMLResponse, StreamingResponse
@@ -31,6 +34,42 @@ from docgraph.workspace import Workspace, RootSlot
 log = logging.getLogger(__name__)
 
 UI_DIR = Path(__file__).parent / "ui"
+
+@dataclass
+class Job:
+    id: str = field(default_factory=lambda: str(uuid.uuid4()))
+    type: str = ""
+    root: str = ""
+    status: str = "running" # running, completed, failed, cancelled
+    result: dict | None = None
+    error: str | None = None
+    log: str = ""
+    start_time: float = field(default_factory=time.time)
+    end_time: float | None = None
+    cancel_token: Any = None
+
+class JobManager:
+    def __init__(self):
+        self.jobs: dict[str, Job] = {}
+
+    def create_job(self, jtype: str, root: str, token: Any) -> Job:
+        j = Job(type=jtype, root=root, cancel_token=token)
+        self.jobs[j.id] = j
+        return j
+
+    def get_job(self, job_id: str) -> Job | None:
+        return self.jobs.get(job_id)
+
+    def finish_job(self, job_id: str, status: str, result: dict | None = None, error: str | None = None, log: str = ""):
+        j = self.jobs.get(job_id)
+        if j:
+            j.status = status
+            j.result = result
+            j.error = error
+            j.log = log
+            j.end_time = time.time()
+
+job_manager = JobManager()
 
 
 def _root_enum(workspace: Workspace) -> type[enum.Enum]:
@@ -167,12 +206,15 @@ def make_app(workspace: Workspace) -> FastAPI:
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
 
+        job = job_manager.create_job("wiki", str(slot.cfg.repo_root), token)
+
         # Per-module progress → SSE so telecode mirrors CLI status into
         # docgraph_wiki.log. Payload: {repo_slug, phase, current, total, module, ts}.
         import time as _time_progress
         def _progress_cb(phase: str, current: int = 0, total: int = 0,
                          module: str = "") -> None:
             broadcast(app, "wiki_progress", {
+                "job_id": job.id,
                 "repo_slug": slot.slug,
                 "phase": phase,
                 "current": int(current),
@@ -181,15 +223,24 @@ def make_app(workspace: Workspace) -> FastAPI:
                 "ts": _time_progress.time(),
             })
 
-        try:
-            pages = await asyncio.to_thread(
-                build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
-                token, _progress_cb,
-            )
-        except OperationCancelled:
-            workspace.reset_cancel(slot.cfg.repo_root)
-            raise HTTPException(499, "wiki build cancelled") from None
-        return {"built": len(pages), "modules": [pg.module for pg in pages]}
+        async def _run_job():
+            try:
+                pages = await asyncio.to_thread(
+                    build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
+                    token, _progress_cb,
+                )
+                result = {"built": len(pages), "modules": [pg.module for pg in pages]}
+                job_manager.finish_job(job.id, "completed", result=result)
+            except OperationCancelled:
+                workspace.reset_cancel(slot.cfg.repo_root)
+                job_manager.finish_job(job.id, "cancelled", error="wiki build cancelled")
+            except Exception as exc:
+                log.exception("api_wiki_build failed: %s", exc)
+                job_manager.finish_job(job.id, "failed", error=str(exc))
+
+        asyncio.create_task(_run_job())
+        return {"built": -1, "modules": [], "job_id": job.id, "status": "running"}
+
 
     @app.post("/api/cypher")
     async def api_cypher(payload: dict, root: RootSlug = DEFAULT):
@@ -291,6 +342,39 @@ def make_app(workspace: Workspace) -> FastAPI:
 
         return StreamingResponse(gen(), media_type="text/event-stream")
 
+    @app.get("/api/jobs")
+    async def api_get_jobs(root: str | None = None):
+        jobs = list(job_manager.jobs.values())
+        if root:
+            jobs = [j for j in jobs if j.root == root]
+        return [{"id": j.id, "type": j.type, "root": j.root, "status": j.status, "start_time": j.start_time, "end_time": j.end_time} for j in jobs]
+
+    @app.get("/api/jobs/{job_id}")
+    async def api_get_job(job_id: str):
+        j = job_manager.get_job(job_id)
+        if not j:
+            raise HTTPException(404, "job not found")
+        return {
+            "id": j.id,
+            "type": j.type,
+            "root": j.root,
+            "status": j.status,
+            "result": j.result,
+            "error": j.error,
+            "log": j.log,
+            "start_time": j.start_time,
+            "end_time": j.end_time
+        }
+
+    @app.post("/api/jobs/{job_id}/cancel")
+    async def api_cancel_job(job_id: str):
+        j = job_manager.get_job(job_id)
+        if not j:
+            raise HTTPException(404, "job not found")
+        if j.cancel_token:
+            j.cancel_token.request()
+        return {"id": j.id, "cancel_requested": True}
+
     # --- Admin: in-process index ---
     # Lets external supervisors (telecode) trigger a reindex without
     # spawning a separate `docgraph index` subprocess that would fight
@@ -309,12 +393,15 @@ def make_app(workspace: Workspace) -> FastAPI:
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
 
+        job = job_manager.create_job("index", str(slot.cfg.repo_root), token)
+
         # Phase progress → SSE so telecode (or any subscriber) can mirror
         # the same status the CLI prints. Sent on the existing `index_progress`
         # event with `{repo_slug, phase, current, total, ts}`.
         import time as _time_progress
         def _progress_cb(phase: str, current: int = 0, total: int = 0) -> None:
             broadcast(app, "index_progress", {
+                "job_id": job.id,
                 "repo_slug": slot.slug,
                 "phase": phase,
                 "current": int(current),
@@ -330,25 +417,15 @@ def make_app(workspace: Workspace) -> FastAPI:
             # related crashes if the host runs in a non-utf-8 console.
             import io, contextlib
             sink = io.StringIO()
-            # Full-reindex wipe is handled inside Indexer.index_all
-            # (close → wipe → fresh GraphDB → init_schema → continue), so
-            # we don't redo it here. init_schema is idempotent (IF NOT
-            # EXISTS) and harmless on the incremental path.
             writer = workspace.take_writer(slot.cfg.repo_root)
             try:
                 writer.init_schema()
-                # Reuse the workspace's embedder pool. DirectML / CUDA
-                # don't take kindly to two ONNX sessions sharing one GPU
-                # device; building a fresh `Embedder` here would race
-                # the host's existing read-path embedder.
                 embedder = workspace._embedder_for(slot.cfg)
                 indexer = Indexer(slot.cfg, writer, embedder=embedder)
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     stats = indexer.index_all(incremental=not full,
                                                cancel_token=token,
                                                progress_cb=_progress_cb)
-                # Indexer.index_all(incremental=False) swaps `self.db` for a
-                # fresh GraphDB after wipe — close that one, not the original.
                 try:
                     indexer.db.close()
                 except Exception:
@@ -357,22 +434,24 @@ def make_app(workspace: Workspace) -> FastAPI:
             finally:
                 workspace.release_writer(slot.cfg.repo_root)
 
-        try:
-            stats, captured = await asyncio.to_thread(_do)
-        except OperationCancelled:
-            # 499 = "Client Closed Request" (nginx convention). Telecode
-            # treats this as a clean cancel rather than a failure.
-            workspace.reset_cancel(slot.cfg.repo_root)
-            raise HTTPException(499, "index cancelled") from None
-        except Exception as exc:
-            log.exception("api_admin_index failed: %s", exc)
-            raise HTTPException(500, f"index failed: {exc}") from exc
-        import time as _time
-        workspace.mark_indexed(slot.cfg.repo_root, _time.time())
-        broadcast(app, "reindex_done", {
-            "repo_slug": slot.slug, "ts": _time.time(), "events": -1,
-        })
-        return {"slug": slot.slug, "full": full, "stats": stats, "log": captured}
+        async def _run_job():
+            try:
+                stats, captured = await asyncio.to_thread(_do)
+                job_manager.finish_job(job.id, "completed", result=stats, log=captured)
+                import time as _time
+                workspace.mark_indexed(slot.cfg.repo_root, _time.time())
+                broadcast(app, "reindex_done", {
+                    "job_id": job.id, "repo_slug": slot.slug, "ts": _time.time(), "events": -1,
+                })
+            except OperationCancelled:
+                workspace.reset_cancel(slot.cfg.repo_root)
+                job_manager.finish_job(job.id, "cancelled", error="index cancelled")
+            except Exception as exc:
+                log.exception("api_admin_index failed: %s", exc)
+                job_manager.finish_job(job.id, "failed", error=str(exc))
+
+        asyncio.create_task(_run_job())
+        return {"slug": slot.slug, "full": full, "job_id": job.id, "status": "running"}
 
     # Admin: cancel the currently-running long-op (index / wiki) for a
     # root. Cooperative — the long op polls a per-root token at safe
@@ -444,6 +523,8 @@ def make_app(workspace: Workspace) -> FastAPI:
 
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
+        
+        job = job_manager.create_job("docs_add", str(slot.cfg.repo_root), token)
 
         def _do() -> dict:
             writer = workspace.take_writer(slot.cfg.repo_root)
@@ -452,17 +533,22 @@ def make_app(workspace: Workspace) -> FastAPI:
             finally:
                 workspace.release_writer(slot.cfg.repo_root)
 
-        try:
-            out = await asyncio.to_thread(_do)
-        except OperationCancelled:
-            workspace.reset_cancel(slot.cfg.repo_root)
-            raise HTTPException(499, "docs add cancelled") from None
-        except Exception as exc:
-            log.exception("api_docs_add failed: %s", exc)
-            raise HTTPException(500, f"docs add failed: {exc}") from exc
-        if isinstance(out, dict) and out.get("error"):
-            raise HTTPException(400, out["error"])
-        return out
+        async def _run_job():
+            try:
+                out = await asyncio.to_thread(_do)
+                if isinstance(out, dict) and out.get("error"):
+                    job_manager.finish_job(job.id, "failed", error=out["error"])
+                else:
+                    job_manager.finish_job(job.id, "completed", result=out)
+            except OperationCancelled:
+                workspace.reset_cancel(slot.cfg.repo_root)
+                job_manager.finish_job(job.id, "cancelled", error="docs add cancelled")
+            except Exception as exc:
+                log.exception("api_docs_add failed: %s", exc)
+                job_manager.finish_job(job.id, "failed", error=str(exc))
+
+        asyncio.create_task(_run_job())
+        return {"url": url, "job_id": job.id, "status": "running"}
 
     @app.post("/api/docs/remove")
     async def api_docs_remove(payload: dict, root: RootSlug = DEFAULT):

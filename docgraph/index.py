@@ -239,6 +239,8 @@ class Indexer:
                     rows = [r for r, _ in batch]
                     del batch
                     def _on_emb(n: int) -> None:
+                        if cancel_token is not None:
+                            cancel_token.raise_if_set()
                         prog.advance(task, n)
                         if progress_emit is not None:
                             try:
