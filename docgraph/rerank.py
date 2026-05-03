@@ -24,12 +24,25 @@ RERANK_TOP_K = 50  # how many candidates to feed into the cross-encoder
 class Reranker:
     """Lazy wrapper around fastembed's TextCrossEncoder. Thread-safe."""
 
-    def __init__(self, model_name: str | None = None) -> None:
+    def __init__(
+        self,
+        model_name: str | None = None,
+        providers: list[str] | None = None,
+    ) -> None:
         self.model_name = (
             model_name
             or os.environ.get("DOCGRAPH_RERANK_MODEL")
             or DEFAULT_RERANK_MODEL
         )
+        # Mirrors Embedder: explicit `providers` wins; otherwise honour the
+        # DOCGRAPH_RERANK_GPU env var (set by Config / the host launcher) and
+        # use the shared GPU_PROVIDERS chain. None → fastembed's CPU default.
+        if providers is None and os.environ.get(
+            "DOCGRAPH_RERANK_GPU", ""
+        ).lower() in ("1", "true", "yes"):
+            from .embed import GPU_PROVIDERS
+            providers = list(GPU_PROVIDERS)
+        self.providers = providers
         self._lock = Lock()
         self._encoder = None
 
@@ -37,8 +50,24 @@ class Reranker:
         with self._lock:
             if self._encoder is None:
                 from fastembed.rerank.cross_encoder import TextCrossEncoder
-                log.info(f"Loading cross-encoder reranker: {self.model_name}")
-                self._encoder = TextCrossEncoder(model_name=self.model_name)
+                log.info(
+                    f"Loading cross-encoder reranker: {self.model_name}"
+                    + (f" (providers={self.providers})" if self.providers else "")
+                )
+                try:
+                    self._encoder = TextCrossEncoder(
+                        model_name=self.model_name,
+                        providers=self.providers if self.providers else None,
+                    )
+                except Exception as exc:
+                    if self.providers:
+                        log.warning(
+                            f"Reranker GPU init failed ({exc!s}); falling back to CPU"
+                        )
+                        self.providers = None
+                        self._encoder = TextCrossEncoder(model_name=self.model_name)
+                    else:
+                        raise
             return self._encoder
 
     def score(self, query: str, documents: list[str]) -> list[float]:

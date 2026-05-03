@@ -36,7 +36,11 @@ class Retriever:
             # cfg.rerank_model may be "" — Reranker falls back to its env var
             # default in that case (jinaai/jina-reranker-v1-tiny-en).
             model = getattr(self.cfg, "rerank_model", "") or None
-            self._reranker = Reranker(model_name=model)
+            providers: list[str] | None = None
+            if getattr(self.cfg, "rerank_gpu", False):
+                from .embed import GPU_PROVIDERS
+                providers = list(GPU_PROVIDERS)
+            self._reranker = Reranker(model_name=model, providers=providers)
         return self._reranker
 
     def _ranker_(self) -> PersonalizedRanker:

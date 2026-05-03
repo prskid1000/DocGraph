@@ -29,6 +29,12 @@ class Config:
     # (jinaai/jina-reranker-v1-tiny-en).
     rerank_default: bool = False
     rerank_model: str = ""
+    # Run the cross-encoder reranker on GPU (CUDA / DirectML / CoreML / ROCm
+    # in that order, falling back to CPU). Off by default — the reranker model
+    # is small (~33 MB) and the cost of co-located GPU inference with embed
+    # passes is usually higher than the speedup. Independent from `gpu` so
+    # users can keep embeddings on GPU and reranking on CPU (or vice versa).
+    rerank_gpu: bool = False
     # GPU acceleration for embeddings (and reranker). Off by default; when
     # True, the Embedder asks ONNX Runtime to use CUDA / DirectML / CoreML
     # before falling back to CPU. Requires `onnxruntime-gpu` or
@@ -269,6 +275,7 @@ def load_config(
         embedding_dim=int(os.environ.get("DOCGRAPH_EMBED_DIM", "384")),
         rerank_default=os.environ.get("DOCGRAPH_RERANK_DEFAULT", "").lower() in ("1", "true", "yes"),
         rerank_model=os.environ.get("DOCGRAPH_RERANK_MODEL", ""),
+        rerank_gpu=os.environ.get("DOCGRAPH_RERANK_GPU", "").lower() in ("1", "true", "yes"),
         gpu=os.environ.get("DOCGRAPH_GPU", "").lower() in ("1", "true", "yes"),
         # Setting DOCGRAPH_LLM_MODEL is sufficient to enable; the boolean
         # DOCGRAPH_LLM_DOCSTRINGS still works as an explicit override.
