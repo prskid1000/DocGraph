@@ -996,6 +996,21 @@ class Indexer:
         # Persist state (last-known git HEAD per root, etc.)
         self._save_state(state)
 
+        # ---- Step 9b: optional document + asset pass (tier 2 + 3) ----
+        doc_stats = {"text_docs": 0, "doc_chunks": 0, "assets": 0, "ref_edges": 0}
+        if self.cfg.index_documents:
+            try:
+                doc_stats = self._index_documents()
+                _console.print(
+                    f"[cyan]Documents[/]: {doc_stats['text_docs']} text "
+                    f"({doc_stats['doc_chunks']} chunks), "
+                    f"{doc_stats['assets']} assets, "
+                    f"{doc_stats['ref_edges']} references"
+                )
+            except Exception as exc:
+                _console.print(f"[yellow]Document pass failed: {exc}[/yellow]")
+                log.exception("document pass failed")
+
         # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----
         # Cache entities should not carry _id (transient); strip.
         n_cache_ents = sum(len(c.get("entities", [])) for c in cache.values())
@@ -1023,6 +1038,7 @@ class Indexer:
             "entities": sum(len(c.get("entities", [])) for c in cache.values()),
             "elapsed": elapsed,
             "errors": len(errors),
+            "documents": doc_stats,
         }
 
     # ---- Persistent state (separate from cache: smaller, global) ----
@@ -1445,3 +1461,204 @@ class Indexer:
             self.db.insert_edges("TESTS", "Function", "Function", rows_func)
         if rows_class:
             self.db.insert_edges("TESTS", "Function", "Class", rows_class)
+
+    # ── Document + asset indexing ──────────────────────────────────────
+    def _index_documents(self) -> dict:
+        """Tier 2 + tier 3 pass.
+
+        Walks the repo for documents (md/txt/rst/csv) and assets (pdf/
+        xlsx/png/mp4/etc), embeds the text-tier ones as Doc nodes,
+        registers heavy files as Asset nodes, then scans every code
+        and doc file for path-shaped string mentions and emits
+        REFERENCES_ edges to the matching assets.
+
+        Idempotent — drops every existing Asset / file-tier Doc / its
+        REFERENCES_ edges first, then rebuilds. The cost is dominated
+        by text doc embedding; asset registration and reference
+        resolution are cheap. We don't run unless `cfg.index_documents`.
+        """
+        from . import documents as _docs
+        from .embed import Embedder, GPU_PROVIDERS
+        from .docs import chunk_doc
+
+        text_docs, assets = _docs.walk_documents(
+            self.cfg,
+            text_exts=tuple(self.cfg.text_extensions),
+            asset_exts=tuple(self.cfg.asset_extensions),
+            csv_text_max_bytes=self.cfg.csv_text_max_bytes,
+        )
+        stats = {"text_docs": 0, "doc_chunks": 0, "assets": 0, "ref_edges": 0}
+        if not text_docs and not assets:
+            return stats
+
+        # 1. Wipe prior state so the pass is idempotent. URL-tier Doc
+        #    rows (`@Docs add`) are preserved — those have a scheme
+        #    prefix on `source` (see documents.is_url_source).
+        try:
+            self.db.execute(
+                "MATCH (d:Doc) "
+                "WHERE NOT d.source STARTS WITH 'http://' "
+                "  AND NOT d.source STARTS WITH 'https://' "
+                "DETACH DELETE d"
+            )
+        except Exception:
+            pass
+        try:
+            self.db.execute("MATCH (a:Asset) DETACH DELETE a")
+        except Exception:
+            pass
+
+        # 2. Register Asset nodes first — needed for the reference
+        #    resolution step below.
+        repo_label = self.cfg.repo_root.name
+        asset_rows: list[dict] = []
+        for full, rel, ext, size in assets:
+            self._next_id += 1
+            asset_rows.append({
+                "id": self._next_id,
+                "path": rel,
+                "ext": ext,
+                "size": int(size),
+                "mime": _docs.mime_for(ext),
+                "repo": repo_label,
+            })
+        if asset_rows:
+            self.db.insert_nodes("Asset", asset_rows)
+            stats["assets"] = len(asset_rows)
+
+        # 3. Embed + insert text-tier Doc nodes.
+        if text_docs:
+            embedder = self.embedder or Embedder(
+                self.cfg.embedding_model,
+                providers=list(GPU_PROVIDERS) if self.cfg.gpu else None,
+            )
+            doc_rows: list[dict] = []
+            with _bar() as prog:
+                task = prog.add_task("Embedding documents", total=len(text_docs))
+                for full, rel, ext in text_docs:
+                    title, body = _docs.extract_text(full, ext)
+                    if not body.strip():
+                        prog.advance(task)
+                        continue
+                    pieces = chunk_doc(body)
+                    if not pieces:
+                        prog.advance(task)
+                        continue
+                    vecs = embedder.embed(pieces, batch_size=self.cfg.embed_batch_size)
+                    for i, (piece, vec) in enumerate(zip(pieces, vecs)):
+                        self._next_id += 1
+                        doc_rows.append({
+                            "id": self._next_id,
+                            "source": rel,
+                            "title": title or full.stem,
+                            "idx": i,
+                            "body": piece[:6000],
+                            "embedding": vec,
+                        })
+                    prog.advance(task)
+            if doc_rows:
+                self.db.insert_nodes("Doc", doc_rows)
+                stats["text_docs"] = len({r["source"] for r in doc_rows})
+                stats["doc_chunks"] = len(doc_rows)
+
+        # 4. Resolve references. For every code file (from File table),
+        #    every text doc just indexed, and every URL Doc, scan content
+        #    for path-shaped mentions matching an Asset. Emit edges.
+        if asset_rows:
+            asset_lookup = _docs.build_asset_lookup(
+                [(r["path"], r["id"]) for r in asset_rows]
+            )
+            ref_edges = self._resolve_asset_references(
+                asset_lookup,
+                text_docs,
+                doc_rows if text_docs else [],
+            )
+            stats["ref_edges"] = ref_edges
+        return stats
+
+    def _resolve_asset_references(
+        self,
+        asset_lookup: dict[str, list[int]],
+        text_docs: list[tuple[Path, str, str]],
+        doc_rows: list[dict],
+    ) -> int:
+        """Walk every code file's File node and every text doc, scan
+        content for path-like strings, and emit REFERENCES_ edges to
+        any Asset whose path / basename matches.
+
+        Edges are inserted with their endpoint kinds (File→Asset and
+        Doc→Asset). Function / Class endpoints aren't populated here
+        — those would require attributing the mention to a specific
+        scope, which the AST work doesn't give us cheaply enough yet.
+        Future improvement.
+        """
+        from . import documents as _docs
+        # Pull every File node so we can walk their bodies once.
+        file_rows = self.db.fetch_all(
+            "MATCH (f:File) RETURN f.id AS id, f.path AS path"
+        )
+        file_to_assets: list[dict] = []
+        roots = self.cfg.roots_with_prefix()
+
+        def _abs_for(logical: str) -> Path | None:
+            for root, prefix in roots:
+                if prefix == "":
+                    return root / logical
+                if logical.startswith(prefix):
+                    return root / logical[len(prefix):]
+            return None
+
+        with _bar() as prog:
+            task = prog.add_task("Resolving asset refs", total=len(file_rows) + len(text_docs))
+            for fr in file_rows:
+                path_abs = _abs_for(fr["path"])
+                if path_abs is None or not path_abs.exists():
+                    prog.advance(task)
+                    continue
+                try:
+                    content = path_abs.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    prog.advance(task)
+                    continue
+                ext = fr["path"].rsplit(".", 1)[-1].lower() if "." in fr["path"] else ""
+                cands = _docs.extract_references_for(content, ext)
+                hits = _docs.resolve_to_assets(cands, asset_lookup)
+                for asset_id in hits:
+                    # REFERENCES_ has a `line INT64` property. Asset
+                    # references aren't line-attributed (we only know
+                    # the file), so fill 0 — preserves the column count
+                    # Kuzu's COPY FROM expects without lying about a line.
+                    file_to_assets.append({"from_id": fr["id"], "to_id": asset_id, "line": 0})
+                prog.advance(task)
+
+            doc_to_assets: list[dict] = []
+            # Map (source -> doc_id) from this run. We pick any chunk's
+            # id for the source; reference edges are coarse-grained
+            # (per-source, not per-chunk).
+            doc_id_by_source: dict[str, int] = {}
+            for r in doc_rows:
+                doc_id_by_source.setdefault(r["source"], r["id"])
+            for full, rel, ext in text_docs:
+                doc_id = doc_id_by_source.get(rel)
+                if doc_id is None:
+                    prog.advance(task)
+                    continue
+                try:
+                    content = full.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    prog.advance(task)
+                    continue
+                cands = _docs.extract_references_for(content, ext)
+                hits = _docs.resolve_to_assets(cands, asset_lookup)
+                for asset_id in hits:
+                    doc_to_assets.append({"from_id": doc_id, "to_id": asset_id, "line": 0})
+                prog.advance(task)
+
+        n = 0
+        if file_to_assets:
+            self.db.insert_edges("REFERENCES_", "File", "Asset", file_to_assets)
+            n += len(file_to_assets)
+        if doc_to_assets:
+            self.db.insert_edges("REFERENCES_", "Doc", "Asset", doc_to_assets)
+            n += len(doc_to_assets)
+        return n

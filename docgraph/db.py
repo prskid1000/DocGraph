@@ -81,8 +81,13 @@ NODE_DDL = [
         embedding DOUBLE[384],
         PRIMARY KEY (id)
     )""",
-    # External documentation chunks (from `docgraph docs add <url>`).
-    # Each Doc is a chunk of a fetched page; multiple per source URL.
+    # External documentation chunks. Two kinds share this table:
+    #   - URL-fetched (`docgraph docs add <url>`) — `source` is the URL.
+    #   - Repo-file docs (.md/.txt/.rst/.csv when --documents is on)
+    #       — `source` is the logical relative path. We disambiguate at
+    #         query time by sniffing the leading scheme (http:// or
+    #         https:// = url; otherwise = file). No schema bump is
+    #         needed for back-compat with existing Doc rows.
     """CREATE NODE TABLE IF NOT EXISTS Doc(
         id INT64,
         source STRING,
@@ -90,6 +95,19 @@ NODE_DDL = [
         idx INT64,
         body STRING,
         embedding DOUBLE[384],
+        PRIMARY KEY (id)
+    )""",
+    # Asset nodes: media / large / binary files in the repo. We DO NOT
+    # extract their content — instead, code and doc files reference them
+    # via REFERENCES_ edges (resolved from string literals + link syntax).
+    # `path` is the logical relative path (same shape as File.path).
+    """CREATE NODE TABLE IF NOT EXISTS Asset(
+        id INT64,
+        path STRING,
+        ext STRING,
+        size INT64,
+        mime STRING,
+        repo STRING,
         PRIMARY KEY (id)
     )""",
 ]
@@ -104,7 +122,7 @@ EDGE_DDL = [
     # Tier 2 — Behavioral
     "CREATE REL TABLE IF NOT EXISTS CALLS(FROM Function TO Function, line INT64)",
     "CREATE REL TABLE IF NOT EXISTS INSTANTIATES(FROM Function TO Class, line INT64)",
-    "CREATE REL TABLE IF NOT EXISTS REFERENCES_(FROM Function TO Class, FROM Function TO Variable, FROM Function TO Function, line INT64)",
+    "CREATE REL TABLE IF NOT EXISTS REFERENCES_(FROM Function TO Class, FROM Function TO Variable, FROM Function TO Function, FROM File TO Asset, FROM Doc TO Asset, FROM Function TO Asset, FROM Class TO Asset, line INT64)",
     "CREATE REL TABLE IF NOT EXISTS RETURNS(FROM Function TO Class)",
     # Tier 3 — Type system
     "CREATE REL TABLE IF NOT EXISTS INHERITS(FROM Class TO Class)",

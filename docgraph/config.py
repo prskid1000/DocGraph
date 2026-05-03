@@ -40,8 +40,36 @@ class Config:
     llm_model: str = "qwen3.6-35b"
     llm_format: str = "openai"  # "openai" | "anthropic"
     llm_max_tokens: int = 150  # reasoning is disabled via reasoning_effort=none
+    # Document + asset indexing — opt-in. When True, the indexer adds a
+    # second pass that:
+    #  - extracts text content from .md/.txt/.rst/small CSVs and writes
+    #    them as Doc nodes (file-tier, distinct from `docgraph docs add`
+    #    URL-tier rows by leading scheme on `Doc.source`),
+    #  - registers heavyweight files (.pdf/.xlsx/.png/.mp4/etc) as
+    #    Asset nodes (path/size/mime, no content),
+    #  - emits REFERENCES_ edges from any code or doc file that mentions
+    #    an asset by path in a quoted string literal or markdown link.
+    index_documents: bool = False
+    text_extensions: tuple[str, ...] = ("md", "markdown", "txt", "rst", "csv")
+    asset_extensions: tuple[str, ...] = (
+        "pdf", "xlsx", "xls", "docx", "doc", "ppt", "pptx",
+        "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tiff",
+        "mp4", "mov", "webm", "avi", "mkv", "mp3", "wav", "flac", "ogg", "m4a",
+        "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz",
+        "parquet", "feather", "arrow", "h5", "hdf5", "pkl", "pickle", "npz", "npy",
+        "ttf", "woff", "woff2", "otf", "eot",
+        "gltf", "glb", "fbx", "obj", "stl", "blend",
+    )
+    csv_text_max_bytes: int = 1_048_576  # 1 MiB; bigger CSVs become Assets
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
+    # Patterns the USER explicitly added (.gitignore / .docgraphignore /
+    # .cursorindexingignore) — does NOT include the UNIVERSAL media /
+    # binary defaults. The document-indexing pass uses these so it can
+    # opt in to extensions the code pass deliberately skips (.pdf,
+    # .xlsx, .png) without disrespecting the user's exclusions.
+    user_ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
+    user_ignore_spec: pathspec.PathSpec = field(init=False)
     ai_block_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ai_block_spec: pathspec.PathSpec = field(init=False)
     detected_ecosystems: dict[Path, list[str]] = field(init=False)
@@ -53,16 +81,20 @@ class Config:
         #   - AI-BLOCK (.cursorignore): file is indexed, but search/definition
         #     results are masked. Graph still includes the File node.
         self.ignore_specs = {}
+        self.user_ignore_specs = {}
         self.ai_block_specs = {}
         self.detected_ecosystems = {}
         for root in [self.repo_root, *self.extra_roots]:
             index_patterns, detected = assemble_ignores(root)
             self.detected_ecosystems[root] = detected
+            user_patterns: list[str] = []
             for fname in (".gitignore", ".docgraphignore", ".cursorindexingignore"):
                 p = root / fname
                 if p.exists():
-                    index_patterns.extend(p.read_text(encoding="utf-8", errors="ignore").splitlines())
+                    user_patterns.extend(p.read_text(encoding="utf-8", errors="ignore").splitlines())
+            index_patterns.extend(user_patterns)
             self.ignore_specs[root] = pathspec.PathSpec.from_lines("gitignore", index_patterns)
+            self.user_ignore_specs[root] = pathspec.PathSpec.from_lines("gitignore", user_patterns)
 
             ai_block_patterns: list[str] = []
             ci = root / ".cursorignore"
@@ -70,7 +102,17 @@ class Config:
                 ai_block_patterns.extend(ci.read_text(encoding="utf-8", errors="ignore").splitlines())
             self.ai_block_specs[root] = pathspec.PathSpec.from_lines("gitignore", ai_block_patterns)
         self.ignore_spec = self.ignore_specs[self.repo_root]
+        self.user_ignore_spec = self.user_ignore_specs[self.repo_root]
         self.ai_block_spec = self.ai_block_specs[self.repo_root]
+
+    def is_user_ignored(self, rel_path: str, root: Path | None = None) -> bool:
+        """Same as is_ignored but only checks user-supplied patterns
+        (.gitignore / .docgraphignore / .cursorindexingignore). Used by
+        the document-indexing walker so opt-in tiers (assets like .pdf
+        / .png) bypass the universal media filter while still honoring
+        the user's explicit exclusions."""
+        spec = self.user_ignore_specs[root] if root is not None else self.user_ignore_spec
+        return spec.match_file(rel_path)
 
     def is_ignored(self, rel_path: str, root: Path | None = None) -> bool:
         """Should we exclude this path from indexing entirely?"""
@@ -218,4 +260,23 @@ def load_config(
         llm_model=os.environ.get("DOCGRAPH_LLM_MODEL", "qwen3.6-35b"),
         llm_format=os.environ.get("DOCGRAPH_LLM_FORMAT", "openai"),
         llm_max_tokens=int(os.environ.get("DOCGRAPH_LLM_MAX_TOKENS", "150")),
+        index_documents=os.environ.get("DOCGRAPH_INDEX_DOCUMENTS", "").lower() in ("1", "true", "yes"),
+        text_extensions=tuple(
+            e.strip().lstrip(".").lower()
+            for e in os.environ.get("DOCGRAPH_TEXT_EXTS", "").split(",")
+            if e.strip()
+        ) or ("md", "markdown", "txt", "rst", "csv"),
+        asset_extensions=tuple(
+            e.strip().lstrip(".").lower()
+            for e in os.environ.get("DOCGRAPH_ASSET_EXTS", "").split(",")
+            if e.strip()
+        ) or (
+            "pdf", "xlsx", "xls", "docx", "doc", "ppt", "pptx",
+            "png", "jpg", "jpeg", "gif", "svg", "webp", "ico", "bmp", "tiff",
+            "mp4", "mov", "webm", "avi", "mkv", "mp3", "wav", "flac", "ogg", "m4a",
+            "zip", "tar", "gz", "tgz", "7z", "rar", "bz2", "xz",
+            "parquet", "feather", "arrow", "h5", "hdf5", "pkl", "pickle", "npz", "npy",
+            "ttf", "woff", "woff2", "otf", "eot",
+            "gltf", "glb", "fbx", "obj", "stl", "blend",
+        ),
     )

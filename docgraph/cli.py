@@ -116,6 +116,24 @@ def index(
         0, "--workers",
         help="Override the indexer worker count. 0 = auto (max(2, cpu_count - 1)).",
     ),
+    documents: bool = typer.Option(
+        False, "--documents/--no-documents",
+        help="Also index repo documents (.md/.txt/.rst/small CSVs) and "
+             "register heavy / binary files (.pdf/.xlsx/.png/.mp4/etc.) "
+             "as Asset nodes with REFERENCES_ edges from any code/doc that "
+             "mentions them by path. Off by default. Env: DOCGRAPH_INDEX_DOCUMENTS=1.",
+    ),
+    text_exts: str = typer.Option(
+        "", "--text-exts",
+        help="Comma-separated list of extensions for the text-doc tier "
+             "(default: md,markdown,txt,rst,csv). Implies --documents.",
+    ),
+    asset_exts: str = typer.Option(
+        "", "--asset-exts",
+        help="Comma-separated list of extensions for the asset tier "
+             "(default: pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…). "
+             "Implies --documents.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Index a codebase. Incremental by default; pass --full to wipe and rebuild.
@@ -156,6 +174,25 @@ def index(
             embed_batch_size = 32
     if embed_batch_size is not None:
         cfg.embed_batch_size = embed_batch_size
+
+    # Document indexing toggles. Either flag (--documents / extension
+    # overrides) OR env var enables the pass; CLI wins if both set.
+    env_docs = os.environ.get("DOCGRAPH_INDEX_DOCUMENTS", "").lower() in ("1", "true", "yes")
+    if documents or text_exts or asset_exts or env_docs:
+        cfg.index_documents = True
+    if not text_exts:
+        text_exts = os.environ.get("DOCGRAPH_TEXT_EXTS", "").strip()
+    if text_exts:
+        cfg.text_extensions = tuple(
+            e.strip().lstrip(".").lower() for e in text_exts.split(",") if e.strip()
+        )
+    if not asset_exts:
+        asset_exts = os.environ.get("DOCGRAPH_ASSET_EXTS", "").strip()
+    if asset_exts:
+        cfg.asset_extensions = tuple(
+            e.strip().lstrip(".").lower() for e in asset_exts.split(",") if e.strip()
+        )
+
     console.print(f"[cyan]Indexing[/cyan] {cfg.repo_root}")
     if cfg.extra_roots:
         for r in cfg.extra_roots:
