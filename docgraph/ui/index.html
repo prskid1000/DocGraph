@@ -279,7 +279,65 @@
     }
     .detail-head h2 { margin: 0; font-size: 13px; color: var(--fg); font-weight: 600; }
     .detail-head .stat { font-size: 11px; color: var(--fg-dim); margin-left: auto; }
+    .right-tabs { display: flex; gap: 2px; }
+    .right-tab {
+      background: transparent; border: 1px solid transparent; color: var(--fg-dim);
+      padding: 4px 10px; border-radius: 4px; font-size: 12px; font-weight: 600;
+      cursor: pointer;
+    }
+    .right-tab:hover { color: var(--fg); background: var(--panel-2); }
+    .right-tab.active {
+      color: var(--fg); background: var(--panel-2); border-color: var(--border);
+    }
     #detail { padding: 12px; overflow: auto; flex: 1; }
+    /* Chat tab — sibling of #detail. Hidden by default; tab JS toggles. */
+    #chat { display: none; flex-direction: column; flex: 1; min-height: 0; padding: 0; }
+    #chat[data-active="1"] { display: flex; }
+    .chat-attach {
+      display: flex; align-items: center; gap: 6px; padding: 6px 12px;
+      border-bottom: 1px solid var(--border); background: var(--bg-alt);
+      font-size: 11px;
+    }
+    .chat-attach-label { color: var(--fg-dim); }
+    .chat-attach-name {
+      color: var(--accent); font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .chat-attach-clear {
+      margin-left: auto; background: transparent; border: 0; color: var(--fg-dim);
+      cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px;
+    }
+    .chat-attach-clear:hover { color: var(--fg); }
+    .chat-log {
+      flex: 1; overflow: auto; padding: 12px; display: flex; flex-direction: column; gap: 10px;
+    }
+    .chat-msg { font-size: 12px; line-height: 1.5; max-width: 100%; }
+    .chat-msg .who {
+      font-size: 10px; text-transform: uppercase; letter-spacing: 0.08em;
+      color: var(--fg-dim); margin-bottom: 2px;
+    }
+    .chat-msg.user .who { color: var(--accent); }
+    .chat-msg.bot .who { color: var(--accent-2); }
+    .chat-msg .body {
+      background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
+      padding: 8px 10px; white-space: pre-wrap; word-wrap: break-word; color: var(--fg);
+    }
+    .chat-msg.user .body { background: var(--bg-alt); }
+    .chat-msg.error .body { border-color: #c33; color: #f99; }
+    .chat-input-row {
+      display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border);
+      background: var(--bg-alt);
+    }
+    .chat-input-row textarea {
+      flex: 1; resize: vertical; min-height: 32px; max-height: 200px;
+      background: var(--bg); color: var(--fg); border: 1px solid var(--border);
+      border-radius: 4px; padding: 6px 8px; font-size: 12px;
+      font-family: inherit;
+    }
+    .chat-input-row textarea:focus { outline: 1px solid var(--accent); }
+    .chat-input-row .action { align-self: stretch; padding: 0 14px; }
+    .chat-meta { padding: 4px 12px; font-size: 10px; color: var(--fg-dim); border-top: 1px solid var(--border); }
+    .chat-meta:empty { display: none; }
     #detail h2 { margin: 0 0 4px; font-size: 14px;
       background: linear-gradient(90deg, var(--accent), var(--accent-2));
       -webkit-background-clip: text; background-clip: text; color: transparent; }
@@ -608,14 +666,32 @@
         </div>
       </main>
 
-      <!-- RIGHT: detail -->
+      <!-- RIGHT: detail + chat tabs -->
       <aside class="right" id="right-pane"><div class="resize-handle left" id="resize-right" title="Drag to resize"></div>
         <div class="detail-head">
-          <h2>Detail</h2>
+          <div class="right-tabs" role="tablist">
+            <button class="right-tab active" data-tab="detail" role="tab">Detail</button>
+            <button class="right-tab" data-tab="chat" role="tab" id="chat-tab-btn" hidden>Chat</button>
+          </div>
           <span class="stat" id="detail-source"></span>
         </div>
         <div id="detail">
           <div class="empty">Select an entity to inspect.</div>
+        </div>
+        <div id="chat" hidden>
+          <div class="chat-attach" id="chat-attach" hidden>
+            <span class="chat-attach-label">Context:</span>
+            <span class="chat-attach-name" id="chat-attach-name"></span>
+            <button class="chat-attach-clear" id="chat-attach-clear" title="Detach">×</button>
+          </div>
+          <div class="chat-log" id="chat-log">
+            <div class="empty">Ask the configured LLM about this codebase. The selected entity (if any) is sent as context.</div>
+          </div>
+          <div class="chat-input-row">
+            <textarea id="chat-input" rows="2" placeholder="Ask anything…"></textarea>
+            <button id="chat-send" class="action">Send</button>
+          </div>
+          <div class="chat-meta" id="chat-meta"></div>
         </div>
       </aside>
     </div>
@@ -1674,6 +1750,11 @@ function runCommunities(iters){
           head.appendChild(actions);
           defSec.innerHTML = "";
           defSec.appendChild(section("Definition", el("pre", {}, (d.body || "").slice(0, 6000))));
+          // Stash the resolved entity for the chat tab's attached-context pill.
+          window._dgChatContext = {
+            name: sym, file: d.file, language: d.language || "", snippet: d.body || "",
+          };
+          if (window._dgUpdateChatAttach) window._dgUpdateChatAttach();
           // Open inspector to the definition's file
           openInspector(d.file, d.line, sym);
         } else if (n && n.kind === "File") {
@@ -1841,6 +1922,8 @@ function runCommunities(iters){
       $("#selected-pill").classList.remove("show");
       $("#detail").innerHTML = "<div class='empty'>Select an entity to inspect.</div>";
       $("#detail-source").textContent = "";
+      window._dgChatContext = null;
+      if (window._dgUpdateChatAttach) window._dgUpdateChatAttach();
       highlightSelectedResult();
       if (focusHops > 0) computeVisible();
       needsRender = true;
@@ -2260,15 +2343,135 @@ function runCommunities(iters){
       });
     }
 
+    // ---------- Right-panel tabs (Detail | Chat) ----------
+    function setupRightTabs() {
+      const buttons = document.querySelectorAll(".right-tab");
+      const panels = { detail: document.getElementById("detail"),
+                       chat:   document.getElementById("chat") };
+      function activate(name) {
+        buttons.forEach(b => b.classList.toggle("active", b.dataset.tab === name));
+        // Detail panel uses default block layout; Chat uses flex via [data-active].
+        panels.detail.style.display = name === "detail" ? "" : "none";
+        panels.chat.dataset.active = name === "chat" ? "1" : "";
+        if (name === "chat") {
+          const ta = document.getElementById("chat-input");
+          if (ta) setTimeout(() => ta.focus(), 0);
+        }
+      }
+      buttons.forEach(b => b.addEventListener("click", () => activate(b.dataset.tab)));
+    }
+
+    // ---------- Chat tab — POST /api/chat with optional attached context ----------
+    async function setupChat() {
+      const tabBtn = document.getElementById("chat-tab-btn");
+      let cfg = null;
+      try {
+        cfg = await api("/api/llm_config");
+      } catch (_) { /* host doesn't expose it (older docgraph) — keep tab hidden */ }
+      if (!cfg || !cfg.configured) return; // Chat tab stays hidden unless LLM is configured
+      tabBtn.hidden = false;
+      const meta = document.getElementById("chat-meta");
+      meta.textContent = `Model ${cfg.model} via ${cfg.host}:${cfg.port} (${cfg.format})`;
+
+      const log = document.getElementById("chat-log");
+      const input = document.getElementById("chat-input");
+      const send = document.getElementById("chat-send");
+      const attach = document.getElementById("chat-attach");
+      const attachName = document.getElementById("chat-attach-name");
+      const attachClear = document.getElementById("chat-attach-clear");
+      const history = []; // {role, content}
+
+      function appendMsg(role, content, klass) {
+        // Replace the placeholder empty-state on first real message.
+        const empty = log.querySelector(".empty");
+        if (empty) empty.remove();
+        const wrap = document.createElement("div");
+        wrap.className = `chat-msg ${klass || (role === "user" ? "user" : "bot")}`;
+        const who = document.createElement("div");
+        who.className = "who";
+        who.textContent = role === "user" ? "You" : (role === "system" ? "System" : "Assistant");
+        const body = document.createElement("div");
+        body.className = "body";
+        body.textContent = content;
+        wrap.appendChild(who); wrap.appendChild(body);
+        log.appendChild(wrap);
+        log.scrollTop = log.scrollHeight;
+        return body;
+      }
+
+      function refreshAttach() {
+        const ctx = window._dgChatContext;
+        if (ctx && ctx.name) {
+          attach.hidden = false;
+          attachName.textContent = `${ctx.name}` + (ctx.file ? ` · ${ctx.file}` : "");
+        } else {
+          attach.hidden = true;
+        }
+      }
+      window._dgUpdateChatAttach = refreshAttach;
+      attachClear.addEventListener("click", () => {
+        window._dgChatContext = null;
+        refreshAttach();
+      });
+      refreshAttach();
+
+      async function doSend() {
+        const text = input.value.trim();
+        if (!text) return;
+        input.value = "";
+        send.disabled = true;
+        appendMsg("user", text);
+        history.push({ role: "user", content: text });
+        const placeholder = appendMsg("assistant", "Thinking…");
+        try {
+          const body = { messages: history };
+          if (window._dgChatContext) body.context = window._dgChatContext;
+          const resp = await fetch(_withRoot("/api/chat"), {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+          });
+          if (!resp.ok) {
+            const t = await resp.text();
+            placeholder.textContent = `Error ${resp.status}: ${t.slice(0, 400)}`;
+            placeholder.parentElement.classList.add("error");
+            history.pop();
+            return;
+          }
+          const data = await resp.json();
+          const content = (data && data.content) || "(empty response)";
+          placeholder.textContent = content;
+          history.push({ role: "assistant", content });
+        } catch (err) {
+          placeholder.textContent = `Error: ${err.message || err}`;
+          placeholder.parentElement.classList.add("error");
+          history.pop();
+        } finally {
+          send.disabled = false;
+          input.focus();
+        }
+      }
+      send.addEventListener("click", doSend);
+      input.addEventListener("keydown", (e) => {
+        // Enter sends, Shift+Enter inserts newline.
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          doSend();
+        }
+      });
+    }
+
     // ---------- Boot ----------
     document.body.classList.add("no-selection");  // hop chips dim until first selection
     setupCanvas();
     setupTabs();
+    setupRightTabs();
     buildFilterUI();
     setupSearchInputs();
     setupZoom();
     setupMisc();
     setupResizers();
+    setupChat();
     // Resolve the active root before the first data fetch — every api()
     // call appends `?root=<slug>`, and we want it set on the first hit
     // for hosts with multiple roots. Single-root hosts no-op.

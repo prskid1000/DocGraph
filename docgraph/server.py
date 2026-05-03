@@ -505,6 +505,88 @@ def make_app(workspace: Workspace) -> FastAPI:
         })
         return out
 
+    # LLM chat — uses the same host/port/model/format the indexer uses for
+    # docstring + wiki augmentation (Config.llm_*). Off when llm_model is
+    # unset. The UI's right-panel Chat tab probes /api/llm_config first.
+    @app.get("/api/llm_config")
+    async def api_llm_config(root: RootSlug = DEFAULT):
+        cfg = _slot(root).cfg
+        configured = bool(getattr(cfg, "llm_model", "") or "")
+        return {
+            "configured": configured,
+            "host": getattr(cfg, "llm_host", "localhost"),
+            "port": int(getattr(cfg, "llm_port", 1235)),
+            "model": getattr(cfg, "llm_model", "") or "",
+            "format": getattr(cfg, "llm_format", "openai") or "openai",
+            "max_tokens": int(getattr(cfg, "llm_max_tokens", 512) or 512),
+            "has_key": bool(getattr(cfg, "llm_api_key", "") or ""),
+        }
+
+    @app.post("/api/chat")
+    async def api_chat(payload: dict, root: RootSlug = DEFAULT):
+        cfg = _slot(root).cfg
+        if not getattr(cfg, "llm_model", ""):
+            raise HTTPException(503, "LLM is not configured (set llm.model)")
+        messages = payload.get("messages") or []
+        if not isinstance(messages, list) or not messages:
+            raise HTTPException(400, "messages must be a non-empty list")
+        # Attached node context becomes a system-message preamble so the
+        # model sees the snippet without the user having to paste it.
+        ctx = payload.get("context") or None
+        if ctx and isinstance(ctx, dict):
+            name = str(ctx.get("name") or "")
+            file = str(ctx.get("file") or "")
+            lang = str(ctx.get("language") or "")
+            snippet = str(ctx.get("snippet") or "")[:4000]
+            sys_note = (
+                f"You are answering questions about a code entity in the user's repo.\n"
+                f"Entity: `{name}` ({file})\n"
+                f"```{lang}\n{snippet}\n```"
+            )
+            messages = [{"role": "system", "content": sys_note}] + list(messages)
+        from docgraph.llm import LLMClient, LLMConfig
+        client = LLMClient(LLMConfig(
+            host=cfg.llm_host, port=int(cfg.llm_port), model=cfg.llm_model,
+            format=cfg.llm_format,
+            api_key=getattr(cfg, "llm_api_key", "") or None,
+            max_tokens=int(getattr(cfg, "llm_max_tokens", 512) or 512),
+            timeout=int(getattr(cfg, "llm_timeout", 60) or 60),
+        ))
+        # The existing _post helper handles both openai + anthropic shapes
+        # but only takes a single prompt. Build the right payload here so we
+        # can pass the full message list through.
+        try:
+            if client.cfg.format == "anthropic":
+                body = {
+                    "model": client.cfg.model,
+                    "messages": messages,
+                    "max_tokens": client.cfg.max_tokens,
+                    "temperature": 0.4,
+                }
+                data = await asyncio.to_thread(client._post, client.cfg.endpoint, body)
+                content = ""
+                for b in data.get("content") or []:
+                    if isinstance(b, dict) and b.get("type") == "text":
+                        content = (b.get("text") or "").strip()
+                        break
+            else:
+                body = {
+                    "model": client.cfg.model,
+                    "messages": messages,
+                    "max_tokens": client.cfg.max_tokens,
+                    "temperature": 0.4,
+                    "stream": False,
+                    "reasoning_effort": "none",
+                }
+                data = await asyncio.to_thread(client._post, client.cfg.endpoint, body)
+                try:
+                    content = (data["choices"][0]["message"]["content"] or "").strip()
+                except (KeyError, IndexError, TypeError):
+                    content = ""
+        except Exception as exc:
+            raise HTTPException(502, f"LLM call failed: {exc}") from exc
+        return {"content": content, "model": client.cfg.model}
+
     # External docs (`@Docs` parity). Add takes the writer; list reads from
     # the slot's existing RO handle; remove takes the writer briefly.
     @app.get("/api/docs/list")
