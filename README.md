@@ -122,6 +122,9 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | `--gpu` *(optional)* | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
 | `--workers INT` *(optional)* | `0` (auto) | Override the indexer worker count. `0` = auto = `max(2, cpu_count - 1)`. |
 | `--embed-batch-size INT` *(optional)* | `256` (`32` with `--gpu`) | Batch size for embedding. Lower it if you hit GPU device-hung errors with `--gpu` / DirectML. |
+| `--documents` / `--no-documents` *(optional)* | `false` (or `$DOCGRAPH_INDEX_DOCUMENTS=1`) | Also index repo documents (`.md` / `.markdown` / `.txt` / `.rst` / small CSVs as `Doc` nodes for `search_docs`) and register binary / heavy files (`.pdf` / `.xlsx` / `.png` / `.mp4` / `.parquet` / fonts / archives / 3D / installers) as `Asset` nodes with `REFERENCES_` edges from any code or doc that mentions them by path. Off by default. |
+| `--text-exts STR` *(optional)* | `md,markdown,txt,rst,csv` (or `$DOCGRAPH_TEXT_EXTS`) | Comma-separated extension list for the text-doc tier. Implies `--documents`. |
+| `--asset-exts STR` *(optional)* | `pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…` (or `$DOCGRAPH_ASSET_EXTS`) | Comma-separated extension list for the asset tier. Implies `--documents`. |
 | `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
 ### `docgraph host [path]`
@@ -211,7 +214,8 @@ Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_
 | `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. |
 | `--llm-model STR` *(optional)* | `qwen3.6-35b` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects. Override if your server uses a different identifier (`local-model`, `gpt-oss-20b`, etc.). |
 | `--llm-format STR` *(optional)* | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
-| `--llm-max-tokens INT` *(optional)* | `600` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Higher than `index`'s 150 because wiki pages are longer. |
+| `--llm-max-tokens INT` *(optional)* | `4096` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Generous default so deeply-nested module pages have room. Reasoning models still get `reasoning_effort=none` so they don't burn the budget on thinking. |
+| `--depth INT`, `-d INT` *(optional)* | `12` | Max directory levels to bucket files by when generating one page per folder. `1` = top-level only (old behavior); the default `12` produces one page per leaf folder for any reasonable repo. Inherits the same ignore list as `docgraph index` (no pages for `node_modules/` / `.venv/` / ecosystem build dirs). |
 | `--force`, `-f` *(optional)* | off | Rebuild every page from scratch. Default is resumable: skip modules whose page is already on disk. |
 
 API equivalents (used by the Web UI's "Build wiki" button):
@@ -278,6 +282,11 @@ Print version. No flags.
 | `DOCGRAPH_LLM_API_KEY` | `index`, `wiki` | unset. If set, sent as `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic). |
 | `DOCGRAPH_LLM_MAX_TOKENS` | `index`, `wiki` | `150` for `index` (one sentence); `600` for `wiki` (one page). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3 / DeepSeek-R1) skip thinking and fit in these budgets. |
 | `DOCGRAPH_LLM_TIMEOUT` | `index`, `wiki` | `60` (seconds) |
+| `DOCGRAPH_LLM_PROMPT_DOCSTRING` / `_FILE` | `index` | unset. Override (literal text or file path) for the docstring template. Must keep the `{kind}` / `{name}` / `{language}` / `{body}` placeholders. Falls back to the default if the override is malformed. |
+| `DOCGRAPH_LLM_PROMPT_WIKI` / `_FILE` | `wiki` | unset. Override (literal text or file path) for the wiki **"Output format"** tail. No placeholders required — the rendered fact sheet sits above it. |
+| `DOCGRAPH_INDEX_DOCUMENTS` | `index` | unset. Set to `1`/`true` to enable the tier-2 / tier-3 document pass without passing `--documents`. |
+| `DOCGRAPH_TEXT_EXTS` | `index` | comma-separated; default `md,markdown,txt,rst,csv`. Implies the document pass. |
+| `DOCGRAPH_ASSET_EXTS` | `index` | comma-separated; default `pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…`. Implies the document pass. |
 
 CLI flags override env vars. Env vars set defaults that survive across invocations.
 
@@ -326,11 +335,21 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 | Tier | Edges |
 |---|---|
 | **Structural** | `CONTAINS`, `IMPORTS` (file → file or module), `IMPORTS_SYMBOL` (file → specific Class / Function imported by name, e.g. Python `from x import Y`, JS/TS `import {Y} from "x"`) |
-| **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_`, `RETURNS` |
+| **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_` (now also `File` / `Doc` / `Function` / `Class` → `Asset` when the document pass is enabled), `RETURNS` |
 | **Type system** | `INHERITS`, `IMPLEMENTS`, `OVERRIDES` (child→parent method via inheritance closure), `DECORATED_BY` |
 | **Differentiators** | `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic name match) |
 
-Nodes: `File`, `Module`, `Class`, `Function`, `Variable`. Each `Function` and `Class` carries an embedding and a PageRank score.
+Nodes: `File`, `Module`, `Class`, `Function`, `Variable`, `Chunk`, `Doc`, plus `Asset` (when `--documents` is on — metadata-only nodes for binary / heavy files like `.pdf` / `.xlsx` / `.png` / `.parquet`). `Function` and `Class` carry an embedding and a PageRank score; `Doc` and `Chunk` carry embeddings; `Asset` is metadata-only.
+
+## Document + asset indexing (opt-in)
+
+`docgraph index --documents` (or `DOCGRAPH_INDEX_DOCUMENTS=1`) adds two extra tiers on top of the code graph:
+
+- **Tier 2 — text docs.** `.md` / `.markdown` / `.txt` / `.rst` and small CSVs (≤1 MiB) get extracted with stdlib only (no pypdf / openpyxl / python-docx), chunked, embedded, and stored as `Doc` rows whose `source` is the repo-relative path. They show up in `search_docs` alongside `@Docs add <url>` rows; the same MCP tool serves both.
+- **Tier 3 — binary / heavy assets.** `.pdf` / `.xlsx` / `.docx` / `.png` / `.mp4` / `.parquet` / fonts / archives / 3D meshes / installers become `Asset` nodes — metadata only (path / ext / size / mime). No content extraction.
+- **`REFERENCES_` edges.** After both tiers populate, DocGraph scans every code and doc file for path-shaped references and emits edges from `File` / `Doc` / `Function` / `Class` to the matching `Asset`. Format-aware: Markdown link / embed syntax, HTML `src=` / `href=`, code matches only inside quoted string literals with a real extension. So `cypher("MATCH (a:Asset)<-[:REFERENCES_]-(n) WHERE a.path CONTAINS 'logo' RETURN n.path")` answers "where is this image used?" as a graph query.
+
+Idempotent — re-runs drop the file-tier `Doc` and `Asset` rows (and their edges) first; URL-tier `Doc` rows from `@Docs add` are preserved.
 
 ## Languages bundled
 
@@ -388,6 +407,10 @@ Every retriever route accepts a `root=<slug>` query parameter. The slug is one o
 | `GET /` | The web UI |
 | `GET /api/roots` | Discover registered roots: `[{slug, path, default, watching, last_indexed_at}, …]`. The closed `root` enum on every other route is built from this list at host startup. |
 | `POST /api/admin/index` (`{full?: bool}`) | In-process incremental (or `full=true`) reindex via the workspace's writer-lock dance. Lets external supervisors trigger a reindex without spawning a parallel `docgraph index` subprocess that would fight Kuzu's exclusive writer lock. Response is `{slug, full, stats, log}` where `log` is the captured Rich progress transcript. |
+| `POST /api/admin/clear` | Wipe a root's index. Drops the Kuzu DB + per-file delta cache + generated wiki dir so the next index pass is treated as a clean full rebuild. Same writer-lock dance as `/api/admin/index`. Broadcasts a `reindex_done {events: -1}` SSE so the UI snaps back to an empty state. |
+| `GET  /api/docs/list` | Cursor `@Docs` parity readout — every URL ingested into this root with chunk counts. |
+| `POST /api/docs/add`  (`{url}`) | Fetch the URL, chunk + embed, store as `Doc` rows. Idempotent (re-adding the same URL deletes prior chunks first). Reuses the host's writer connection so it doesn't fight `/api/admin/index`. |
+| `POST /api/docs/remove` (`{url}`) | Delete every `Doc` chunk for a previously-ingested URL. Returns `{url, removed_chunks}`. |
 | `POST /mcp` (and friends) | Mounted FastMCP HTTP transport — same tool surface as `docgraph mcp --transport http`, just on the host's port instead of a separate process. |
 | `GET /api/search?q=...&kind=...&limit=10` | Same as the MCP tool |
 | `GET /api/definition?name=...&file=...` | |
@@ -459,10 +482,10 @@ In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/s
 
 ```bash
 pip install pytest
-pytest                   # ~65s (shared embedder cache + 178 tests, incl. daemon)
+pytest                   # ~70s, ~295 tests
 ```
 
-Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, and Variable-node round-trip + delete cascade.
+Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, Variable-node round-trip + delete cascade, the `Workspace` registry's 4-step `resolve()` + writer-lock round-trip, the GPU→CPU embedder fallback on a poisoned ORT session, every CLI flag telecode passes (`--workers`, `--gpu`, `--llm-*`, `--documents`, etc.), and the document/asset pass (text-tier embedding + asset registration + `REFERENCES_` reference scan).
 
 Live LLM tests (`tests/test_llm_live.py`) auto-skip unless an OpenAI-compatible server is reachable at `localhost:1235` with `qwen3.6-35b` loaded. Override host/port/model via `DOCGRAPH_LLM_TEST_HOST` / `DOCGRAPH_LLM_TEST_PORT` / `DOCGRAPH_LLM_TEST_MODEL`.
 
