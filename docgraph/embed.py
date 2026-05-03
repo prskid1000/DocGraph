@@ -79,23 +79,12 @@ def dim_for_model(model_name: str, default: int = 384) -> int:
     return default
 
 
-def resolve_providers(gpu: bool, directml_device_id: int = -1) -> list | None:
-    """Build the ORT provider list given the host's GPU + DirectML adapter
-    config. Returns None (= CPU) when gpu is False. When directml_device_id
-    is >= 0 the DmlExecutionProvider entry is wrapped in a tuple with
-    `device_id` — this is what lets users force the embedder onto the
-    discrete NVIDIA on hybrid-graphics laptops where Windows otherwise
-    routes windowless processes to the integrated GPU."""
-    if not gpu:
-        return None
-    base: list = list(GPU_PROVIDERS)
-    if directml_device_id >= 0:
-        return [
-            ("DmlExecutionProvider", {"device_id": directml_device_id})
-            if p == "DmlExecutionProvider" else p
-            for p in base
-        ]
-    return base
+def resolve_providers(gpu: bool) -> list | None:
+    """ORT provider list when GPU is enabled, else None (= CPU). Adapter
+    selection on Windows hybrid graphics is handled at the OS level via
+    the per-app `GpuPreference=2` registry value (telecode writes this
+    when spawning the host); no in-package device-id pinning is needed."""
+    return list(GPU_PROVIDERS) if gpu else None
 
 
 class Embedder:

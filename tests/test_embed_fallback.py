@@ -104,17 +104,17 @@ def test_no_fallback_when_already_on_cpu(monkeypatch):
 
 
 def test_cache_key_handles_provider_with_options_dict():
-    """Regression: the DirectML adapter-id path passes
-    ``("DmlExecutionProvider", {"device_id": 1})`` in the providers list.
-    Earlier ``_cache_key`` did ``tuple(providers)``, which left the inner
-    dict in the key — unhashable, so dict lookup raised TypeError before
-    the embedder could even load. Lock in that the key is hashable."""
-    from docgraph.embed import _cache_key, resolve_providers
+    """Defensive: nothing in-tree passes a `(name, options_dict)` provider
+    entry today (adapter-id pinning was removed once Windows-side
+    GpuPreference handled it), but ORT's contract still allows it. Lock
+    in that `_cache_key` stays hashable if a tuple form ever shows up
+    again — `tuple(providers)` would otherwise leave an unhashable dict
+    inside the key and crash dict lookup before the embedder could load."""
+    from docgraph.embed import _cache_key
 
-    providers = resolve_providers(True, 1)
-    assert any(isinstance(p, tuple) for p in providers), (
-        "resolve_providers should wrap DmlExecutionProvider as a tuple"
-    )
+    providers = ["CUDAExecutionProvider",
+                 ("DmlExecutionProvider", {"device_id": 1}),
+                 "CPUExecutionProvider"]
     key = _cache_key("BAAI/bge-small-en-v1.5", providers)
     # Must be hashable — store it as a dict key as a smoke test.
     {key: 1}

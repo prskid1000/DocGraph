@@ -149,7 +149,7 @@ def _baseline_reindex(workspace: Workspace, root: Path) -> None:
     try:
         embedder = Embedder(
             slot.cfg.embedding_model,
-            providers=resolve_providers(slot.cfg.gpu, getattr(slot.cfg, "directml_device_id", -1)),
+            providers=resolve_providers(slot.cfg.gpu),
         )
         indexer = Indexer(slot.cfg, writer, embedder=embedder)
         indexer.index_all(incremental=True)

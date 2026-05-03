@@ -87,7 +87,7 @@ class Workspace:
             from docgraph.embed import resolve_providers
             emb = Embedder(
                 cfg.embedding_model,
-                providers=resolve_providers(cfg.gpu, getattr(cfg, "directml_device_id", -1)),
+                providers=resolve_providers(cfg.gpu),
             )
             self._embedders[key] = emb
         return emb

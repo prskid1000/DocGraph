@@ -155,7 +155,7 @@ class Indexer:
         self.db = db
         self.embedder = embedder or Embedder(
             cfg.embedding_model,
-            providers=resolve_providers(cfg.gpu, getattr(cfg, "directml_device_id", -1)),
+            providers=resolve_providers(cfg.gpu),
         )
         self._next_id = 1
 
@@ -1624,7 +1624,7 @@ class Indexer:
         if text_docs:
             embedder = self.embedder or Embedder(
                 self.cfg.embedding_model,
-                providers=resolve_providers(self.cfg.gpu, getattr(self.cfg, "directml_device_id", -1)),
+                providers=resolve_providers(self.cfg.gpu),
             )
             doc_rows: list[dict] = []
             with _bar() as prog:

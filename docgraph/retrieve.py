@@ -37,10 +37,7 @@ class Retriever:
             # default (jinaai/jina-reranker-v1-tiny-en).
             model = getattr(self.cfg, "rerank_model", "") or None
             from .embed import resolve_providers
-            providers = resolve_providers(
-                getattr(self.cfg, "rerank_gpu", False),
-                getattr(self.cfg, "directml_device_id", -1),
-            )
+            providers = resolve_providers(getattr(self.cfg, "rerank_gpu", False))
             self._reranker = Reranker(model_name=model, providers=providers)
         return self._reranker
 

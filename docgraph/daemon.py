@@ -205,7 +205,7 @@ def run_daemon(
 
     embedder = Embedder(
         model_name=model_name,
-        providers=resolve_providers(gpu, -1),
+        providers=resolve_providers(gpu),
     )
     embedder._ensure()  # warm up before we accept clients
 

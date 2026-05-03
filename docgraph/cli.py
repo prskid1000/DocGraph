@@ -314,12 +314,6 @@ def host(
         False, "--rerank-gpu",
         help="Run the cross-encoder reranker on GPU. Independent of --gpu. ",
     ),
-    directml_device_id: int = typer.Option(
-        -1, "--directml-device-id",
-        help="DirectML adapter index for GPU embeddings. -1 = let DirectML "
-             "pick (adapter 0, usually iGPU on hybrid laptops). Set to the "
-             "discrete dGPU's index (often 1) to force the embedder onto NVIDIA.",
-    ),
     # LLM augmentation knobs (used by index / wiki paths run via API).
     llm_model: str | None = typer.Option(
         None, "--llm-model",
@@ -417,7 +411,6 @@ def host(
         "gpu": gpu,
         "rerank_default": rerank_default,
         "rerank_gpu": rerank_gpu,
-        "directml_device_id": directml_device_id,
         "index_documents": bool(documents or text_exts or asset_exts),
     }
     if embed_model:                overrides["embedding_model"] = embed_model

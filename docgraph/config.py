@@ -35,11 +35,6 @@ class Config:
     # passes is usually higher than the speedup. Independent from `gpu` so
     # users can keep embeddings on GPU and reranking on CPU (or vice versa).
     rerank_gpu: bool = False
-    # DirectML adapter selection for hybrid-GPU laptops (Intel iGPU + NVIDIA
-    # dGPU). Default -1 = let DirectML pick adapter 0, which on Windows 11
-    # for windowless processes is usually the iGPU. Set to the dGPU's index
-    # (often 1) to force embeddings onto the discrete card.
-    directml_device_id: int = -1
     # GPU acceleration for embeddings (and reranker). Off by default; when
     # True, the Embedder asks ONNX Runtime to use CUDA / DirectML / CoreML
     # before falling back to CPU. Requires `onnxruntime-gpu` or
@@ -269,7 +264,6 @@ def load_config(
     rerank_default: bool = False,
     rerank_model: str = "",
     rerank_gpu: bool = False,
-    directml_device_id: int = -1,
     gpu: bool = False,
     llm_docstrings: bool = False,
     llm_wiki: bool = True,
@@ -323,7 +317,6 @@ def load_config(
         rerank_default=rerank_default,
         rerank_model=rerank_model,
         rerank_gpu=rerank_gpu,
-        directml_device_id=directml_device_id,
         gpu=gpu,
         llm_docstrings=llm_docstrings,
         llm_wiki=llm_wiki,

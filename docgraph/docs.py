@@ -187,7 +187,7 @@ def add_doc(
     _ck()
     embedder = Embedder(
         cfg.embedding_model,
-        providers=resolve_providers(cfg.gpu, getattr(cfg, "directml_device_id", -1)),
+        providers=resolve_providers(cfg.gpu),
     )
     with _bar() as prog:
         task = prog.add_task(f"Embedding doc chunks ({title or url})", total=len(pieces))
