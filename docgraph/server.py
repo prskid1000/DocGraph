@@ -26,9 +26,10 @@ from pathlib import Path
 from typing import AsyncIterator, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from docgraph.cancel import OperationCancelled
+from docgraph.db import DatabaseBusy
 from docgraph.workspace import Workspace, RootSlot
 
 log = logging.getLogger(__name__)
@@ -101,6 +102,17 @@ def make_app(workspace: Workspace) -> FastAPI:
     app.state.workspace = workspace
     app.state.subscribers = []  # list[asyncio.Queue]
     app.state.mcp = mcp_server
+
+    # Reads racing with a writer hit DatabaseBusy (db_ro.conn is None while
+    # the writer holds Kuzu's exclusive file lock). Surface as 503 +
+    # Retry-After so clients poll instead of crashing on AttributeError.
+    @app.exception_handler(DatabaseBusy)
+    async def _busy_handler(_request: Request, exc: DatabaseBusy):
+        return JSONResponse(
+            status_code=503,
+            content={"error": "database_busy", "detail": str(exc)},
+            headers={"Retry-After": "2"},
+        )
 
     def _slot(root) -> RootSlot:
         if root is None:
@@ -490,6 +502,21 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.post("/api/admin/clear")
     async def api_admin_clear(root: RootSlug = DEFAULT):
         slot = _slot(root)
+        # If a watcher / index / wiki is mid-flight it's holding the writer
+        # and clear_data() would refuse. Signal cancel + wait briefly for
+        # the writer to release before giving up with 503.
+        if slot.db_writer is not None:
+            workspace.request_cancel(slot.cfg.repo_root)
+            deadline = time.time() + 10.0
+            while time.time() < deadline and slot.db_writer is not None:
+                await asyncio.sleep(0.2)
+            if slot.db_writer is not None:
+                raise HTTPException(
+                    status_code=503,
+                    detail="clear blocked: writer still held after 10s — retry",
+                    headers={"Retry-After": "5"},
+                )
+            workspace.reset_cancel(slot.cfg.repo_root)
 
         def _do() -> dict:
             workspace.clear_data(slot.cfg.repo_root)
@@ -501,7 +528,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             log.exception("api_admin_clear failed: %s", exc)
             raise HTTPException(500, f"clear failed: {exc}") from exc
         broadcast(app, "reindex_done", {
-            "repo_slug": slot.slug, "ts": __import__("time").time(), "events": -1,
+            "repo_slug": slot.slug, "ts": time.time(), "events": -1,
         })
         return out
 

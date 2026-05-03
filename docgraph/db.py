@@ -143,6 +143,18 @@ EDGE_DDL = [
 ]
 
 
+class DatabaseBusy(RuntimeError):
+    """Raised when a query hits a connection that's been closed because a
+    writer (watcher reindex / index / wiki / docs add) currently owns the
+    file's exclusive Kuzu lock. Routes catch this and return 503 +
+    Retry-After so the client can poll until the writer releases.
+
+    Kuzu enforces a per-DB-file write lock — we cannot keep an RO handle
+    open while a writer is active in another connection — so the only
+    sane behavior during a writer-held window is to refuse reads with a
+    well-typed error, not crash with AttributeError on a None conn."""
+
+
 class GraphDB:
     def __init__(self, db_path: Path, embedding_dim: int = 384, read_only: bool = False):
         self.db_path = Path(db_path)
@@ -164,6 +176,11 @@ class GraphDB:
             self.conn.execute(ddl)
 
     def execute(self, cypher: str, params: dict | None = None) -> Any:
+        if self.conn is None:
+            raise DatabaseBusy(
+                f"graph DB busy: connection to {self.db_path} is closed "
+                "(writer active — retry shortly)"
+            )
         return self.conn.execute(cypher, params or {})
 
     def fetch_all(self, cypher: str, params: dict | None = None) -> list[dict]:
