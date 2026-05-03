@@ -33,13 +33,14 @@ class Retriever:
 
     def _reranker_(self) -> Reranker:
         if self._reranker is None:
-            # cfg.rerank_model may be "" — Reranker falls back to its env var
-            # default in that case (jinaai/jina-reranker-v1-tiny-en).
+            # cfg.rerank_model may be "" — Reranker falls back to its built-in
+            # default (jinaai/jina-reranker-v1-tiny-en).
             model = getattr(self.cfg, "rerank_model", "") or None
-            providers: list[str] | None = None
-            if getattr(self.cfg, "rerank_gpu", False):
-                from .embed import GPU_PROVIDERS
-                providers = list(GPU_PROVIDERS)
+            from .embed import resolve_providers
+            providers = resolve_providers(
+                getattr(self.cfg, "rerank_gpu", False),
+                getattr(self.cfg, "directml_device_id", -1),
+            )
             self._reranker = Reranker(model_name=model, providers=providers)
         return self._reranker
 
