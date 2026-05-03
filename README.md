@@ -353,7 +353,7 @@ Every retriever route accepts a `root=<slug>` query parameter. The slug is one o
 | `POST /api/docs/remove` (`{url}`) | Delete every `Doc` chunk for a URL. Returns `{url, removed_chunks}`. |
 | `POST /mcp` | Mounted FastMCP HTTP transport |
 | `GET /api/search?q=...&kind=...&limit=10` | Same as the MCP tool |
-| `GET /api/{definition,references,call_graph,file_map,neighborhood,explore,impact_of,test_impact,git_changes,git_blame,git_recent,rules_for,search_docs}` | All MCP retriever tools as REST GETs |
+| `GET /api/definition`, `/references`, `/call_graph`, `/file_map`, `/neighborhood`, `/explore`, `/impact_of`, `/test_impact`, `/git_changes`, `/git_blame`, `/git_recent`, `/rules_for`, `/search_docs` | All MCP retriever tools as REST GETs |
 | `POST /api/cypher` (`{query, limit}`) | Read-only Cypher |
 | `GET /api/graph?limit_nodes=2000` | All nodes + edges for the viewer |
 | `GET /api/stats` | Entity counts + per-edge-table counts |
