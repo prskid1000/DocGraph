@@ -320,10 +320,45 @@
     .chat-msg.bot .who { color: var(--accent-2); }
     .chat-msg .body {
       background: var(--panel-2); border: 1px solid var(--border); border-radius: 6px;
-      padding: 8px 10px; white-space: pre-wrap; word-wrap: break-word; color: var(--fg);
+      padding: 8px 10px; word-wrap: break-word; overflow-wrap: break-word; color: var(--fg);
     }
-    .chat-msg.user .body { background: var(--bg-alt); }
-    .chat-msg.error .body { border-color: #c33; color: #f99; }
+    /* User messages stay verbatim (whitespace preserved). Assistant body
+       holds rendered markdown (block elements set their own spacing). */
+    .chat-msg.user .body { background: var(--bg-alt); white-space: pre-wrap; }
+    .chat-msg.error .body { border-color: #c33; color: #f99; white-space: pre-wrap; }
+    /* Markdown rendering inside an assistant body */
+    .chat-msg.bot .body p { margin: 0 0 6px 0; }
+    .chat-msg.bot .body p:last-child { margin-bottom: 0; }
+    .chat-msg.bot .body h1, .chat-msg.bot .body h2, .chat-msg.bot .body h3,
+    .chat-msg.bot .body h4, .chat-msg.bot .body h5, .chat-msg.bot .body h6 {
+      margin: 8px 0 4px 0; font-weight: 600; color: var(--fg);
+    }
+    .chat-msg.bot .body h1 { font-size: 14px; }
+    .chat-msg.bot .body h2 { font-size: 13px; }
+    .chat-msg.bot .body h3 { font-size: 12px; }
+    .chat-msg.bot .body h4, .chat-msg.bot .body h5, .chat-msg.bot .body h6 { font-size: 11px; }
+    .chat-msg.bot .body strong { color: var(--fg); font-weight: 600; }
+    .chat-msg.bot .body em { color: var(--fg); font-style: italic; }
+    .chat-msg.bot .body ul, .chat-msg.bot .body ol { margin: 4px 0 8px 0; padding-left: 22px; }
+    .chat-msg.bot .body li { margin: 2px 0; }
+    .chat-msg.bot .body a { color: var(--accent); text-decoration: underline; }
+    .chat-msg.bot .body code.md-inline {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 3px;
+      padding: 0 4px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px; color: var(--accent-2);
+    }
+    .chat-msg.bot .body pre.md-code {
+      background: var(--bg); border: 1px solid var(--border); border-radius: 4px;
+      padding: 8px; margin: 6px 0; overflow: auto; font-size: 11px; position: relative;
+    }
+    .chat-msg.bot .body pre.md-code code {
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace; color: var(--fg);
+      background: transparent; padding: 0; border: 0; white-space: pre;
+    }
+    .chat-msg.bot .body pre.md-code[data-lang]::before {
+      content: attr(data-lang); position: absolute; top: 4px; right: 8px;
+      font-size: 9px; color: var(--fg-dim); text-transform: uppercase; letter-spacing: 0.08em;
+    }
     .chat-input-row {
       display: flex; gap: 6px; padding: 8px 12px; border-top: 1px solid var(--border);
       background: var(--bg-alt);
@@ -1112,6 +1147,12 @@ function runCommunities(iters){
         const det = $("#detail");
         if (det) det.innerHTML = "<div class='empty'>Select an entity to inspect.</div>";
       } catch (_) {}
+      // Drop attached chat context (it referenced the old root's entity)
+      // and ask the chat tab to re-pull the LLM config so its meta line
+      // shows the right model + endpoint for the new root.
+      window._dgChatContext = null;
+      if (window._dgUpdateChatAttach) window._dgUpdateChatAttach();
+      if (window._dgRefreshChatMeta) window._dgRefreshChatMeta();
       loadStats();
       loadGraph();
     }
@@ -2364,14 +2405,23 @@ function runCommunities(iters){
     // ---------- Chat tab — POST /api/chat with optional attached context ----------
     async function setupChat() {
       const tabBtn = document.getElementById("chat-tab-btn");
-      let cfg = null;
-      try {
-        cfg = await api("/api/llm_config");
-      } catch (_) { /* host doesn't expose it (older docgraph) — keep tab hidden */ }
-      if (!cfg || !cfg.configured) return; // Chat tab stays hidden unless LLM is configured
-      tabBtn.hidden = false;
       const meta = document.getElementById("chat-meta");
-      meta.textContent = `Model ${cfg.model} via ${cfg.host}:${cfg.port} (${cfg.format})`;
+      async function refreshMeta() {
+        let cfg = null;
+        try { cfg = await api("/api/llm_config"); } catch (_) {}
+        if (!cfg || !cfg.configured) {
+          tabBtn.hidden = true;
+          meta.textContent = "";
+          return null;
+        }
+        tabBtn.hidden = false;
+        const slug = ROOT.slug ? ` · root ${ROOT.slug}` : "";
+        meta.textContent = `Model ${cfg.model} via ${cfg.host}:${cfg.port} (${cfg.format})${slug}`;
+        return cfg;
+      }
+      window._dgRefreshChatMeta = refreshMeta;
+      const cfg = await refreshMeta();
+      if (!cfg) return; // Chat tab stays hidden unless LLM is configured
 
       const log = document.getElementById("chat-log");
       const input = document.getElementById("chat-input");
@@ -2380,6 +2430,92 @@ function runCommunities(iters){
       const attachName = document.getElementById("chat-attach-name");
       const attachClear = document.getElementById("chat-attach-clear");
       const history = []; // {role, content}
+
+      function escapeHtml(s) {
+        return String(s)
+          .replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
+      }
+
+      // Tiny markdown → HTML renderer. Handles fenced code, inline code,
+      // bold/italic, headings, ordered/unordered lists, links, paragraphs.
+      // Code content is escaped before insertion so untrusted model output
+      // can't inject HTML/JS. Not a full CommonMark spec — just enough for
+      // chat messages to look right.
+      function renderMarkdown(text) {
+        const trimmed = (text || "").trim();
+        if (!trimmed) return "<em class='empty-md'>(empty response)</em>";
+        // JSON-only response → pretty-print as a code block.
+        if ((trimmed.startsWith("{") && trimmed.endsWith("}")) ||
+            (trimmed.startsWith("[") && trimmed.endsWith("]"))) {
+          try {
+            const parsed = JSON.parse(trimmed);
+            const pretty = JSON.stringify(parsed, null, 2);
+            return `<pre class="md-code" data-lang="json"><code>${escapeHtml(pretty)}</code></pre>`;
+          } catch (_) { /* not valid JSON, fall through to markdown */ }
+        }
+        // 1) Pull fenced code blocks out first (preserve verbatim).
+        const codeBlocks = [];
+        let html = text.replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g, (_m, lang, code) => {
+          const idx = codeBlocks.length;
+          codeBlocks.push(`<pre class="md-code"${lang ? ` data-lang="${escapeHtml(lang)}"` : ""}><code>${escapeHtml(code)}</code></pre>`);
+          return ` CB${idx} `;
+        });
+        // 2) Pull inline code out next.
+        const inlines = [];
+        html = html.replace(/`([^`\n]+)`/g, (_m, code) => {
+          const idx = inlines.length;
+          inlines.push(`<code class="md-inline">${escapeHtml(code)}</code>`);
+          return ` IC${idx} `;
+        });
+        // 3) Escape everything else.
+        html = escapeHtml(html);
+        // 4) Headings, must come before bold/italic so `### **x**` works.
+        html = html.replace(/^######\s+(.+)$/gm, "<h6>$1</h6>");
+        html = html.replace(/^#####\s+(.+)$/gm, "<h5>$1</h5>");
+        html = html.replace(/^####\s+(.+)$/gm, "<h4>$1</h4>");
+        html = html.replace(/^###\s+(.+)$/gm, "<h3>$1</h3>");
+        html = html.replace(/^##\s+(.+)$/gm, "<h2>$1</h2>");
+        html = html.replace(/^#\s+(.+)$/gm, "<h1>$1</h1>");
+        // 5) Bold + italic.
+        html = html.replace(/\*\*([^*\n]+)\*\*/g, "<strong>$1</strong>");
+        html = html.replace(/(^|\W)\*([^*\n]+)\*/g, "$1<em>$2</em>");
+        // 6) Links [text](url).
+        html = html.replace(/\[([^\]]+)\]\(([^)]+)\)/g,
+          (_m, txt, href) => `<a href="${escapeHtml(href)}" target="_blank" rel="noopener">${txt}</a>`);
+        // 7) Lists — group consecutive list items. Bullets: `- ` `* ` `+ `.
+        // Numbered: `1. ` `2. ` etc. Each line walked once.
+        const lines = html.split("\n");
+        const out = [];
+        let listType = null; // "ul" | "ol" | null
+        for (const line of lines) {
+          const ulMatch = /^(\s*)[-*+]\s+(.+)$/.exec(line);
+          const olMatch = /^(\s*)\d+\.\s+(.+)$/.exec(line);
+          if (ulMatch) {
+            if (listType !== "ul") { if (listType) out.push(`</${listType}>`); out.push("<ul>"); listType = "ul"; }
+            out.push(`<li>${ulMatch[2]}</li>`);
+          } else if (olMatch) {
+            if (listType !== "ol") { if (listType) out.push(`</${listType}>`); out.push("<ol>"); listType = "ol"; }
+            out.push(`<li>${olMatch[2]}</li>`);
+          } else {
+            if (listType) { out.push(`</${listType}>`); listType = null; }
+            out.push(line);
+          }
+        }
+        if (listType) out.push(`</${listType}>`);
+        html = out.join("\n");
+        // 8) Paragraphs — collapse runs of single newlines into <br>, double newlines into paragraph breaks.
+        // But don't touch our placeholder code blocks (they'll be reinjected after).
+        html = html
+          .split(/\n{2,}/).map(p => p.trim() ? p : "")
+          .filter(Boolean)
+          .map(p => /^<(h\d|ul|ol|pre|li)/.test(p) ? p : `<p>${p.replace(/\n/g, "<br>")}</p>`)
+          .join("");
+        // 9) Reinject preserved code blocks + inline code.
+        html = html.replace(/ CB(\d+) /g, (_m, i) => codeBlocks[+i]);
+        html = html.replace(/ IC(\d+) /g, (_m, i) => inlines[+i]);
+        return html;
+      }
 
       function appendMsg(role, content, klass) {
         // Replace the placeholder empty-state on first real message.
@@ -2392,11 +2528,23 @@ function runCommunities(iters){
         who.textContent = role === "user" ? "You" : (role === "system" ? "System" : "Assistant");
         const body = document.createElement("div");
         body.className = "body";
-        body.textContent = content;
+        // User messages stay as plain text — markdown rendering is for the
+        // assistant's output. Errors also stay plain so the raw text is
+        // visible for debugging.
+        if (role === "user" || klass === "error") {
+          body.textContent = content;
+        } else {
+          body.innerHTML = renderMarkdown(content);
+        }
         wrap.appendChild(who); wrap.appendChild(body);
         log.appendChild(wrap);
         log.scrollTop = log.scrollHeight;
         return body;
+      }
+      // Helper used by the doSend flow to switch a placeholder body from
+      // its "Thinking…" plain text to rendered markdown once content arrives.
+      function setBodyMarkdown(bodyEl, content) {
+        bodyEl.innerHTML = renderMarkdown(content);
       }
 
       function refreshAttach() {
@@ -2440,7 +2588,7 @@ function runCommunities(iters){
           }
           const data = await resp.json();
           const content = (data && data.content) || "(empty response)";
-          placeholder.textContent = content;
+          setBodyMarkdown(placeholder, content);
           history.push({ role: "assistant", content });
         } catch (err) {
           placeholder.textContent = `Error: ${err.message || err}`;

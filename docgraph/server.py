@@ -544,12 +544,17 @@ def make_app(workspace: Workspace) -> FastAPI:
                 f"```{lang}\n{snippet}\n```"
             )
             messages = [{"role": "system", "content": sys_note}] + list(messages)
+        # Chat outputs are prose, not docstring one-liners — use the wiki
+        # budget (typically 4096) so long answers aren't truncated. Caller
+        # may still override per-request via payload.max_tokens.
+        chat_budget = int(payload.get("max_tokens")
+                          or getattr(cfg, "llm_max_tokens_wiki", 4096) or 4096)
         from docgraph.llm import LLMClient, LLMConfig
         client = LLMClient(LLMConfig(
             host=cfg.llm_host, port=int(cfg.llm_port), model=cfg.llm_model,
             format=cfg.llm_format,
             api_key=getattr(cfg, "llm_api_key", "") or None,
-            max_tokens=int(getattr(cfg, "llm_max_tokens", 512) or 512),
+            max_tokens=chat_budget,
             timeout=int(getattr(cfg, "llm_timeout", 60) or 60),
         ))
         # The existing _post helper handles both openai + anthropic shapes
