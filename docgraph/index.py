@@ -185,6 +185,7 @@ class Indexer:
         prog_label: str,
         insert_batch: int = 5000,
         cancel_token: "CancelToken | None" = None,
+        progress_emit: "Callable[[int], None] | None" = None,
     ) -> None:
         """Stream-embed and insert. plan: [(row_dict, embed_text), ...].
 
@@ -237,10 +238,17 @@ class Indexer:
                     texts = [t for _, t in batch]
                     rows = [r for r, _ in batch]
                     del batch
+                    def _on_emb(n: int) -> None:
+                        prog.advance(task, n)
+                        if progress_emit is not None:
+                            try:
+                                progress_emit(n)
+                            except Exception:
+                                pass
                     vecs = self.embedder.embed(
                         texts,
                         batch_size=self.cfg.embed_batch_size,
-                        on_progress=lambda n: prog.advance(task, n),
+                        on_progress=_on_emb,
                     )
                     # Attach numpy slices (1.5 KB each) instead of list[float]
                     # (12 KB each) — db.insert_nodes converts to list per
@@ -378,6 +386,19 @@ class Indexer:
             except Exception:
                 log.debug("progress_cb raised; ignoring", exc_info=True)
 
+        # Throttled per-item emitter. Long phases (parse 30k files, embed
+        # 170k entities) would otherwise dump thousands of SSE events; cap
+        # at one update per second + always fire on completion.
+        def _throttled(phase: str, total: int):
+            state = {"done": 0, "last": 0.0}
+            def push(n: int = 1) -> None:
+                state["done"] += n
+                now = time.perf_counter()
+                if now - state["last"] >= 1.0 or state["done"] >= total:
+                    state["last"] = now
+                    _emit(phase, state["done"], total)
+            return push
+
         _ck()
         _emit("start")
         t0 = time.perf_counter()
@@ -448,6 +469,7 @@ class Indexer:
         parsed: dict[str, FileParse] = {}
         errors: list[str] = []
         if changed:
+            parse_emit = _throttled("parse", len(changed))
             with _bar() as prog:
                 ptask = prog.add_task("Parsing files", total=len(changed))
                 # parse worker receives (absolute_path, owning_root, logical_rel)
@@ -463,6 +485,7 @@ class Indexer:
                 with ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
                     for result in ex.map(_parse_worker, args_iter, chunksize=8):
                         prog.advance(ptask)
+                        parse_emit(1)
                         # Per-file checkpoint: parse can be the slowest
                         # phase on big repos; this lets a cancel land
                         # within a few hundred ms instead of waiting for
@@ -600,19 +623,23 @@ class Indexer:
 
         # Warm up the embedder once before any progress bar opens, so the
         # "Loading embedding model" log doesn't punch through the live display.
+        ent_total = len(class_plan) + len(function_plan)
         if class_plan or function_plan:
             _ck()
-            _emit("embed_entities", 0, len(class_plan) + len(function_plan))
+            _emit("embed_entities", 0, ent_total)
             self.embedder._ensure()
+        ent_emit = _throttled("embed_entities", ent_total) if ent_total else None
 
         # ---- Step 5b: stream embed + insert classes/functions ----
         if class_plan:
             self._stream_embed_insert("Class", class_plan, "Embedding entities (classes)",
-                                       cancel_token=cancel_token)
+                                       cancel_token=cancel_token,
+                                       progress_emit=ent_emit)
             class_plan.clear()
         if function_plan:
             self._stream_embed_insert("Function", function_plan, "Embedding entities (functions)",
-                                       cancel_token=cancel_token)
+                                       cancel_token=cancel_token,
+                                       progress_emit=ent_emit)
             function_plan.clear()
 
         # ---- Step 5c: build chunk plan, then stream embed + insert ----
@@ -650,8 +677,10 @@ class Indexer:
         if chunk_plan:
             _ck()
             _emit("embed_chunks", 0, len(chunk_plan))
+            chunk_emit = _throttled("embed_chunks", len(chunk_plan))
             self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks",
-                                       cancel_token=cancel_token)
+                                       cancel_token=cancel_token,
+                                       progress_emit=chunk_emit)
             chunk_plan.clear()
 
         # ---- Step 5d: CONTAINS_CHUNK edges ----
