@@ -14,6 +14,12 @@ import pyarrow as pa
 
 # Node tables — all entities share an integer pk for fast joins; qname is the
 # stable human-readable identifier.
+#
+# Embedding columns are `DOUBLE[{dim}]` and substituted at init time from
+# `GraphDB.embedding_dim` so the DB matches the chosen embedding model
+# (BGE small = 384, mpnet = 768, e5-large = 1024 …). A schema mismatch is
+# unrecoverable — Kuzu won't auto-resize a fixed-length array column — so
+# switching model requires `docgraph admin clear` + full reindex.
 NODE_DDL = [
     """CREATE NODE TABLE IF NOT EXISTS File(
         id INT64,
@@ -39,7 +45,7 @@ NODE_DDL = [
         line_end INT64,
         body STRING,
         kind STRING,
-        embedding DOUBLE[384],
+        embedding DOUBLE[{dim}],
         pagerank DOUBLE,
         PRIMARY KEY (id)
     )""",
@@ -54,7 +60,7 @@ NODE_DDL = [
         signature STRING,
         is_method BOOLEAN,
         is_test BOOLEAN,
-        embedding DOUBLE[384],
+        embedding DOUBLE[{dim}],
         pagerank DOUBLE,
         PRIMARY KEY (id)
     )""",
@@ -78,7 +84,7 @@ NODE_DDL = [
         file STRING,
         idx INT64,
         body STRING,
-        embedding DOUBLE[384],
+        embedding DOUBLE[{dim}],
         PRIMARY KEY (id)
     )""",
     # External documentation chunks. Two kinds share this table:
@@ -94,7 +100,7 @@ NODE_DDL = [
         title STRING,
         idx INT64,
         body STRING,
-        embedding DOUBLE[384],
+        embedding DOUBLE[{dim}],
         PRIMARY KEY (id)
     )""",
     # Asset nodes: media / large / binary files in the repo. We DO NOT
@@ -150,7 +156,11 @@ class GraphDB:
         self._known_ids: dict[str, set[int]] = {}
 
     def init_schema(self) -> None:
-        for ddl in NODE_DDL + EDGE_DDL:
+        # NODE_DDL templates contain `{dim}` placeholders for embedding columns
+        # so the on-disk schema matches whatever model the user picked.
+        for ddl in NODE_DDL:
+            self.conn.execute(ddl.format(dim=self.embedding_dim))
+        for ddl in EDGE_DDL:
             self.conn.execute(ddl)
 
     def execute(self, cypher: str, params: dict | None = None) -> Any:

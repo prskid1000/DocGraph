@@ -174,7 +174,7 @@ def add_doc(
         return {"url": url, "chunks": 0, "title": title, "error": "empty body"}
 
     if db is None:
-        db = GraphDB(cfg.db_path, embedding_dim=384)
+        db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
     db.init_schema()
 
     # Remove existing chunks for this URL
@@ -251,7 +251,7 @@ def remove_doc(cfg: Config, url: str, db: GraphDB | None = None) -> int:
 
     Pass an existing writer `db` to reuse it (host route)."""
     if db is None:
-        db = GraphDB(cfg.db_path, embedding_dim=384)
+        db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
     db.init_schema()
     rows = db.fetch_all(
         "MATCH (d:Doc) WHERE d.source = $u RETURN count(d) AS c", {"u": url}

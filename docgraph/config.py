@@ -75,6 +75,16 @@ class Config:
     detected_ecosystems: dict[Path, list[str]] = field(init=False)
 
     def __post_init__(self) -> None:
+        # Auto-align embedding_dim to the chosen model. We only override when
+        # the user left embedding_dim at the default (384) AND picked a model
+        # whose actual dim differs — explicit dim wins so power users can
+        # still override. Done first because the dim feeds Kuzu DDL.
+        if self.embedding_dim == 384:
+            from docgraph.embed import dim_for_model  # local import to avoid cycle
+            actual = dim_for_model(self.embedding_model, default=384)
+            if actual != 384:
+                self.embedding_dim = actual
+
         # Three-tier ignore:
         #   - UNIVERSAL + autodetected ecosystem templates (docgraph.ignores)
         #   - User INDEX-EXCLUDE: .gitignore, .docgraphignore, .cursorindexingignore
@@ -248,6 +258,9 @@ def load_config(
         host=os.environ.get("DOCGRAPH_HOST", "127.0.0.1"),
         port=int(os.environ.get("DOCGRAPH_PORT", "5500")),
         embedding_model=os.environ.get("DOCGRAPH_EMBED_MODEL", "BAAI/bge-small-en-v1.5"),
+        # Explicit override; otherwise auto-derived from the model in
+        # Config.__post_init__ via fastembed's catalog.
+        embedding_dim=int(os.environ.get("DOCGRAPH_EMBED_DIM", "384")),
         gpu=os.environ.get("DOCGRAPH_GPU", "").lower() in ("1", "true", "yes"),
         # Setting DOCGRAPH_LLM_MODEL is sufficient to enable; the boolean
         # DOCGRAPH_LLM_DOCSTRINGS still works as an explicit override.

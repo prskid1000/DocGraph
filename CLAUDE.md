@@ -31,7 +31,7 @@ It is the **v2 rewrite** of an older Neo4j + ChromaDB + Streamlit + Vite stack. 
 | `docgraph/index.py` | Parallel pipeline + per-file delta updates. **Most complex file.** |
 | `docgraph/summary.py` | Builds the embedding text per entity (extracts docstrings/JSDoc/Rust `///` etc.). |
 | `docgraph/db.py` | Kuzu schema + bulk insert helpers. Edges go through `COPY FROM arrow (from='X', to='Y')` (pyarrow-staged) — 10-50× faster than the old MATCH+CREATE. Default `insert_edges` batch is 10k rows. The `_known_ids` cache filters dangling-endpoint rows before COPY (which hard-errors on missing PKs, vs. the old silent-drop). `close()` is explicit + `__del__` calls it — needed because Windows + Kuzu's COPY internals don't release the file lock on `del` alone. |
-| `docgraph/embed.py` | fastembed wrapper (BGE-small, 384-dim). `Embedder(providers=...)` passes ORT providers through; `GPU_PROVIDERS` is the default GPU stack (CUDA → DirectML → CoreML → ROCm → CPU). Process-wide `_MODEL_CACHE` (locked) keys on `(model_name, providers)` so multiple `Embedder()` instances share one loaded ONNX session — important for the test suite, multi-repo, and `watch --serve` reload paths. `clear_model_cache()` exposed for tests; production code never needs it. |
+| `docgraph/embed.py` | fastembed wrapper. Default model is BGE-small (384-dim) but **any fastembed-supported model is allowed** — the Kuzu schema's embedding columns are sized at init time from `GraphDB.embedding_dim`, which `Config.__post_init__` auto-derives from the chosen model via `dim_for_model()` (consults `TextEmbedding.list_supported_models()`). `Embedder(providers=...)` passes ORT providers through; `GPU_PROVIDERS` is the default GPU stack (CUDA → DirectML → CoreML → ROCm → CPU). Process-wide `_MODEL_CACHE` (locked) keys on `(model_name, providers)` so multiple `Embedder()` instances share one loaded ONNX session — important for the test suite, multi-repo, and `watch --serve` reload paths. `clear_model_cache()` exposed for tests; production code never needs it. |
 | `docgraph/rank.py` | NetworkX PageRank + `PersonalizedRanker` (query-time personalized PR with cached graph). |
 | `docgraph/retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher` / `git_*` / `rules_for`. **All Cypher lives here or in `db.py`.** |
 | `docgraph/git_tools.py` | `git diff` / `blame` / `log` shell-outs, joined to graph entities. |
@@ -262,6 +262,13 @@ Both are evaluated lazily on every call (`docstring_prompt_template()` / `wiki_p
 - `Indexer._augment_llm_docstrings()` runs after parsing, before embedding. Targets entities of kind `function` / `method` / `class` / `interface` that lack a native docstring. Skips silently if the server is unreachable. Default timeout is 60s per call; concurrency is `min(8, max(2, cfg.workers))`.
 - Cache: `.docgraph/llm_docstrings.json` keyed by `sha256(body)`. Survives across runs and across renames (rename-safe). Incrementals only call the LLM for body-changed entities.
 - Generated text is read back in `summary.build_embedding_text(..., llm_doc=...)` — used **only** when no native docstring is found, so we never override a real doc.
+
+## Switching the embedding model
+
+- Default: `BAAI/bge-small-en-v1.5` (384-dim). Override with `--embed-model` or `DOCGRAPH_EMBED_MODEL=<hf-id>`. Anything in `TextEmbedding.list_supported_models()` is accepted.
+- `Config.__post_init__` calls `embed.dim_for_model(<name>)` and overrides `cfg.embedding_dim` if the model's actual dim differs from the 384 default. Power users can pin `DOCGRAPH_EMBED_DIM=<n>` to force a value (e.g. for a custom model not in fastembed's catalog).
+- Schema columns are `DOUBLE[{dim}]` formatted from `GraphDB.embedding_dim` at `init_schema()` time. Switching to a different-dim model on an existing DB is a hard error: Kuzu's `IF NOT EXISTS` keeps the old schema, then the next embedding insert rejects the wrong array length. The fix is `POST /api/admin/clear` (or delete `.docgraph/`) + full reindex. Telecode's tray dropdown labels this requirement.
+- The dim is not part of the `.docgraph/cache.json` shape, so changing it doesn't break incremental cache reads from a fresh clear.
 
 ## GPU embeddings (opt-in)
 

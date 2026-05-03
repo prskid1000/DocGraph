@@ -44,6 +44,29 @@ def clear_model_cache() -> None:
         _MODEL_CACHE.clear()
 
 
+def dim_for_model(model_name: str, default: int = 384) -> int:
+    """Look up the output dim of a fastembed text-embedding model.
+
+    Used to size Kuzu's `embedding DOUBLE[N]` columns at schema-init time
+    so the on-disk array length matches whatever model the user picked.
+    Falls back to `default` if the model isn't in fastembed's catalog
+    (older fastembed, custom local model, mistyped name) — the indexer
+    will then either succeed by chance (matching dim) or fail loudly on
+    the first insert (mismatched dim). We prefer that to silent dim
+    drift across a session."""
+    if not model_name:
+        return default
+    try:
+        for m in TextEmbedding.list_supported_models():
+            if m.get("model") == model_name:
+                d = m.get("dim")
+                if isinstance(d, int) and d > 0:
+                    return d
+    except Exception:
+        log.debug("dim_for_model lookup failed for %s; using default=%d", model_name, default)
+    return default
+
+
 class Embedder:
     def __init__(
         self,

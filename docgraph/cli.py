@@ -205,7 +205,7 @@ def index(
             f"  [yellow]LLM docstrings[/]: {cfg.llm_format} @ "
             f"{cfg.llm_host}:{cfg.llm_port} (model={cfg.llm_model})"
         )
-    db = GraphDB(cfg.db_path, embedding_dim=384)
+    db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
     db.init_schema()
     indexer = Indexer(cfg, db)
     stats = indexer.index_all(incremental=not full)
