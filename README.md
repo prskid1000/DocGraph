@@ -14,7 +14,7 @@ docgraph mcp /repo-a --transport stdio               # editor stdio MCP (proxies
 
 ### GUI / process supervision (optional)
 
-Want a tray-based UI that supervises one `docgraph host` covering every repo you care about, and bridges every MCP tool into a local LLM through a proxy? See [telecode](https://github.com/prithwirajs/telecode) — its DocGraph section auto-starts the host, tails its log, and registers `docgraph_<tool>` in the managed-tools registry. The agent selects which repo per call via the `root` enum the host emits.
+Want a tray UI that supervises one `docgraph host` covering every repo you care about, and bridges every MCP tool into a local LLM via a proxy? See [telecode](https://github.com/prithwirajs/telecode) — its DocGraph section auto-starts the host, tails its log, and registers `docgraph_<tool>` in the managed-tools registry. The agent selects which repo per call via the `root` enum.
 
 ## Why
 
@@ -22,50 +22,50 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 ### Architecture
 
-- **One Kuzu DB per repo, one host process per machine.** `docgraph host` runs the unified server: web UI + JSON API + MCP HTTP + optional watchers, all rooted in a `Workspace` registry that owns the per-repo connections. Multi-root via repeatable `--root` flags.
-- **Closed-enum `root` selection.** The host reads its registered slugs at boot and emits the JSON API + MCP tool schemas with a JSON Schema enum. LLMs pick from a known set; protocol-layer rejection on typos. Single-root case collapses to a one-value default.
-- **165+ languages** out of the box via tree-sitter (just install more `tree-sitter-*` packages).
+- **One Kuzu DB per repo, one host process per machine.** `docgraph host` runs the unified server: web UI + JSON API + MCP HTTP + optional watchers, all rooted in a `Workspace` registry that owns per-repo connections. Multi-root via repeatable `--root` flags.
+- **Closed-enum `root` selection.** The host reads its registered slugs at boot and emits the JSON API + MCP tool schemas with a JSON Schema enum. LLMs pick from a known set; protocol rejects typos. Single-root collapses to a one-value default.
+- **165+ languages** out of the box via tree-sitter (just `pip install` more `tree-sitter-*` packages).
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
-- **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML. Still no torch dep — just `pip install onnxruntime-gpu` / `onnxruntime-directml`. Falls back to CPU silently if no GPU runtime is installed.
-- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound network calls are opt-in: `docgraph docs add <url>` (you supply the URL) and `--llm-model <name>` (you supply the local server).
+- **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML. No torch dep — `pip install onnxruntime-gpu` / `-directml` / `-silicon`. Falls back to CPU silently if no GPU runtime is installed.
+- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound calls are opt-in: `docgraph docs add <url>` and `--llm-model <name>` (you supply the local server).
+- **Configuration is flags-only.** No `DOCGRAPH_*` environment variables. Every knob is a CLI flag or a `load_config(...)` kwarg, so the spawn surface is fully visible in `ps` / Process Hacker.
 
 ### Retrieval
 
 - **MCP server** — 15 tools (6 base + 9 differentiators). Two transports: `stdio` for editors (Cursor / Claude Desktop) and `http` for web clients (`docgraph mcp --transport http`).
-- **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). The "what else will my change break?" answer.
-- **Differentiator MCP tools** — `explore` (multi-hop BFS), `impact_of` (blast radius), `test_impact` (which tests cover this?), and `cypher` (raw read-only graph query — rejects `CREATE` / `MERGE` / `SET` / `DELETE` / `DROP` server-side, so agents can't accidentally mutate the graph).
-- **Personalized PageRank** — `search` accepts `focus_file` / `focus_symbol` and ranks results by proximity to the file or symbol the agent is currently editing.
+- **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). Answers "what else will my change break?".
+- **Differentiator MCP tools** — `explore` (multi-hop BFS), `impact_of` (blast radius), `test_impact` (which tests cover this?), `cypher` (raw read-only graph query — rejects writes server-side).
+- **Personalized PageRank** — `search` accepts `focus_file` / `focus_symbol` and ranks by proximity to what the agent is editing.
 - **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (still local, still ONNX).
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
-- **Symbol-level imports + method overrides** — `IMPORTS_SYMBOL` (file → exact Class / Function it imports, not just file → file) and `OVERRIDES` (child method → parent method via the inheritance closure) so agents can ask "who imports this class?" and "what does this method override?" precisely.
+- **Symbol-level imports + method overrides** — `IMPORTS_SYMBOL` (file → exact Class / Function imported by name) and `OVERRIDES` (child method → parent via the inheritance closure).
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
-- **Diff- and history-aware tools** — `git_changes` (changed entities + 1-hop callers — Cursor `@Commit` joined to the graph), `git_blame` (line-range blame — Cursor `@Blame` parity), `git_recent` (last N commits scoped to a file or repo).
+- **Diff- and history-aware tools** — `git_changes` (changed entities + 1-hop callers), `git_blame` (line-range blame), `git_recent` (last N commits scoped to a file or repo).
 
 ### Watcher + UI
 
-- **Live graph UI** — single HTML file, no build step. Force-directed layout (ForceAtlas2-lite + label-propagation community detection) runs in a **Web Worker** so the main thread stays at 60fps. Render is Canvas 2D, batched by color and viewport-culled — comfortable up to ~10k nodes.
-- **Detail Level / progressive reveal** — start with all `File` nodes (level 0); click any node to reveal its 1-hop neighbors. Lets you skim a 10k-node graph as a hub-and-spoke first, drill in only where you care.
-- **Color modes** — color nodes by **kind** (Function / Class / File / …) or by **community** (auto-clustered via label propagation, no LLM).
-- **Process detection** — entry-point → leaf call chains, surfaced in a dedicated **Processes** tab. An entry point = a function with no incoming `CALLS` edge; the panel shows ranked entries plus their forward call chain.
+- **Live graph UI** — single HTML file, no build step. ForceAtlas2-lite + label-propagation community detection runs in a **Web Worker**; render is Canvas 2D, batched and viewport-culled — comfortable up to ~10k nodes.
+- **Detail Level / progressive reveal** — start with all `File` nodes; click any node to reveal 1-hop neighbors. Skim a 10k-node graph as a hub-and-spoke first, drill in only where you care.
+- **Color modes** — by **kind** (Function / Class / File / …) or by **community** (auto-clustered, no LLM).
+- **Process detection** — entry-point → leaf call chains, surfaced in the **Processes** tab.
 - **LLM-grounded wiki** — the **Wiki** tab generates one Markdown page per top-level module from a Kuzu fact sheet (top classes / functions by PageRank, importers, tests). CLI: `docgraph wiki`. Falls back to a plain rendering when the LLM is unreachable.
-- **Watcher** — `docgraph watch` auto-reindexes on file changes (Rust `notify` under the hood, debounced).
-- **Live UI auto-redraw** — `docgraph watch --serve` runs the watcher and the web server in **one process** so they share the Kuzu file lock. After every reindex the browser refreshes itself via Server-Sent Events at `/api/events` — no F5, no polling.
-- **ML-training-style progress bars** — every index phase (parse, embed entities, embed chunks, write nodes, build symbol table, resolve edges, `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, PageRank, persist) reports `% | M/N | elapsed | ETA`. Same bars in `docgraph docs add`.
+- **Watcher** — `docgraph host --watch <root>` auto-reindexes on file changes (Rust `notify`, debounced). The browser refreshes itself via SSE at `/api/events` — no F5, no polling.
+- **Phase progress bars** — every index phase (parse, embed entities, embed chunks, write nodes, build symbol table, resolve edges, `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, PageRank, persist) reports `% | M/N | elapsed | ETA`.
 
 ### Multi-root + ignores
 
 - **Multi-root** — `docgraph host --root A --root B` runs one process serving N independent repos, each with its own `.docgraph/graph.kuzu`. Every API/MCP call accepts a `root=<slug>` arg (closed enum, validated at the protocol layer). The single web UI's repo picker is populated from `GET /api/roots`.
-- **Indexer-side `--repo` (repeatable)** still works for monorepos: merges several path roots into a single index. Different from multi-root above (workspace registers independent indexes side-by-side; `--repo` builds one index from multiple paths).
-- **Smart default ignores** — universal baseline (Cursor-parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs (`target/`, `build/`, `bin/`, `obj/`) only ignored when their marker file is detected.
-- **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI. The HTTP API also sandboxes `/api/file_content` to the repo root (403 on traversal) and redacts `.cursorignore`'d files.
-- **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)` so any MCP client gets glob-matched auto-attach.
+- **Indexer-side `--repo` (repeatable)** still works for monorepos: merges several path roots into one index. Different from multi-root above.
+- **Smart default ignores** — universal baseline (Cursor parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs only ignored when their marker file is detected.
+- **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI. The HTTP API also sandboxes `/api/file_content` to the repo root.
+- **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)`.
 
 ### Optional augmentation
 
-- **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent (re-ingesting a URL replaces prior chunks).
-- **Optional LLM-augmented docstrings** — opt-in via `--llm-model <name>`; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash so incrementals stay fast.
-- **LLM-grounded wiki (opt-in)** — `docgraph wiki` walks every top-level module, builds a fact sheet from Kuzu (top classes / functions / importers / tests), and asks the same local LLM to write a 200-300 word Markdown page per module. Saved to `.docgraph/wiki/<slug>.md` and shown in the Web UI's Wiki tab. Same `--llm-*` flags and `DOCGRAPH_LLM_*` env vars as `docgraph index`.
+- **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent.
+- **LLM-augmented docstrings (opt-in)** — `--llm-model <name>` enables it; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash.
+- **LLM-grounded wiki (opt-in)** — `docgraph wiki` walks every top-level module, builds a fact sheet from Kuzu, and asks the same local LLM to write a 200-300 word Markdown page per module. Saved to `.docgraph/wiki/<slug>.md` and shown in the Web UI.
 
 ## Performance
 
@@ -94,7 +94,7 @@ Requires Python 3.10+. The first run downloads the embedding model (~30 MB BGE-s
 
 ```bash
 pip install onnxruntime-gpu          # NVIDIA / CUDA (Linux, Windows)
-pip install onnxruntime-directml     # Windows / any GPU (DirectX 12)
+pip install onnxruntime-directml     # Windows / any DirectX 12 GPU
 pip install onnxruntime-silicon      # Apple Silicon (CoreML)
 ```
 
@@ -102,128 +102,107 @@ DocGraph picks whichever provider is installed automatically; without one it sta
 
 ## CLI reference
 
-`path` argument defaults to the current directory; the repo root is auto-detected by walking up to find `.git`.
+`path` argument defaults to the current directory; the repo root is auto-detected by walking up to find `.git`. **Every knob is a flag — there are no `DOCGRAPH_*` environment variables.**
 
 ### `docgraph index [path]`
 
 Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 
-**All flags are optional.** Plain `docgraph index` with zero arguments works — flags only enable opt-in features (LLM docstrings, GPU embeddings, multi-repo) or alter defaults.
-
 | Flag | Default | Description |
 |---|---|---|
-| `--full`, `-f` *(optional)* | `false` | Wipe the DB and rebuild from scratch instead of delta-update |
-| `--repo PATH`, `-r PATH` *(optional)* | — | Additional repo root to fold into **the same** `.docgraph/graph.kuzu` (monorepo / sibling-projects shape). Persisted in `.docgraph/repos.json`. This is *indexer-side* multi-root — different from the *host-side* multi-root model where each `--root` to `docgraph host` is an independent index. |
-| `--llm-model STR` *(optional)* | unset (off) — when set, defaults to `qwen3.6-35b` via `$DOCGRAPH_LLM_MODEL` | **Activator.** Pass the model name your local server expects (e.g. `qwen3.6-35b`, `local-model`) to enable LLM-augmented docstrings for entities lacking native docs. Cached by body hash in `.docgraph/llm_docstrings.json` so incrementals don't re-call. |
-| `--llm-host STR` *(optional)* | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Local LLM server host. Ignored unless `--llm-model` is set. |
-| `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. Ignored unless `--llm-model` is set. |
-| `--llm-format STR` *(optional)* | `openai` | API format: `openai` (Chat Completions @ `/v1/chat/completions`) or `anthropic` (Messages @ `/v1/messages`). Ignored unless `--llm-model` is set. |
-| `--llm-max-tokens INT` *(optional)* | `150` | Max tokens per LLM call. DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) fit a one-sentence answer in this budget; bump it for non-reasoning models if you want longer summaries. |
-| `--gpu` *(optional)* | `false` | Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML / ROCm). Requires `onnxruntime-gpu`, `onnxruntime-directml`, or `onnxruntime-silicon` to be installed. Falls back to CPU silently if no GPU runtime is found. |
-| `--workers INT` *(optional)* | `0` (auto) | Override the indexer worker count. `0` = auto = `max(2, cpu_count - 1)`. |
-| `--embed-batch-size INT` *(optional)* | `256` (`32` with `--gpu`) | Batch size for embedding. Lower it if you hit GPU device-hung errors with `--gpu` / DirectML. |
-| `--documents` / `--no-documents` *(optional)* | `false` (or `$DOCGRAPH_INDEX_DOCUMENTS=1`) | Also index repo documents (`.md` / `.markdown` / `.txt` / `.rst` / small CSVs as `Doc` nodes for `search_docs`) and register binary / heavy files (`.pdf` / `.xlsx` / `.png` / `.mp4` / `.parquet` / fonts / archives / 3D / installers) as `Asset` nodes with `REFERENCES_` edges from any code or doc that mentions them by path. Off by default. |
-| `--text-exts STR` *(optional)* | `md,markdown,txt,rst,csv` (or `$DOCGRAPH_TEXT_EXTS`) | Comma-separated extension list for the text-doc tier. Implies `--documents`. |
-| `--asset-exts STR` *(optional)* | `pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…` (or `$DOCGRAPH_ASSET_EXTS`) | Comma-separated extension list for the asset tier. Implies `--documents`. |
-| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
+| `--full`, `-f` | `false` | Wipe the DB and rebuild from scratch |
+| `--repo PATH`, `-r PATH` | — | Additional repo root to fold into **the same** `.docgraph/graph.kuzu` (monorepo / sibling-projects shape). Persisted in `.docgraph/repos.json`. Different from host-side multi-root. |
+| `--llm-model STR` | unset (off) | **Activator** for LLM-augmented docstrings. Pass the model name your local server expects (`qwen3.6-35b`, `local-model`, …). Cached by body hash. |
+| `--llm-host STR` | `localhost` | Local LLM server host. Ignored unless `--llm-model` is set. |
+| `--llm-port INT` | `1235` | Local LLM server port. Ignored unless `--llm-model` is set. |
+| `--llm-format STR` | `openai` | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
+| `--llm-max-tokens INT` | `512` | Max tokens per LLM call. `reasoning_effort=none` lets reasoning models fit a one-sentence answer. |
+| `--llm-prompt-docstring-file PATH` | unset | Custom docstring template (must keep `{kind}` / `{name}` / `{language}` / `{body}`). |
+| `--gpu` | `false` | Use GPU for embeddings via ONNX Runtime. Requires `onnxruntime-gpu`/`-directml`/`-silicon`. Falls back to CPU silently if absent. |
+| `--workers INT` | `0` (auto) | Override worker count. `0` = `max(2, cpu_count - 1)`. |
+| `--embed-batch-size INT` | `256` (`32` with `--gpu`) | Lower if you hit GPU device-hung errors with `--gpu` / DirectML. |
+| `--embed-model STR` | `BAAI/bge-small-en-v1.5` | Override the fastembed model. Schema dim auto-aligns. Switching dim on an existing DB requires `clear` + reindex. |
+| `--documents` / `--no-documents` | `false` | Index repo documents (`.md` / `.txt` / `.rst` / small CSVs) as `Doc` nodes and binary / heavy files (`.pdf` / `.xlsx` / …) as `Asset` nodes with `REFERENCES_` edges. |
+| `--text-exts STR` | `md,markdown,txt,rst,csv` | Text-doc extensions. Implies `--documents`. |
+| `--asset-exts STR` | `pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…` | Asset extensions. Implies `--documents`. |
+| `--verbose`, `-v` | `false` | Verbose logs |
 
 ### `docgraph host [path]`
 
-The unified server. One process serves N roots — web UI + JSON API + MCP HTTP all on the same port. **All flags are optional.**
+The unified server. One process serves N roots — web UI + JSON API + MCP HTTP all on the same port.
 
 ```bash
 docgraph host                                       # cwd as the only root
 docgraph host /repo-a                               # single-root sugar
-docgraph host --root /repo-a --root /repo-b        # multi-root
-docgraph host --root /repo-a --watch /repo-a      # also reindex on change
+docgraph host --root /repo-a --root /repo-b         # multi-root
+docgraph host --root /repo-a --watch /repo-a        # also reindex on change
 ```
+
+Accepts every `index`-time flag too (`--gpu`, `--embed-model`, `--llm-*`, `--rerank-default`, `--rerank-model`, `--rerank-gpu`, `--documents`, `--text-exts`, `--asset-exts`) plus:
 
 | Flag | Default | Description |
 |---|---|---|
-| `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root to register. With multiple roots, every API/MCP call accepts `root=<slug>` to pick. |
-| `--watch PATH` *(repeatable)* | — | Per-root watcher. Each value must match one of the registered `--root` entries. |
-| `--host STR` *(optional)* | `127.0.0.1` | Bind address |
-| `--port INT` *(optional)* | `5500` | Bind port |
-| `--debounce INT` *(optional)* | `500` | Watcher debounce (ms) |
-| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
+| `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root to register. With multiple roots, every API/MCP call accepts `root=<slug>`. |
+| `--watch PATH` *(repeatable)* | — | Per-root watcher. Each value must match a registered `--root`. |
+| `--host STR` | `127.0.0.1` | Bind address |
+| `--port INT` | `5500` | Bind port |
+| `--debounce INT` | `500` | Watcher debounce (ms) |
+| `--llm-prompt-docstring-file PATH` | unset | Process-wide custom docstring template. |
+| `--llm-prompt-wiki-file PATH` | unset | Process-wide custom wiki output-format tail (no placeholders required). |
 
 ### `docgraph watch [path]`
 
-Auto-reindex on file changes (Rust `notify` under the hood, debounced). Now a thin alias for `docgraph host` with watchers — `docgraph watch <path>` is equivalent to a single-root host watching that path. `--serve` adds the web UI + JSON API + MCP HTTP. **All flags are optional.**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--root PATH`, `-r PATH` *(repeatable)* | — | Watch root. Single positional path is the sugar. |
-| `--debounce INT` *(optional)* | `500` | Debounce window in ms before reindex fires |
-| `--serve` *(optional)* | `false` | Also run the web UI + JSON API + MCP HTTP. Equivalent to `docgraph host --watch <root>`. |
-| `--host STR` *(optional)* | `127.0.0.1` | Bind address (only with `--serve`) |
-| `--port INT` *(optional)* | `5500` | Bind port (only with `--serve`) |
-| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
+Auto-reindex on file changes. Now a thin alias for `docgraph host` with watchers — `docgraph watch <path>` is equivalent to a single-root host watching that path. `--serve` adds the web UI + JSON API + MCP HTTP.
 
 ### `docgraph serve [path]`
 
-Thin alias for `docgraph host` with no watchers. **All flags are optional.**
-
-| Flag | Default | Description |
-|---|---|---|
-| `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root to register. Positional path is single-root sugar. |
-| `--host STR` *(optional)* | `127.0.0.1` (or `$DOCGRAPH_HOST`) | Bind address |
-| `--port INT` *(optional)* | `5500` (or `$DOCGRAPH_PORT`) | Bind port |
-| `--verbose`, `-v` *(optional)* | `false` | Verbose access logs |
+Thin alias for `docgraph host` with no watchers.
 
 ### `docgraph mcp [path]`
-
-Run the Model Context Protocol server. **All flags are optional.**
 
 ```bash
 docgraph mcp /myrepo --transport stdio              # editor stdio MCP. Probes a running host first.
 docgraph mcp /myrepo --transport stdio --standalone # explicit isolated mode (no host probe)
-docgraph mcp /myrepo --transport http               # standalone HTTP MCP (prefer `docgraph host` instead)
+docgraph mcp /myrepo --transport http               # standalone HTTP MCP (prefer `docgraph host`)
 ```
 
 | Flag | Default | Description |
 |---|---|---|
 | `--root PATH`, `-r PATH` *(repeatable)* | — | Repo root. Positional path is single-root sugar. |
-| `--transport STR` *(optional)* | `stdio` | `stdio` (for Cursor / Claude Desktop) or `http` |
-| `--host STR` *(optional)* | `127.0.0.1` | Bind address (HTTP transport, or stdio's host probe) |
-| `--port INT` *(optional)* | `5500` | Bind port (HTTP transport, or stdio's host probe) |
-| `--host-url STR` *(stdio only)* | — | Override the URL stdio probes for an existing host (default: `http://127.0.0.1:5500`) |
+| `--transport STR` | `stdio` | `stdio` (Cursor / Claude Desktop) or `http` |
+| `--host STR` | `127.0.0.1` | Bind address (HTTP transport, or stdio's host probe) |
+| `--port INT` | `5500` | Bind port (HTTP transport, or stdio's host probe) |
+| `--host-url STR` *(stdio only)* | — | Override the URL stdio probes for an existing host |
 | `--standalone` *(stdio only)* | `false` | Skip the host probe and run a single-process stdio server. |
-| `--verbose`, `-v` *(optional)* | `false` | Verbose logs |
 
-**Strict-mode stdio.** With `--transport stdio` (default), `docgraph mcp <path>` first probes for a running `docgraph host`. If found, it acts as a thin proxy scoped to `<path>` (the LLM only sees that root in the schema). If `<path>` isn't a registered root on the host, it errors out — pass `--standalone` to bypass the probe and run isolated.
+**Strict-mode stdio.** With `--transport stdio` (default), `docgraph mcp <path>` first probes for a running `docgraph host`. If found, it acts as a thin proxy scoped to `<path>`. If `<path>` isn't a registered root on the host, it errors out — pass `--standalone` to bypass.
 
 ### `docgraph stats [path]`
 
-Print entity + edge counts. No flags.
+Print entity + edge counts.
 
 ### `docgraph wiki [path]`
 
-Generate (or rebuild) an LLM-grounded wiki for the indexed repo. For every top-level module DocGraph pulls a fact sheet from Kuzu (top classes / functions by PageRank, importers, tests) and asks a local LLM to write a 200-300 word page. Pages land in `.docgraph/wiki/<slug>.md` and are surfaced in the Web UI's **Wiki** tab. If no LLM is reachable, the page falls back to a plain rendering of the facts so the wiki is never blank.
-
-**Resumable.** If the run is interrupted (Ctrl-C, network blip, OOM), just run `docgraph wiki` again — modules whose page is already on disk are skipped without an LLM call. Pass `--force` to rebuild every page from scratch.
-
-Uses the **same LLM config as `docgraph index --llm-model`**. All `DOCGRAPH_LLM_*` env vars are honored too.
-
-**All flags are optional.** Like `docgraph index`'s LLM-docstring path, the only one you typically pass is `--llm-model` (most local servers reject unknown model names). Everything else has a working default.
+Generate (or rebuild) an LLM-grounded wiki. Resumable — re-running skips modules already on disk; `--force` rebuilds every page.
 
 | Flag | Default | Description |
 |---|---|---|
-| `--module STR`, `-m STR` *(optional)* | unset (all) | Build only the named top-level module. |
-| `--llm-host STR` *(optional)* | `localhost` (or `$DOCGRAPH_LLM_HOST`) | Host running the local LLM server. |
-| `--llm-port INT` *(optional)* | `1235` (or `$DOCGRAPH_LLM_PORT`) | Local LLM server port. |
-| `--llm-model STR` *(optional)* | `qwen3.6-35b` (or `$DOCGRAPH_LLM_MODEL`) | Model name your local server expects. Override if your server uses a different identifier (`local-model`, `gpt-oss-20b`, etc.). |
-| `--llm-format STR` *(optional)* | `openai` (or `$DOCGRAPH_LLM_FORMAT`) | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
-| `--llm-max-tokens INT` *(optional)* | `4096` (or `$DOCGRAPH_LLM_MAX_TOKENS`) | Per-call token budget. Generous default so deeply-nested module pages have room. Reasoning models still get `reasoning_effort=none` so they don't burn the budget on thinking. |
-| `--depth INT`, `-d INT` *(optional)* | `12` | Max directory levels to bucket files by when generating one page per folder. `1` = top-level only (old behavior); the default `12` produces one page per leaf folder for any reasonable repo. Inherits the same ignore list as `docgraph index` (no pages for `node_modules/` / `.venv/` / ecosystem build dirs). |
-| `--force`, `-f` *(optional)* | off | Rebuild every page from scratch. Default is resumable: skip modules whose page is already on disk. |
+| `--module STR`, `-m` | unset (all) | Build only the named top-level module |
+| `--llm-host STR` | `localhost` | LLM server host |
+| `--llm-port INT` | `1235` | LLM server port |
+| `--llm-model STR` | `qwen3.6-35b` | Model name your local server expects |
+| `--llm-format STR` | `openai` | `openai` or `anthropic` |
+| `--llm-max-tokens INT` | `4096` | Per-call token budget. Reasoning models still get `reasoning_effort=none`. |
+| `--llm-prompt-wiki-file PATH` | unset | Custom wiki output-format tail |
+| `--depth INT`, `-d` | `12` | Max directory levels to bucket files by. `1` = top-level only; `12` = one page per leaf folder. |
+| `--force`, `-f` | off | Rebuild every page from scratch |
 
-API equivalents (used by the Web UI's "Build wiki" button):
+API equivalents:
 
 ```
-GET  /api/wiki/list                                # list of pages [{slug, title, module, summary}]
+GET  /api/wiki/list                                # [{slug, title, module, summary}]
 GET  /api/wiki/page?slug=<slug>                    # full Markdown body + facts JSON
-POST /api/wiki/build  {"module": "X"?, "force": true?}  # rebuild all (or one module). Resumable by default; pass force=true to redo every page.
+POST /api/wiki/build  {"module": "X"?, "force": true?}
 ```
 
 ### `docgraph clear [path]`
@@ -232,63 +211,19 @@ Delete `.docgraph/` for the repo (DB + cache + repos list).
 
 | Flag | Default | Description |
 |---|---|---|
-| `--yes`, `-y` *(optional)* | `false` | Skip the confirmation prompt |
+| `--yes`, `-y` | `false` | Skip the confirmation prompt |
 
 ### `docgraph install-mcp [path]`
 
-Print a JSON snippet ready to paste into Cursor / Claude Desktop's MCP config. No flags.
+Print a JSON snippet ready to paste into Cursor / Claude Desktop's MCP config.
 
-### `docgraph docs add <url>`
+### `docgraph docs add <url>` / `docs list` / `docs remove <url>`
 
-Fetch a URL, chunk + embed it, store as `Doc` nodes for `search_docs`. Idempotent: re-adding the same URL deletes prior chunks first.
-
-| Flag | Default | Description |
-|---|---|---|
-| `--path PATH` | cwd | Repo whose `.docgraph/` to write the doc nodes into |
-
-### `docgraph docs list`
-
-Show ingested doc URLs and their chunk counts.
-
-| Flag | Default | Description |
-|---|---|---|
-| `--path PATH` | cwd | Repo to query |
-
-### `docgraph docs remove <url>`
-
-Delete all chunks for a previously-ingested doc URL.
-
-| Flag | Default | Description |
-|---|---|---|
-| `--path PATH` | cwd | Repo to operate on |
+Fetch a URL, chunk + embed it, store as `Doc` nodes for `search_docs`. Idempotent. `--path PATH` (default cwd) selects which repo's `.docgraph/` to write to.
 
 ### `docgraph version`
 
-Print version. No flags.
-
-### Environment variables
-
-| Var | Used by | Default |
-|---|---|---|
-| `DOCGRAPH_HOST` | `host`, `serve`, `mcp` (http) | `127.0.0.1` |
-| `DOCGRAPH_PORT` | `host`, `serve`, `mcp` (http) | `5500` |
-| `DOCGRAPH_EMBED_MODEL` | `index` | `BAAI/bge-small-en-v1.5` |
-| `DOCGRAPH_GPU` | `index`, `host`, `serve`, `mcp`, `watch`, `docs add` | unset (off). Set to `1`/`true` to use GPU for embeddings via ONNX Runtime. If a DirectML / CUDA session is poisoned mid-inference (e.g. another process saturating the GPU), the embedder transparently falls back to CPU and continues. |
-| `DOCGRAPH_LLM_MODEL` | `index`, `wiki` | unset for `index` (off — setting this enables LLM-augmented docstrings); `qwen3.6-35b` for `wiki`. |
-| `DOCGRAPH_LLM_DOCSTRINGS` | `index` | unset. Set to `1`/`true` to enable explicitly (rarely needed; setting `DOCGRAPH_LLM_MODEL` is enough). |
-| `DOCGRAPH_LLM_HOST` | `index`, `wiki` | `localhost` |
-| `DOCGRAPH_LLM_PORT` | `index`, `wiki` | `1235` |
-| `DOCGRAPH_LLM_FORMAT` | `index`, `wiki` | `openai` |
-| `DOCGRAPH_LLM_API_KEY` | `index`, `wiki` | unset. If set, sent as `Authorization: Bearer …` (OpenAI) or `x-api-key: …` (Anthropic). |
-| `DOCGRAPH_LLM_MAX_TOKENS` | `index`, `wiki` | `150` for `index` (one sentence); `600` for `wiki` (one page). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3 / DeepSeek-R1) skip thinking and fit in these budgets. |
-| `DOCGRAPH_LLM_TIMEOUT` | `index`, `wiki` | `60` (seconds) |
-| `DOCGRAPH_LLM_PROMPT_DOCSTRING` / `_FILE` | `index` | unset. Override (literal text or file path) for the docstring template. Must keep the `{kind}` / `{name}` / `{language}` / `{body}` placeholders. Falls back to the default if the override is malformed. |
-| `DOCGRAPH_LLM_PROMPT_WIKI` / `_FILE` | `wiki` | unset. Override (literal text or file path) for the wiki **"Output format"** tail. No placeholders required — the rendered fact sheet sits above it. |
-| `DOCGRAPH_INDEX_DOCUMENTS` | `index` | unset. Set to `1`/`true` to enable the tier-2 / tier-3 document pass without passing `--documents`. |
-| `DOCGRAPH_TEXT_EXTS` | `index` | comma-separated; default `md,markdown,txt,rst,csv`. Implies the document pass. |
-| `DOCGRAPH_ASSET_EXTS` | `index` | comma-separated; default `pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…`. Implies the document pass. |
-
-CLI flags override env vars. Env vars set defaults that survive across invocations.
+Print version.
 
 ## MCP install (Cursor / Claude Desktop)
 
@@ -313,43 +248,43 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 
 | Tool | What it returns |
 |---|---|
-| `search(query, kind?, limit=10, focus_file?, focus_symbol?)` | Hybrid vector + name + PageRank. Pass a focus → personalized PageRank biases ranking toward what the agent is reading |
+| `search(query, kind?, limit=10, focus_file?, focus_symbol?, rerank?)` | Hybrid vector + name + PageRank. `focus_*` → personalized PageRank; `rerank=True` → cross-encoder pass over the top candidates. |
 | `definition(name, file?)` | Full body + metadata of a symbol |
 | `references(name)` | All callers / usages |
 | `call_graph(name, depth=2)` | Forward + backward call graph (depth 1–5) |
 | `file_map(file)` | Entities + outgoing imports for a file |
-| `neighborhood(name, limit=10)` | PageRank-ranked related code via calls + similarity + tests + inheritance — the "what else should I read?" tool |
-| `explore(seeds, hops=3, limit=25)` | Multi-hop BFS subgraph from one or more seed names. Replaces chained `neighborhood` calls |
-| `impact_of(target, depth=3)` | Blast radius: transitive callers, importers, co-changed files, and tests for a file or symbol |
-| `test_impact(target)` | Tests that exercise `target` (file or symbol) via TESTS + reverse `CALLS*` |
-| `cypher(query, limit=100)` | Read-only Cypher escape hatch for power agents. Rejects writes, caps rows |
-| `git_changes(ref?)` | Diff-aware retrieval. `ref`: None (working tree), `HEAD`, `main` (branch vs main), `<sha>`. Returns files + entities + 1-hop callers. Mirrors Cursor `@Commit` / `@PR` / `@Recent Changes` |
-| `git_blame(file, line_start, line_end?)` | `git blame` per line. Mirrors Cursor Blame |
+| `neighborhood(name, limit=10)` | PageRank-ranked related code via calls + similarity + tests + inheritance |
+| `explore(seeds, hops=3, limit=25)` | Multi-hop BFS subgraph from seed names |
+| `impact_of(target, depth=3)` | Blast radius: transitive callers, importers, co-changed files, tests |
+| `test_impact(target)` | Tests that exercise `target` via `TESTS` + reverse `CALLS*` |
+| `cypher(query, limit=100)` | Read-only Cypher escape hatch. Rejects writes, caps rows |
+| `git_changes(ref?)` | Diff-aware retrieval. `ref` = None / `HEAD` / `main` / `<sha>`. Returns files + entities + 1-hop callers |
+| `git_blame(file, line_start, line_end?)` | `git blame` per line |
 | `git_recent(file?, limit=20)` | Recent commits, optionally scoped to a file |
-| `rules_for(file)` | Auto-attach rules for a file: matches `.cursor/rules/*.mdc` by glob, plus `AGENTS.md` / `CLAUDE.md` always-on. Drop in existing Cursor `.mdc` rules and they work here |
-| `search_docs(query, limit=10)` | Semantic search across ingested external docs (`docgraph docs add <url>`). Cursor `@Docs` parity |
-| `search(..., rerank=True)` | Cross-encoder rerank (Jina tiny, ~33 MB) over the top candidates for token-level precision. Opt-in; first call downloads the model |
+| `rules_for(file)` | Auto-attach rules: `.cursor/rules/*.mdc` glob match + `AGENTS.md` / `CLAUDE.md` always-on |
+| `search_docs(query, limit=10)` | Semantic search across ingested external docs (`docgraph docs add <url>`) |
+| `list_roots()` | `[{slug, path, default, watching, last_indexed_at}, …]` |
 
 ## Relationships extracted
 
 | Tier | Edges |
 |---|---|
-| **Structural** | `CONTAINS`, `IMPORTS` (file → file or module), `IMPORTS_SYMBOL` (file → specific Class / Function imported by name, e.g. Python `from x import Y`, JS/TS `import {Y} from "x"`) |
-| **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_` (now also `File` / `Doc` / `Function` / `Class` → `Asset` when the document pass is enabled), `RETURNS` |
-| **Type system** | `INHERITS`, `IMPLEMENTS`, `OVERRIDES` (child→parent method via inheritance closure), `DECORATED_BY` |
+| **Structural** | `CONTAINS`, `IMPORTS`, `IMPORTS_SYMBOL` (file → specific Class / Function imported by name) |
+| **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_` (also `File`/`Doc`/`Function`/`Class` → `Asset` when `--documents`), `RETURNS` |
+| **Type system** | `INHERITS`, `IMPLEMENTS`, `OVERRIDES` (child→parent method via the inheritance closure), `DECORATED_BY` |
 | **Differentiators** | `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic name match) |
 
-Nodes: `File`, `Module`, `Class`, `Function`, `Variable`, `Chunk`, `Doc`, plus `Asset` (when `--documents` is on — metadata-only nodes for binary / heavy files like `.pdf` / `.xlsx` / `.png` / `.parquet`). `Function` and `Class` carry an embedding and a PageRank score; `Doc` and `Chunk` carry embeddings; `Asset` is metadata-only.
+Nodes: `File`, `Module`, `Class`, `Function`, `Variable`, `Chunk`, `Doc`, plus `Asset` (when `--documents` is on). `Function` / `Class` carry an embedding + PageRank score; `Doc` / `Chunk` carry embeddings; `Asset` is metadata only.
 
 ## Document + asset indexing (opt-in)
 
-`docgraph index --documents` (or `DOCGRAPH_INDEX_DOCUMENTS=1`) adds two extra tiers on top of the code graph:
+`docgraph index --documents` adds two extra tiers on top of the code graph:
 
-- **Tier 2 — text docs.** `.md` / `.markdown` / `.txt` / `.rst` and small CSVs (≤1 MiB) get extracted with stdlib only (no pypdf / openpyxl / python-docx), chunked, embedded, and stored as `Doc` rows whose `source` is the repo-relative path. They show up in `search_docs` alongside `@Docs add <url>` rows; the same MCP tool serves both.
-- **Tier 3 — binary / heavy assets.** `.pdf` / `.xlsx` / `.docx` / `.png` / `.mp4` / `.parquet` / fonts / archives / 3D meshes / installers become `Asset` nodes — metadata only (path / ext / size / mime). No content extraction.
-- **`REFERENCES_` edges.** After both tiers populate, DocGraph scans every code and doc file for path-shaped references and emits edges from `File` / `Doc` / `Function` / `Class` to the matching `Asset`. Format-aware: Markdown link / embed syntax, HTML `src=` / `href=`, code matches only inside quoted string literals with a real extension. So `cypher("MATCH (a:Asset)<-[:REFERENCES_]-(n) WHERE a.path CONTAINS 'logo' RETURN n.path")` answers "where is this image used?" as a graph query.
+- **Tier 2 — text Docs.** `.md` / `.markdown` / `.txt` / `.rst` and small CSVs (≤ 1 MiB) extracted with stdlib only (no pypdf / openpyxl / python-docx), chunked, embedded, stored as `Doc(source=<repo-relative-path>, …)`. Surfaced through `search_docs`.
+- **Tier 3 — binary / heavy Assets.** `.pdf` / `.xlsx` / `.docx` / `.png` / `.mp4` / `.parquet` / fonts / archives / 3D meshes / installers become `Asset` nodes — metadata only.
+- **`REFERENCES_` edges.** Format-aware path scan emits edges from `File` / `Doc` / `Function` / `Class` to matching Assets. So `cypher("MATCH (a:Asset)<-[:REFERENCES_]-(n) WHERE a.path CONTAINS 'logo' RETURN n.path")` answers "where is this image used?" as a graph query.
 
-Idempotent — re-runs drop the file-tier `Doc` and `Asset` rows (and their edges) first; URL-tier `Doc` rows from `@Docs add` are preserved.
+Idempotent — re-runs drop the file-tier `Doc` and `Asset` rows first; URL-tier `Doc` rows from `@Docs add` are preserved.
 
 ## Languages bundled
 
@@ -361,32 +296,36 @@ Adding more is two steps:
 pip install tree-sitter-<lang>
 ```
 
-then add an entry to `LANGUAGES` and a query to `TAGS_QUERIES` in `docgraph/parse.py`. Most grammars work with the standard `(function_definition name: (_) @name) @definition.function` shape.
+then add an entry to `LANGUAGES` and a query to `TAGS_QUERIES` in `docgraph/parse.py`.
 
 ## Architecture
 
 ```
 docgraph/
-  cli.py             # typer entry: host (unified) / index / serve / mcp / watch / stats / wiki / clear / install-mcp
+  cli.py             # typer entry: host (unified) / index / serve / mcp / watch / stats / wiki / clear
   workspace.py       # registry of registered roots — one host serves N roots, dynamic enum from slugs
-  config.py          # auto-detect repo root, .gitignore, .docgraphignore
+  config.py          # load_config(repo_root, **overrides) — fully kwarg-driven; no env vars
   parse.py           # tree-sitter universal parser (per-language tags queries)
   index.py           # parallel pipeline + per-file delta updates
-  db.py              # Kuzu schema (5 node tables, 13 edge tables) + bulk insert
-  embed.py           # fastembed wrapper (BGE-small ONNX, 384-dim) + GPU→CPU recovery on ORT Fail
+  db.py              # Kuzu schema + bulk insert (COPY FROM arrow)
+  embed.py           # fastembed wrapper + GPU→CPU recovery on ORT Fail
   rank.py            # PageRank over call + reference + inheritance graph
   retrieve.py        # hybrid retrieval (vector cosine + name boost + PageRank)
-  mcp_tools.py       # 15 MCP tools + list_roots, all carrying a closed-enum `root` parameter
-  mcp_stdio_proxy.py # strict stdio↔HTTP proxy for editors (Cursor, Claude Desktop)
-  server.py          # FastAPI host: web UI + JSON API + SSE + FastMCP mounted at /mcp
-  watch.py           # per-root async awatch tasks; one workspace-wide reindex semaphore
-  wiki.py            # LLM-grounded module wiki (per-leaf-folder pages, resumable)
+  rerank.py          # lazy Jina cross-encoder (~33 MB), GPU-capable
+  llm.py             # urllib client + set_docstring_prompt(text) override
+  mcp_tools.py       # 15 MCP tools + list_roots, all with closed-enum `root`
+  mcp_stdio_proxy.py # strict stdio↔HTTP proxy for editors
+  server.py          # FastAPI host: web UI + JSON API + SSE + FastMCP at /mcp
+  watch.py           # per-root async awatch; one workspace-wide reindex semaphore
+  wiki.py            # LLM-grounded module wiki + set_wiki_prompt_tail(text) override
   ui/index.html      # single-page force-directed canvas viewer (zero deps)
 ```
 
 Data lives at `<repo>/.docgraph/`:
 - `graph.kuzu/` — the embedded DB
 - `cache.json` — per-file `{hash, entities, edges}` for delta updates
+- `wiki/` — generated module pages
+- `llm_docstrings.json` — body-hash-keyed cache of generated docstrings
 
 ## How incremental works
 
@@ -400,94 +339,75 @@ Data lives at `<repo>/.docgraph/`:
 
 ## JSON API (when running `docgraph host`)
 
-Every retriever route accepts a `root=<slug>` query parameter. The slug is one of those returned by `GET /api/roots`; on a single-root host it has one value and is the default, so callers can omit it.
+Every retriever route accepts a `root=<slug>` query parameter. The slug is one of those returned by `GET /api/roots`; on a single-root host it has one value and is the default.
 
 | Endpoint | Notes |
 |---|---|
 | `GET /` | The web UI |
-| `GET /api/roots` | Discover registered roots: `[{slug, path, default, watching, last_indexed_at}, …]`. The closed `root` enum on every other route is built from this list at host startup. |
-| `POST /api/admin/index` (`{full?: bool}`) | In-process incremental (or `full=true`) reindex via the workspace's writer-lock dance. Lets external supervisors trigger a reindex without spawning a parallel `docgraph index` subprocess that would fight Kuzu's exclusive writer lock. Response is `{slug, full, stats, log}` where `log` is the captured Rich progress transcript. |
-| `POST /api/admin/clear` | Wipe a root's index. Drops the Kuzu DB + per-file delta cache + generated wiki dir so the next index pass is treated as a clean full rebuild. Same writer-lock dance as `/api/admin/index`. Broadcasts a `reindex_done {events: -1}` SSE so the UI snaps back to an empty state. |
+| `GET /api/roots` | `[{slug, path, default, watching, last_indexed_at}, …]` |
+| `POST /api/admin/index` (`{full?: bool}`) | In-process incremental (or `full=true`) reindex via the workspace's writer-lock dance. Response: `{slug, full, stats, log}`. |
+| `POST /api/admin/clear` | Wipe a root's index (DB + cache + wiki). Broadcasts a `reindex_done {events: -1}` SSE. |
+| `POST /api/admin/cancel` | Cancel an in-flight `/api/admin/index` or `/api/wiki/build`. Returns 499 on the long-op. |
 | `GET  /api/docs/list` | Cursor `@Docs` parity readout — every URL ingested into this root with chunk counts. |
-| `POST /api/docs/add`  (`{url}`) | Fetch the URL, chunk + embed, store as `Doc` rows. Idempotent (re-adding the same URL deletes prior chunks first). Reuses the host's writer connection so it doesn't fight `/api/admin/index`. |
-| `POST /api/docs/remove` (`{url}`) | Delete every `Doc` chunk for a previously-ingested URL. Returns `{url, removed_chunks}`. |
-| `POST /mcp` (and friends) | Mounted FastMCP HTTP transport — same tool surface as `docgraph mcp --transport http`, just on the host's port instead of a separate process. |
+| `POST /api/docs/add`  (`{url}`) | Fetch + chunk + embed a URL. Idempotent. Reuses the host's writer connection. |
+| `POST /api/docs/remove` (`{url}`) | Delete every `Doc` chunk for a URL. Returns `{url, removed_chunks}`. |
+| `POST /mcp` | Mounted FastMCP HTTP transport |
 | `GET /api/search?q=...&kind=...&limit=10` | Same as the MCP tool |
-| `GET /api/definition?name=...&file=...` | |
-| `GET /api/references?name=...` | |
-| `GET /api/call_graph?name=...&depth=2` | |
-| `GET /api/file_map?file=...` | |
-| `GET /api/neighborhood?name=...&limit=10` | |
-| `GET /api/graph?limit_nodes=2000` | All nodes + edges for the viewer |
-| `GET /api/stats` | Entity counts + table list |
-| `GET /api/file_content?file=...` | Source text for inspection (sandboxed to repo root; redacts `.cursorignore`'d files) |
-| `GET /api/git_changes?ref=...` | Diff-aware retrieval |
-| `GET /api/git_blame?file=...&line_start=&line_end=` | `git blame` |
-| `GET /api/git_recent?file=...&limit=` | Recent commits |
-| `GET /api/rules_for?file=...` | Auto-attach rules matching the file |
-| `GET /api/search_docs?q=...&limit=` | Semantic search over ingested external docs |
-| `GET /api/explore?seeds=a,b&hops=&limit=` | Multi-hop subgraph from seeds |
-| `GET /api/impact_of?target=...&depth=&limit=` | Blast radius |
-| `GET /api/test_impact?target=...&limit=` | Tests covering target |
+| `GET /api/{definition,references,call_graph,file_map,neighborhood,explore,impact_of,test_impact,git_changes,git_blame,git_recent,rules_for,search_docs}` | All MCP retriever tools as REST GETs |
 | `POST /api/cypher` (`{query, limit}`) | Read-only Cypher |
-| `GET /api/processes?limit=&max_chain_len=` | Detected entry-point → call chains. Used by the **Processes** tab. |
-| `GET /api/wiki/list` | List of generated wiki pages (`{slug, title, module, summary}`). |
-| `GET /api/wiki/page?slug=...` | Markdown body + facts JSON for one page. |
-| `POST /api/wiki/build` (`{module?: "X", force?: true}`) | Rebuild all (or one module's) wiki page. Resumable: skips modules already on disk unless `force=true`. Uses the same LLM config as `docgraph index --llm-model` via `DOCGRAPH_LLM_*` env vars. |
-| `GET /api/events` | Server-Sent Events stream. Emits `reindex_done` after every reindex when running under `docgraph watch --serve`; the bundled UI uses it to auto-refresh. Sends keepalive comments every 15 s. |
+| `GET /api/graph?limit_nodes=2000` | All nodes + edges for the viewer |
+| `GET /api/stats` | Entity counts + per-edge-table counts |
+| `GET /api/file_content?file=...` | Source text for inspection (sandboxed; redacts `.cursorignore`'d files) |
+| `GET /api/processes?limit=&max_chain_len=` | Detected entry-point → call chains |
+| `GET /api/wiki/list`, `?slug=`, `POST /api/wiki/build` | Wiki pages (resumable; `force=true` rebuilds) |
+| `GET /api/events` | SSE stream. Emits `reindex_done` after every reindex; the bundled UI uses it to auto-refresh. Keepalive every 15 s. |
 
 ## Comparison
 
 | | DocGraph | GitNexus | Codebase-Memory | Cursor | Greptile | Sourcegraph (Cody) | Continue.dev |
 |---|---|---|---|---|---|---|---|
-| License | MIT | open | open | proprietary | proprietary SaaS | Apache 2 (self-host) | Apache 2 |
-| Runs fully local | ✅ | ✅ | ✅ | partial (cloud-augmented) | ❌ (cloud only) | ✅ (self-hosted) | ✅ |
+| License | MIT | open | open | proprietary | proprietary SaaS | Apache 2 | Apache 2 |
+| Runs fully local | ✅ | ✅ | ✅ | partial | ❌ (cloud) | ✅ (self-hosted) | ✅ |
 | Embedded store | Kuzu (graph + vectors) | KuzuDB / LadybugDB | SQLite | proprietary | cloud | Postgres + cloud index | LanceDB / SQLite |
-| Languages day 1 | 17 (tree-sitter) | many | 66 | many | many | many (SCIP) | many (tree-sitter) |
-| Live graph UI | force-directed canvas + Web Worker physics | Mermaid (static) | ❌ | ❌ | ❌ | partial (call-graph view) | ❌ |
+| Live graph UI | force-directed canvas + Web Worker physics | Mermaid (static) | ❌ | ❌ | ❌ | partial | ❌ |
 | Per-file incremental | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | Personalized PageRank | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
 | Cross-encoder rerank | ✅ (opt-in) | ❌ | ❌ | ❌ | ✅ | ❌ | ❌ |
-| `SIMILAR_TO` edge | ✅ | implicit | ❌ | implicit | implicit | ❌ | implicit |
-| `CO_CHANGED_WITH` edge | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
-| `TESTS` edge | ✅ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ |
+| `SIMILAR_TO` / `CO_CHANGED_WITH` / `TESTS` edges | ✅ | implicit/❌/❌ | ❌ | implicit/❌/❌ | implicit/❌/❌ | ❌ | implicit/❌/❌ |
 | Diff-aware retrieval | ✅ (`git_changes`) | ❌ | ❌ | partial (`@Commit`) | ❌ | ❌ | ❌ |
 | Cursor-rules ingest | ✅ (`.mdc` + `AGENTS.md`) | ❌ | ❌ | native | ❌ | ❌ | ❌ |
 | Optional LLM docs | ✅ (local OpenAI/Anthropic-compat) | ❌ | ❌ | ❌ | ✅ (cloud) | ❌ | partial |
-| Live UI auto-redraw | ✅ (SSE on reindex) | ❌ | ❌ | n/a (IDE) | n/a | ❌ | n/a |
 | Read-only Cypher escape hatch | ✅ | ❌ | ❌ | ❌ | ❌ | partial (GraphQL) | ❌ |
 | MCP tools | 15 | 7 | 14 | n/a (IDE) | yes | via plugins | via plugins |
 | Install | `pipx install` | manual | manual | proprietary IDE | hosted SaaS | self-host stack | binary |
 
-> Aider, Bloop, OpenGrok, and CodeQL are adjacent but solve different problems (in-terminal pair-programming, semantic code search without graph, security analysis) and are omitted to keep the table focused on local code-graph tools.
-
 ## Multi-root
 
-A single `docgraph host` process can serve any number of independently-indexed repos at once. Each registered root has its own `.docgraph/graph.kuzu`; the host opens a per-root read-only connection at startup, and every MCP tool / JSON route accepts a closed-enum `root=<slug>` argument so the LLM picks the right one per call.
+A single `docgraph host` process can serve any number of independently-indexed repos. Each registered root has its own `.docgraph/graph.kuzu`; the host opens a per-root read-only connection at startup, and every tool / route accepts a closed-enum `root=<slug>` argument.
 
 ```bash
-docgraph index /path/to/repo-a                           # build the index for each repo first
+docgraph index /path/to/repo-a
 docgraph index /path/to/repo-b
 docgraph host --root /path/to/repo-a --root /path/to/repo-b   # one process, one port
 docgraph host --root /path/to/repo-a --watch /path/to/repo-a  # also reindex repo-a on file change
 ```
 
-The workspace is **immutable for a host's lifetime** — adding or removing a root requires a host restart. That's deliberate: it keeps the closed-enum schema valid for the entire process and avoids hot-reload races.
+The workspace is **immutable for the host's lifetime** — adding/removing a root requires a host restart. Deliberate: keeps the closed-enum schema valid for the whole process.
 
-A different concept lives one layer down: `docgraph index --repo` lets the **indexer** walk multiple sibling paths into **one** `.docgraph/graph.kuzu` (useful for monorepos). The two shapes can coexist — a host can register one root whose Config carries `extra_roots`.
+A different concept lives one layer down: `docgraph index --repo` lets the **indexer** walk multiple sibling paths into ONE `.docgraph/graph.kuzu` (useful for monorepos). The two shapes can coexist.
 
-In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/src/foo.py`) so they stay unique. Cross-repo `IMPORTS` resolve naturally through the existing fuzzy import matcher.
+In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/src/foo.py`) so they stay unique.
 
 ## Tests
 
 ```bash
 pip install pytest
-pytest                   # ~70s, ~295 tests
+pytest                   # ~90s, ~250 tests
 ```
 
-Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked end-to-end), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, Variable-node round-trip + delete cascade, the `Workspace` registry's 4-step `resolve()` + writer-lock round-trip, the GPU→CPU embedder fallback on a poisoned ORT session, every CLI flag telecode passes (`--workers`, `--gpu`, `--llm-*`, `--documents`, etc.), and the document/asset pass (text-tier embedding + asset registration + `REFERENCES_` reference scan).
+Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, Variable round-trip + delete cascade, the `Workspace` registry's `resolve()` + writer-lock round-trip, the GPU→CPU embedder fallback on a poisoned ORT session, every CLI flag telecode passes, the document/asset pass, and the env-free contract (`DOCGRAPH_*` env vars must not affect Config).
 
-Live LLM tests (`tests/test_llm_live.py`) auto-skip unless an OpenAI-compatible server is reachable at `localhost:1235` with `qwen3.6-35b` loaded. Override host/port/model via `DOCGRAPH_LLM_TEST_HOST` / `DOCGRAPH_LLM_TEST_PORT` / `DOCGRAPH_LLM_TEST_MODEL`.
+Live LLM tests (`tests/test_llm_live.py`) auto-skip unless an OpenAI-compatible server is reachable at `localhost:1235` with `qwen3.6-35b` loaded.
 
 ## License
 
