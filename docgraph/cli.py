@@ -113,6 +113,15 @@ def index(
              "`reasoning_effort=none` so reasoning models (Qwen3 / "
              "DeepSeek-R1) skip thinking and fit in this budget.",
     ),
+    llm_docstrings: bool = typer.Option(
+        False, "--llm-docstrings/--no-llm-docstrings",
+        help="Use the LLM to generate docstrings during indexing. "
+             "Off by default — must be enabled explicitly.",
+    ),
+    llm_wiki: bool = typer.Option(
+        False, "--llm-wiki/--no-llm-wiki",
+        help="Use the LLM when building wiki pages. Off by default.",
+    ),
     gpu: bool = typer.Option(
         False, "--gpu",
         help="Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML). "
@@ -182,7 +191,7 @@ def index(
         extra_roots=repo if repo else None,
         gpu=gpu,
         embedding_model=embed_model or "BAAI/bge-small-en-v1.5",
-        llm_docstrings=bool(llm_model),
+        llm_docstrings=llm_docstrings,
         llm_host=llm_host,
         llm_port=llm_port,
         llm_model=llm_model or "qwen3.6-35b",

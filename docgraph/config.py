@@ -305,10 +305,9 @@ def load_config(
 ) -> Config:
     """Build a Config from explicit kwargs.
 
-    Every knob is a parameter — no DOCGRAPH_* env vars are read. Setting
-    `llm_model` to a non-default value implies `llm_docstrings=True`
-    (kept for parity with the historical "set the model = enable the
-    feature" behaviour); pass `llm_docstrings=False` to override.
+    Every knob is a parameter — no DOCGRAPH_* env vars are read. Both
+    `llm_docstrings` and `llm_wiki` must be enabled explicitly (setting
+    `llm_model` alone does not enable them).
 
     `extra_roots`, when given, overrides any persisted list and is saved
     to .docgraph/repos.json.

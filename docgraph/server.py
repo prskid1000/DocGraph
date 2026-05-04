@@ -672,9 +672,11 @@ def make_app(workspace: Workspace) -> FastAPI:
             file = str(ctx.get("file") or "")
             lang = str(ctx.get("language") or "")
             snippet = str(ctx.get("snippet") or "")[:4000]
+            summary = str(ctx.get("summary") or "")
+            summary_part = f"\nAI Summary: {summary}" if summary else ""
             sys_note = (
                 f"You are answering questions about a code entity in the user's repo.\n"
-                f"Entity: `{name}` ({file})\n"
+                f"Entity: `{name}` ({file}){summary_part}\n"
                 f"```{lang}\n{snippet}\n```"
             )
             messages = [{"role": "system", "content": sys_note}] + list(messages)

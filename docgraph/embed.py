@@ -80,11 +80,22 @@ def dim_for_model(model_name: str, default: int = 384) -> int:
 
 
 def resolve_providers(gpu: bool) -> list | None:
-    """ORT provider list when GPU is enabled, else None (= CPU). Adapter
-    selection on Windows hybrid graphics is handled at the OS level via
-    the per-app `GpuPreference=2` registry value (telecode writes this
-    when spawning the host); no in-package device-id pinning is needed."""
-    return list(GPU_PROVIDERS) if gpu else None
+    """ORT provider list when GPU is enabled, else None (= CPU). Filters
+    the requested providers against what's actually installed so ORT
+    doesn't waste time (and log warnings) trying unavailable providers.
+    Uses the same filtering logic as Embedder._available_providers()."""
+    if not gpu:
+        return None
+    try:
+        import onnxruntime as ort
+        available = set(ort.get_available_providers())
+        kept = [p for p in GPU_PROVIDERS if p in available]
+        # If only CPU remains, return [] so fastembed takes its default path
+        if kept == ["CPUExecutionProvider"]:
+            return []
+        return kept
+    except Exception:
+        return list(GPU_PROVIDERS)
 
 
 class Embedder:

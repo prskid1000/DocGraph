@@ -92,14 +92,13 @@ def _facts_for_module(db: GraphDB, module: str, files: list[str]) -> dict:
             log.debug("wiki query failed: %s", e)
             return []
 
-    # Top classes / functions in this module by PageRank. We pull `body` and
-    # use its first non-empty line as a doc snippet — the schema doesn't have
-    # a separate docstring column.
+    # Top classes / functions in this module by PageRank. Use the AI-generated
+    # llm_doc if available; otherwise fall back to the first line of the body.
     top_classes = _safe(
         "MATCH (c:Class) WHERE c.file IN $files "
         "RETURN c.name AS name, c.qname AS qname, c.file AS file, "
         "c.line_start AS line, coalesce(c.pagerank, 0.0) AS pagerank, "
-        "c.body AS body "
+        "c.body AS body, c.llm_doc AS llm_doc "
         "ORDER BY pagerank DESC LIMIT 8",
         {"files": files},
     )
@@ -107,16 +106,20 @@ def _facts_for_module(db: GraphDB, module: str, files: list[str]) -> dict:
         "MATCH (f:Function) WHERE f.file IN $files "
         "RETURN f.name AS name, f.qname AS qname, f.file AS file, "
         "f.line_start AS line, coalesce(f.pagerank, 0.0) AS pagerank, "
-        "f.body AS body "
+        "f.body AS body, f.llm_doc AS llm_doc "
         "ORDER BY pagerank DESC LIMIT 12",
         {"files": files},
     )
     # Body → first interesting line as a doc-ish snippet
     for r in (*top_classes, *top_functions):
-        b = (r.get("body") or "").strip().splitlines()
-        snippet = next((ln.strip(' "\'') for ln in b if ln.strip() and not ln.strip().startswith(("def ", "class ", "@"))), "")
-        r["doc"] = snippet[:160]
+        if r.get("llm_doc"):
+            r["doc"] = r["llm_doc"]
+        else:
+            b = (r.get("body") or "").strip().splitlines()
+            snippet = next((ln.strip(' "\'') for ln in b if ln.strip() and not ln.strip().startswith(("def ", "class ", "@"))), "")
+            r["doc"] = snippet[:160]
         r.pop("body", None)
+        r.pop("llm_doc", None)
     # What this module imports (external modules / files outside it). Note: File
     # uses `path`, not `file`, as its locator property.
     imports = _safe(

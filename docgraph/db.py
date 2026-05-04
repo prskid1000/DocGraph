@@ -45,6 +45,7 @@ NODE_DDL = [
         line_end INT64,
         body STRING,
         kind STRING,
+        llm_doc STRING,
         embedding DOUBLE[{dim}],
         pagerank DOUBLE,
         PRIMARY KEY (id)
@@ -60,6 +61,7 @@ NODE_DDL = [
         signature STRING,
         is_method BOOLEAN,
         is_test BOOLEAN,
+        llm_doc STRING,
         embedding DOUBLE[{dim}],
         pagerank DOUBLE,
         PRIMARY KEY (id)

@@ -184,6 +184,11 @@
     .result .snippet { font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
       font-size: 11px; color: var(--fg-dim); margin-top: 6px; max-height: 50px;
       overflow: hidden; white-space: pre-wrap; }
+    .result .summary { font-size: 11px; color: #88a; margin-top: 4px; font-style: italic;
+      line-height: 1.4; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+    .section .summary { font-size: 13px; color: #aab; margin-bottom: 12px; line-height: 1.6;
+      font-style: italic; background: rgba(125,211,252,0.06); padding: 10px 14px; border-radius: 6px;
+      border-left: 3px solid var(--accent-2); }
     .kind-tag { font-size: 9px; padding: 1px 6px; border-radius: 3px; font-weight: 600;
       letter-spacing: 0.04em; text-transform: uppercase; color: #0b0e14; }
     .kind-tag.Function { background: var(--accent); }
@@ -1687,6 +1692,7 @@ function runCommunities(iters){
             x.name,
           ),
           el("div", { className: "meta" }, `${x.file}:${x.line} · score ${x.score.toFixed(2)} · pr ${x.pagerank.toFixed(4)}`),
+          x.llm_doc ? el("div", { className: "summary" }, x.llm_doc) : null,
           x.snippet ? el("div", { className: "snippet" }, x.snippet) : null,
         );
         node.onclick = () => select(x.id, x.name);
@@ -1790,10 +1796,16 @@ function runCommunities(iters){
           actions.appendChild(openBtn);
           head.appendChild(actions);
           defSec.innerHTML = "";
-          defSec.appendChild(section("Definition", el("pre", {}, (d.body || "").slice(0, 6000))));
+          const defBody = el("div");
+          if (d.llm_doc) {
+            defBody.appendChild(el("div", { className: "summary" }, d.llm_doc));
+          }
+          defBody.appendChild(el("pre", {}, (d.body || "").slice(0, 6000)));
+          defSec.appendChild(section("Definition", defBody));
           // Stash the resolved entity for the chat tab's attached-context pill.
           window._dgChatContext = {
-            name: sym, file: d.file, language: d.language || "", snippet: d.body || "",
+            name: sym, file: d.file, language: d.language || "",
+            snippet: d.body || "", summary: d.llm_doc || "",
           };
           if (window._dgUpdateChatAttach) window._dgUpdateChatAttach();
           // Open inspector to the definition's file

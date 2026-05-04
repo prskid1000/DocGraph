@@ -119,7 +119,7 @@ class LLMClient:
                 return self._call_anthropic(prompt)
             return self._call_openai(prompt)
         except (urllib.error.URLError, TimeoutError, ConnectionError) as e:
-            log.debug(f"LLM call failed for {name}: {e}")
+            log.warning(f"LLM call failed for {name}: {e}")
             return ""
         except Exception as e:  # noqa: BLE001
             log.debug(f"LLM unexpected error for {name}: {e}")

@@ -13,6 +13,7 @@ always recomputed because they're cheap and global.
 """
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import logging
@@ -22,7 +23,7 @@ import subprocess
 import threading
 import time
 from collections import defaultdict
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
 from dataclasses import asdict
 from pathlib import Path
 from typing import Callable, TYPE_CHECKING
@@ -158,6 +159,7 @@ class Indexer:
             providers=resolve_providers(cfg.gpu),
         )
         self._next_id = 1
+        self.progress_cb: ProgressCb = None
 
     # ---- ID allocation ----
     def _seed_ids_from_db(self) -> None:
@@ -322,8 +324,13 @@ class Indexer:
             return ent, h, text
 
         n_workers = min(8, max(2, self.cfg.workers))
-        with _bar() as prog:
-            ptask = prog.add_task("LLM docstrings", total=len(targets))
+        total = len(targets)
+        done = 0
+
+        # We use a context manager for the Rich bar if we're in a CLI (no cb)
+        # but if we have a cb, we just use it directly.
+        with _bar() if not self.progress_cb else contextlib.nullcontext() as prog:
+            ptask = prog.add_task("LLM docstrings", total=total) if prog else None
             with ThreadPoolExecutor(max_workers=n_workers) as ex:
                 for ent, h, text in ex.map(_task, targets):
                     if cancel_token is not None:
@@ -332,7 +339,12 @@ class Indexer:
                         if isinstance(ent.extra, dict):
                             ent.extra["llm_doc"] = text
                         cache[h] = text
-                    prog.advance(ptask)
+                    
+                    done += 1
+                    if prog and ptask is not None:
+                        prog.advance(ptask)
+                    if self.progress_cb:
+                        self.progress_cb("llm_augment", done, total)
 
         try:
             cache_path.write_text(json.dumps(cache), encoding="utf-8")
@@ -369,6 +381,7 @@ class Indexer:
     # ---- Main entrypoint ----
     def index_all(self, incremental: bool = True, progress_cb: ProgressCb = None,
                   cancel_token: "CancelToken | None" = None) -> dict:
+        self.progress_cb = progress_cb
         # Cooperative cancel: poll `cancel_token.raise_if_set()` at major
         # phase boundaries. Mid-phase cancellation is unsafe (inside Kuzu
         # COPY or an ONNX embed call would corrupt state); between phases
@@ -564,12 +577,13 @@ class Indexer:
                         "line_end": ent.line_end,
                         "body": ent.body,
                         "kind": ent.kind,
+                        "llm_doc": ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
                         "pagerank": 0.0,
                     }
                     text = build_embedding_text(
                         ent.name, ent.qname, ent.signature, ent.body,
                         fp.language, ent.kind,
-                        llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
+                        llm_doc=row["llm_doc"],
                     )
                     class_plan.append((row, text))
                 elif ent.kind in ("function", "method"):
@@ -589,12 +603,13 @@ class Indexer:
                         "signature": ent.signature or ent.body.split("\n")[0][:200],
                         "is_method": ent.kind == "method",
                         "is_test": is_test,
+                        "llm_doc": ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
                         "pagerank": 0.0,
                     }
                     text = build_embedding_text(
                         ent.name, ent.qname, ent.signature, ent.body,
                         fp.language, ent.kind,
-                        llm_doc=ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
+                        llm_doc=row["llm_doc"],
                     )
                     function_plan.append((row, text))
                 else:

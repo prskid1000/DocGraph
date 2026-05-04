@@ -134,7 +134,7 @@ class Retriever:
             rows = self.db.fetch_all(
                 f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.qname AS qname, "
                 f"n.file AS file, n.line_start AS line_start, n.body AS body, "
-                f"n.embedding AS embedding, n.pagerank AS pagerank"
+                f"n.embedding AS embedding, n.pagerank AS pagerank, n.llm_doc AS llm_doc"
             )
             if not rows:
                 continue
@@ -189,6 +189,7 @@ class Retriever:
                     "file": r["file"],
                     "line": r["line_start"],
                     "snippet": snippet,
+                    "llm_doc": r.get("llm_doc"),
                     "score": float(score),
                     "pagerank": float(pr),
                     "ppr": float(ppr_boost),
@@ -250,7 +251,7 @@ class Retriever:
             for r in self.db.fetch_all(
                 f"MATCH (n:{label}) WHERE {where} "
                 f"RETURN n.id AS id, n.name AS name, n.qname AS qname, "
-                f"n.file AS file, n.line_start AS line, n.body AS body",
+                f"n.file AS file, n.line_start AS line, n.body AS body, n.llm_doc AS llm_doc",
                 params,
             ):
                 r["label"] = label
