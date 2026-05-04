@@ -748,7 +748,7 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.post("/api/docs/add")
     async def api_docs_add(payload: dict, root: RootSlug = DEFAULT):
-        from docgraph.docs import add_doc
+        from docgraph.docs import prepare_doc, store_prepared_doc
         slot = _slot(root)
         url = (payload or {}).get("url", "").strip()
         if not url:
@@ -783,9 +783,18 @@ def make_app(workspace: Workspace) -> FastAPI:
                 pass
 
         def _do() -> dict:
+            prepared = prepare_doc(slot.cfg, url, cancel_token=token, progress_cb=_progress_cb)
+            if prepared.get("error"):
+                return prepared
             writer = workspace.take_writer(slot.cfg.repo_root)
             try:
-                return add_doc(slot.cfg, url, db=writer, cancel_token=token, progress_cb=_progress_cb)
+                return store_prepared_doc(
+                    slot.cfg,
+                    prepared,
+                    db=writer,
+                    cancel_token=token,
+                    progress_cb=_progress_cb,
+                )
             finally:
                 workspace.release_writer(slot.cfg.repo_root)
 

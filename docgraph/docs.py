@@ -143,29 +143,16 @@ def chunk_doc(text: str) -> list[str]:
     return [c for c in chunks if c.strip()]
 
 
-# --- Public API -------------------------------------------------------
+# --- Doc preparation + persistence -----------------------------------
 
 
-from typing import Callable
-
-
-def add_doc(
+def prepare_doc(
     cfg: Config,
     url: str,
-    db: GraphDB | None = None,
     cancel_token: CancelToken | None = None,
     progress_cb: Callable[[str, int, int, str], None] | None = None,
 ) -> dict:
-    """Fetch `url`, chunk, embed, write Doc rows. Replaces any existing Doc
-    rows for the same source URL (so re-running is idempotent).
-
-    Pass an existing writer `db` to reuse it (the host's `/api/docs/add`
-    route does this so it doesn't fight the workspace's writer-lock dance
-    by opening a parallel GraphDB).
-
-    Pass `cancel_token` to make the op cooperatively cancellable. Checkpoints
-    are at safe boundaries (before fetch, after fetch, before embed, before
-    insert) — never mid-embed (ONNX batch) or mid-COPY (Kuzu)."""
+    """Fetch, chunk, and embed a URL before any writer lock is taken."""
     def _ck() -> None:
         if cancel_token is not None:
             cancel_token.raise_if_set()
@@ -190,24 +177,11 @@ def add_doc(
             pass
     _ck()
     if not text.strip():
-        return {"url": url, "chunks": 0, "title": title, "error": "empty body"}
-
-    if db is None:
-        db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
-    db.init_schema()
-
-    # Remove existing chunks for this URL
-    try:
-        db.execute("MATCH (d:Doc) WHERE d.source = $u DETACH DELETE d", {"u": url})
-    except Exception:
-        pass
+        return {"url": url, "title": title, "error": "empty body", "pieces": [], "vecs": []}
 
     pieces = chunk_doc(text)
     _ck()
-    embedder = Embedder(
-        cfg.embedding_model,
-        providers=resolve_providers(cfg.gpu),
-    )
+    embedder = Embedder(cfg.embedding_model, providers=resolve_providers(cfg.gpu))
     if progress_cb:
         try:
             progress_cb("embedding", 0, len(pieces), "starting embed")
@@ -215,14 +189,17 @@ def add_doc(
             pass
     with _bar() as prog:
         task = prog.add_task(f"Embedding doc chunks ({title or url})", total=len(pieces))
+
         def _on_progress(n: int) -> None:
             prog.advance(task, n)
             if progress_cb:
                 try:
-                    # compute current completed from progress bar's completed value
-                    # but we only get deltas; accumulate via closure by reading prog
-                    # use task fields from rich Progress if available; else incrementally send
-                    progress_cb("embedding", int(prog.tasks[task].completed if hasattr(prog.tasks[task], 'completed') else 0), len(pieces), "embedding")
+                    progress_cb(
+                        "embedding",
+                        int(prog.tasks[task].completed if hasattr(prog.tasks[task], "completed") else 0),
+                        len(pieces),
+                        "embedding",
+                    )
                 except Exception:
                     pass
 
@@ -231,43 +208,119 @@ def add_doc(
             batch_size=cfg.embed_batch_size,
             on_progress=_on_progress,
         )
+    return {"url": url, "title": title, "pieces": pieces, "vecs": vecs}
+
+
+def store_prepared_doc(
+    cfg: Config,
+    prepared: dict,
+    db: GraphDB | None = None,
+    cancel_token: CancelToken | None = None,
+    progress_cb: Callable[[str, int, int, str], None] | None = None,
+) -> dict:
+    """Persist a prepared doc payload into the graph DB."""
+    def _ck() -> None:
+        if cancel_token is not None:
+            cancel_token.raise_if_set()
+
     _ck()
-    if progress_cb:
+    if prepared.get("error"):
+        return {
+            "url": prepared.get("url", ""),
+            "title": prepared.get("title", ""),
+            "chunks": 0,
+            "error": prepared["error"],
+        }
+
+    title = str(prepared.get("title") or "")
+    url = str(prepared.get("url") or "")
+    pieces_raw = prepared.get("pieces")
+    vecs_raw = prepared.get("vecs")
+    pieces = list(pieces_raw) if pieces_raw is not None else []
+    vecs = vecs_raw.tolist() if hasattr(vecs_raw, "tolist") else (list(vecs_raw) if vecs_raw is not None else [])
+
+    owns_db = db is None
+    if db is None:
+        db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
+
+    try:
+        db.init_schema()
+
         try:
-            progress_cb("inserting", 0, len(rows), "inserting chunks")
+            db.execute("MATCH (d:Doc) WHERE d.source = $u DETACH DELETE d", {"u": url})
         except Exception:
             pass
 
-    # Continue id allocation past max(id) across all node tables
-    max_id = 0
-    for label in ("File", "Module", "Class", "Function", "Variable", "Chunk", "Doc"):
-        try:
-            rows = db.fetch_all(f"MATCH (n:{label}) RETURN max(n.id) AS m")
-            m = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
-            if m > max_id:
-                max_id = m
-        except Exception:
-            pass
+        _ck()
+        if progress_cb:
+            try:
+                progress_cb("inserting", 0, len(pieces), "inserting chunks")
+            except Exception:
+                pass
 
-    rows = []
-    for i, (piece, vec) in enumerate(zip(pieces, vecs)):
-        max_id += 1
-        rows.append({
-            "id": max_id,
-            "source": url,
-            "title": title or urlparse(url).netloc,
-            "idx": i,
-            "body": piece[:6000],
-            "embedding": vec,
-        })
-    _ck()
-    db.insert_nodes("Doc", rows)
-    if progress_cb:
-        try:
-            progress_cb("completed", len(rows), len(rows), "completed")
-        except Exception:
-            pass
-    return {"url": url, "title": title, "chunks": len(rows)}
+        max_id = 0
+        for label in ("File", "Module", "Class", "Function", "Variable", "Chunk", "Doc"):
+            try:
+                rows = db.fetch_all(f"MATCH (n:{label}) RETURN max(n.id) AS m")
+                m = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
+                if m > max_id:
+                    max_id = m
+            except Exception:
+                pass
+
+        rows = []
+        for i, (piece, vec) in enumerate(zip(pieces, vecs)):
+            max_id += 1
+            rows.append({
+                "id": max_id,
+                "source": url,
+                "title": title or urlparse(url).netloc,
+                "idx": i,
+                "body": piece[:6000],
+                "embedding": vec,
+            })
+
+        _ck()
+        db.insert_nodes("Doc", rows)
+        if progress_cb:
+            try:
+                progress_cb("completed", len(rows), len(rows), "completed")
+            except Exception:
+                pass
+        return {"url": url, "title": title, "chunks": len(rows)}
+    finally:
+        if owns_db:
+            try:
+                db.close()
+            except Exception:
+                pass
+
+
+# --- Public API -------------------------------------------------------
+
+
+from typing import Callable
+
+
+def add_doc(
+    cfg: Config,
+    url: str,
+    db: GraphDB | None = None,
+    cancel_token: CancelToken | None = None,
+    progress_cb: Callable[[str, int, int, str], None] | None = None,
+) -> dict:
+    """Fetch `url`, chunk, embed, write Doc rows. Replaces any existing Doc
+    rows for the same source URL (so re-running is idempotent).
+
+    Pass an existing writer `db` to reuse it (the host's `/api/docs/add`
+    route does this so it doesn't fight the workspace's writer-lock dance
+    by opening a parallel GraphDB).
+
+    Pass `cancel_token` to make the op cooperatively cancellable. Checkpoints
+    are at safe boundaries (before fetch, after fetch, before embed, before
+    insert) — never mid-embed (ONNX batch) or mid-COPY (Kuzu)."""
+    prepared = prepare_doc(cfg, url, cancel_token=cancel_token, progress_cb=progress_cb)
+    return store_prepared_doc(cfg, prepared, db=db, cancel_token=cancel_token, progress_cb=progress_cb)
 
 
 def list_docs(cfg: Config) -> list[dict]:
