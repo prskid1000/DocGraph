@@ -306,8 +306,10 @@ class Indexer:
                 targets.append((ent, h, fp))
 
         if not targets:
+            log.info("LLM docstrings: no new entities to augment in this pass")
             return
 
+        log.info("LLM docstrings: augmenting %d entities missing native docstrings...", len(targets))
         client = LLMClient(LLMConfig(
             host=self.cfg.llm_host,
             port=self.cfg.llm_port,
@@ -346,6 +348,7 @@ class Indexer:
                     if self.progress_cb:
                         self.progress_cb("llm_augment", done, total)
 
+        log.info("LLM docstrings: augmentation complete (%d processed)", total)
         try:
             cache_path.write_text(json.dumps(cache), encoding="utf-8")
         except Exception:

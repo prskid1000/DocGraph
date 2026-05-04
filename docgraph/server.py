@@ -239,10 +239,15 @@ def make_app(workspace: Workspace) -> FastAPI:
         # Per-call ?rerank= wins; otherwise fall back to cfg.rerank_default
         # (set via DOCGRAPH_RERANK_DEFAULT env var or telecode tray toggle).
         use_rerank = rerank if rerank is not None else bool(getattr(slot.cfg, "rerank_default", False))
-        return slot.retriever.search(
+        results = slot.retriever.search(
             q, kind=kind, limit=limit,
             focus_file=focus_file, focus_symbol=focus_symbol, rerank=use_rerank,
         )
+        log.info(
+            f"Search: query='{q}' kind={kind} limit={limit} rerank={use_rerank} "
+            f"root={slot.slug} -> {len(results)} hits"
+        )
+        return results
 
     @app.get("/api/definition")
     async def api_definition(name: str, file: str | None = None,
@@ -644,23 +649,23 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.get("/api/llm_config")
     async def api_llm_config(root: RootSlug = DEFAULT):
         cfg = _slot(root).cfg
-        configured = bool(getattr(cfg, "llm_model", "") or "")
+        # Features are enabled via their respective toggles; the model always
+        # has a system default (qwen3.6-35b) if the user leaves it blank.
         return {
-            "configured": configured,
+            "configured": True,
             "host": getattr(cfg, "llm_host", "localhost"),
             "port": int(getattr(cfg, "llm_port", 1235)),
-            "model": getattr(cfg, "llm_model", "") or "",
+            "model": getattr(cfg, "llm_model", "") or "qwen3.6-35b",
             "format": getattr(cfg, "llm_format", "openai") or "openai",
             "max_tokens": int(getattr(cfg, "llm_max_tokens", 512) or 512),
             "max_tokens_chat": int(getattr(cfg, "llm_max_tokens_chat", 0) or 0),
             "has_key": bool(getattr(cfg, "llm_api_key", "") or ""),
+            "rerank_default": bool(getattr(cfg, "rerank_default", False)),
         }
 
     @app.post("/api/chat")
     async def api_chat(payload: dict, root: RootSlug = DEFAULT):
         cfg = _slot(root).cfg
-        if not getattr(cfg, "llm_model", ""):
-            raise HTTPException(503, "LLM is not configured (set llm.model)")
         messages = payload.get("messages") or []
         if not isinstance(messages, list) or not messages:
             raise HTTPException(400, "messages must be a non-empty list")

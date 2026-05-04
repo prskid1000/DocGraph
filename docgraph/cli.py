@@ -487,6 +487,8 @@ def host(
     if embed_batch_size > 0:       overrides["embed_batch_size"] = embed_batch_size
     if llm_model:
         overrides["llm_model"] = llm_model
+    else:
+        overrides["llm_model"] = "qwen3.6-35b"
     overrides["llm_docstrings"] = llm_docstrings
     overrides["llm_wiki"] = llm_wiki
     if llm_host:                   overrides["llm_host"] = llm_host

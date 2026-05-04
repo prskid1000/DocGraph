@@ -113,7 +113,8 @@
     .tab {
       flex: 1; padding: 10px 12px; display: flex; align-items: center; gap: 6px;
       font-size: 12px; color: var(--fg-dim); cursor: pointer; user-select: none;
-      border-bottom: 2px solid transparent;
+      border-bottom: 1px solid transparent;
+      margin-bottom: -1px;
     }
     .tab:hover { color: var(--fg); }
     .tab.active { color: var(--fg); border-bottom-color: var(--accent-2); }
@@ -164,10 +165,18 @@
 
     /* Explorer (search) */
     .explorer-pane { display: flex; flex-direction: column; height: 100%; }
-    .search-row { padding: 10px 12px; border-bottom: 1px solid var(--border-soft); }
-    .search-row input { width: 100%; padding: 7px 10px; background: var(--bg);
+    /* Sidebar search: input and button in a flex row to avoid overlap */
+    .search-row .input-group { display: flex; gap: 6px; align-items: center; }
+    .search-row input { flex: 1; padding: 7px 10px; background: var(--bg);
       border: 1px solid var(--border); color: var(--fg); border-radius: 6px; outline: none; font-size: 12px; }
     .search-row input:focus { border-color: var(--accent-2); }
+    .search-row .go-btn {
+      background: var(--accent-2); color: #0b0e14; border: 0; border-radius: 6px;
+      padding: 3px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
+      line-height: 1.5; transition: filter .12s; height: 26px; flex-shrink: 0;
+    }
+    .search-row .go-btn:hover { filter: brightness(1.15); }
+    
     .kind-chips { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
     .kind-chip { font-size: 10px; padding: 3px 8px; border-radius: 999px;
       background: var(--bg); border: 1px solid var(--border); color: var(--fg-dim);
@@ -465,27 +474,17 @@
       animation: lspin 0.8s linear infinite; flex-shrink: 0; }
     .skel-fail { color: var(--bad); font-size: 11px; padding: 6px 8px; }
 
-    /* In-input search button — replaces the auto-search debounce. The
-       absolute positioning is anchored to the input itself (via a wrapper
-       ".search-row" that's position:relative). Input padding-right makes
-       room for the button so the placeholder text never collides with it. */
-    .search-bar .go-btn, .search-row .go-btn {
-      position: absolute; top: 50%; transform: translateY(-50%);
-      background: var(--accent-2); color: #0b0e14; border: 0; border-radius: 6px;
-      padding: 3px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
-      line-height: 1.5; transition: filter .12s; height: 22px;
-    }
-    .search-bar .go-btn:hover, .search-row .go-btn:hover { filter: brightness(1.15); }
     /* Top search bar: input has padding-right:36px from the kbd era — bump
        it for the new wider button, then anchor the button inside that. */
     .search-bar { position: relative; }
     .search-bar input { padding-right: 50px !important; }
-    .search-bar .go-btn { right: 6px; }
-    /* Sidebar search: .search-row has its own 12px outer padding, so the
-       button needs 12px + a small gap to sit flush against the input. */
-    .search-row { position: relative; }
-    .search-row input { padding-right: 50px; }
-    .search-row .go-btn { right: 16px; }
+    .search-bar .go-btn {
+      position: absolute; top: 50%; transform: translateY(-50%); right: 6px;
+      background: var(--accent-2); color: #0b0e14; border: 0; border-radius: 6px;
+      padding: 3px 10px; font-size: 11px; font-weight: 600; cursor: pointer;
+      line-height: 1.5; transition: filter .12s; height: 22px;
+    }
+    .search-bar .go-btn:hover { filter: brightness(1.15); }
 
     /* Custom scrollbars */
     ::-webkit-scrollbar { width: 10px; height: 10px; }
@@ -558,8 +557,10 @@
         <!-- Explorer tab -->
         <div class="tab-content explorer-pane" data-pane="explorer">
           <div class="search-row">
-            <input id="q" placeholder="Search code (semantic)… press Enter" autocomplete="off" />
-            <button class="go-btn" id="q-go" title="Search">Go</button>
+            <div class="input-group">
+              <input id="q" placeholder="Search code (semantic)… press Enter" autocomplete="off" />
+              <button class="go-btn" id="q-go" title="Search">Go</button>
+            </div>
             <div class="kind-chips">
               <span class="kind-chip active" data-kind="">All</span>
               <span class="kind-chip" data-kind="function">Functions</span>

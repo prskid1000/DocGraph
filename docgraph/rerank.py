@@ -74,16 +74,29 @@ class Reranker:
         top_k: int | None = None,
     ) -> list[dict]:
         """Rerank `items` by feeding `query` and `item[text_key]` to the
-        cross-encoder. Mutates each item to add `rerank_score`. Returns the
-        list re-sorted by `rerank_score` desc."""
+        cross-encoder. Mutates each item to add `rerank_score` and update
+        `score_key`. Returns the list re-sorted by `rerank_score` desc."""
         k = top_k or RERANK_TOP_K
         head = items[:k]
         tail = items[k:]
         if not head:
             return items
-        docs = [str(it.get(text_key) or it.get("body") or it.get("name") or "") for it in head]
+
+        # For best results, give the cross-encoder both the name and the
+        # snippet. Cross-encoders are good at handling this unstructured
+        # join. 300 chars of snippet + name is well within the 512-token limit.
+        docs = []
+        for it in head:
+            name = it.get("name") or ""
+            text = it.get(text_key) or it.get("body") or ""
+            docs.append(f"{name} {text}".strip())
+
         scores = self.score(query, docs)
         for it, s in zip(head, scores):
-            it["rerank_score"] = float(s)
+            s_val = float(s)
+            it["rerank_score"] = s_val
+            # Update the primary score key so the UI reflects the reranked order
+            it[score_key] = s_val
+
         head.sort(key=lambda x: x.get("rerank_score", 0.0), reverse=True)
         return head + tail
