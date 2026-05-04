@@ -146,11 +146,15 @@ def chunk_doc(text: str) -> list[str]:
 # --- Public API -------------------------------------------------------
 
 
+from typing import Callable
+
+
 def add_doc(
     cfg: Config,
     url: str,
     db: GraphDB | None = None,
     cancel_token: CancelToken | None = None,
+    progress_cb: Callable[[str, int, int, str], None] | None = None,
 ) -> dict:
     """Fetch `url`, chunk, embed, write Doc rows. Replaces any existing Doc
     rows for the same source URL (so re-running is idempotent).
@@ -167,8 +171,23 @@ def add_doc(
             cancel_token.raise_if_set()
 
     _ck()
+    if progress_cb:
+        try:
+            progress_cb("queued", 0, 0, "queued")
+        except Exception:
+            pass
     with _console.status(f"[cyan]Fetching[/] {url}"):
+        if progress_cb:
+            try:
+                progress_cb("fetching", 0, 0, "fetching")
+            except Exception:
+                pass
         title, text = fetch_url(url)
+    if progress_cb:
+        try:
+            progress_cb("fetched", 0, 0, "fetched")
+        except Exception:
+            pass
     _ck()
     if not text.strip():
         return {"url": url, "chunks": 0, "title": title, "error": "empty body"}
@@ -189,14 +208,35 @@ def add_doc(
         cfg.embedding_model,
         providers=resolve_providers(cfg.gpu),
     )
+    if progress_cb:
+        try:
+            progress_cb("embedding", 0, len(pieces), "starting embed")
+        except Exception:
+            pass
     with _bar() as prog:
         task = prog.add_task(f"Embedding doc chunks ({title or url})", total=len(pieces))
+        def _on_progress(n: int) -> None:
+            prog.advance(task, n)
+            if progress_cb:
+                try:
+                    # compute current completed from progress bar's completed value
+                    # but we only get deltas; accumulate via closure by reading prog
+                    # use task fields from rich Progress if available; else incrementally send
+                    progress_cb("embedding", int(prog.tasks[task].completed if hasattr(prog.tasks[task], 'completed') else 0), len(pieces), "embedding")
+                except Exception:
+                    pass
+
         vecs = embedder.embed(
             pieces,
             batch_size=cfg.embed_batch_size,
-            on_progress=lambda n: prog.advance(task, n),
+            on_progress=_on_progress,
         )
     _ck()
+    if progress_cb:
+        try:
+            progress_cb("inserting", 0, len(rows), "inserting chunks")
+        except Exception:
+            pass
 
     # Continue id allocation past max(id) across all node tables
     max_id = 0
@@ -222,6 +262,11 @@ def add_doc(
         })
     _ck()
     db.insert_nodes("Doc", rows)
+    if progress_cb:
+        try:
+            progress_cb("completed", len(rows), len(rows), "completed")
+        except Exception:
+            pass
     return {"url": url, "title": title, "chunks": len(rows)}
 
 

@@ -46,6 +46,7 @@ class Job:
     result: dict | None = None
     error: str | None = None
     log: str = ""
+    progress: dict | None = None
     start_time: float = field(default_factory=time.time)
     end_time: float | None = None
     cancel_token: Any = None
@@ -70,6 +71,11 @@ class JobManager:
             j.error = error
             j.log = log
             j.end_time = time.time()
+
+    def update_job_progress(self, job_id: str, progress: dict) -> None:
+        j = self.jobs.get(job_id)
+        if j:
+            j.progress = progress
 
 job_manager = JobManager()
 
@@ -463,6 +469,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             "result": j.result,
             "error": j.error,
             "log": j.log,
+            "progress": j.progress,
             "start_time": j.start_time,
             "end_time": j.end_time
         }
@@ -509,6 +516,16 @@ def make_app(workspace: Workspace) -> FastAPI:
                 "total": int(total),
                 "ts": _time_progress.time(),
             })
+            # Also store progress on the Job so /api/jobs/<id> can return it
+            try:
+                job_manager.update_job_progress(job.id, {
+                    "phase": phase,
+                    "current": int(current),
+                    "total": int(total),
+                    "ts": _time_progress.time(),
+                })
+            except Exception:
+                pass
 
         def _do() -> tuple[dict, str]:
             # Indexer.index_all() prints Rich progress bars. We capture
@@ -734,11 +751,34 @@ def make_app(workspace: Workspace) -> FastAPI:
         token = workspace.cancel_token_for(slot.cfg.repo_root)
         
         job = job_manager.create_job("docs_add", str(slot.cfg.repo_root), token)
+        # mark queued progress so callers see initial state immediately
+        try:
+            job_manager.update_job_progress(job.id, {"phase": "queued", "current": 0, "total": 0, "message": "queued", "ts": time.time()})
+        except Exception:
+            pass
+
+        # progress callback for add_doc: phase, current, total, message
+        def _progress_cb(phase: str, current: int = 0, total: int = 0, message: str = "") -> None:
+            import time as _t
+            payload = {
+                "job_id": job.id,
+                "repo_slug": slot.slug,
+                "phase": phase,
+                "current": int(current),
+                "total": int(total),
+                "message": message,
+                "ts": _t.time(),
+            }
+            broadcast(app, "docs_progress", payload)
+            try:
+                job_manager.update_job_progress(job.id, payload)
+            except Exception:
+                pass
 
         def _do() -> dict:
             writer = workspace.take_writer(slot.cfg.repo_root)
             try:
-                return add_doc(slot.cfg, url, db=writer, cancel_token=token)
+                return add_doc(slot.cfg, url, db=writer, cancel_token=token, progress_cb=_progress_cb)
             finally:
                 workspace.release_writer(slot.cfg.repo_root)
 
