@@ -84,6 +84,8 @@ class LLMConfig:
     timeout: int = DEFAULT_TIMEOUT_SECS
 
     def __post_init__(self) -> None:
+        if not self.model:
+            self.model = DEFAULT_MODEL
         fmt = (self.format or "").lower()
         if fmt not in ("openai", "anthropic"):
             raise ValueError(f"llm format must be 'openai' or 'anthropic', got {self.format!r}")
