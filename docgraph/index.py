@@ -1198,6 +1198,32 @@ class Indexer:
                 self.db.insert_edges("IMPORTS_SYMBOL", "File", "Function", imports_symbol_func_rows, on_progress=cb)
                 self.db.insert_edges("OVERRIDES", "Function", "Function", overrides_rows, on_progress=cb)
 
+        # ---- Step 8b: LINKS_TO edges from BFS web crawl ----
+        # page_links.json is written by fetch_all whenever pages are crawled.
+        # External files have path "external/<filename>" in file_index because
+        # external_dir (name="external") is appended to cfg.extra_roots before
+        # walk_files runs, giving it the prefix "external/".
+        _page_links_file = self.cfg.external_dir / "page_links.json"
+        if _page_links_file.exists() and file_index:
+            try:
+                _link_data = json.loads(_page_links_file.read_text(encoding="utf-8"))
+                _ext_prefix = self.cfg.external_dir.name + "/"
+                links_to_rows: list[dict] = []
+                for _e in _link_data:
+                    _fid = file_index.get(_ext_prefix + _e.get("from", ""))
+                    _tid = file_index.get(_ext_prefix + _e.get("to", ""))
+                    if _fid is not None and _tid is not None and _fid != _tid:
+                        links_to_rows.append({"from_id": _fid, "to_id": _tid})
+                if links_to_rows:
+                    try:
+                        self.db.execute("MATCH ()-[r:LINKS_TO]->() DELETE r")
+                    except Exception:
+                        pass
+                    self.db.insert_edges("LINKS_TO", "File", "File", links_to_rows)
+                    log.info("LINKS_TO: inserted %d hyperlink edges", len(links_to_rows))
+            except Exception as _exc:
+                log.warning("LINKS_TO: failed to load page_links.json: %s", _exc)
+
         _ck()
         _emit("tier4_pagerank")
         # ---- Step 9: Tier 4 + PageRank (incremental-aware) ----

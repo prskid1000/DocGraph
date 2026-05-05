@@ -113,6 +113,8 @@ EDGE_DDL = [
     "CREATE REL TABLE IF NOT EXISTS CO_CHANGED_WITH(FROM File TO File, count INT64)",
     "CREATE REL TABLE IF NOT EXISTS TESTS(FROM Function TO Function, FROM Function TO Class)",
     "CREATE REL TABLE IF NOT EXISTS CONTAINS_CHUNK(FROM Function TO Chunk, FROM Class TO Chunk)",
+    # External-link structure: BFS parent→child hyperlinks from the web crawler.
+    "CREATE REL TABLE IF NOT EXISTS LINKS_TO(FROM File TO File)",
 ]
 
 

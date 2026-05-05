@@ -84,8 +84,12 @@ def fetch_link(
     force: bool = False,
     cancel_check: Callable[[], None] | None = None,
     progress_cb: Callable[[int, int, int], None] | None = None,
-) -> int:
-    """Fetch `link` into `external_dir`. Returns the number of pages saved.
+) -> tuple[int, list[tuple[str, str]]]:
+    """Fetch `link` into `external_dir`.
+
+    Returns `(pages_saved, link_edges)` where `link_edges` is a list of
+    `(from_filename, to_filename)` pairs recording the BFS parent→child
+    hyperlink structure (both filenames relative to `external_dir`).
 
     Skips entirely when the link is still fresh and `force` is False.
     Pages are written as `<url_slug>.html` (seed) and `<url_slug>__p2.html`,
@@ -102,7 +106,7 @@ def fetch_link(
     if not force and not link.is_stale():
         remaining = link.ttl_hours - (time.time() - (link.last_fetched or 0)) / 3600
         log.debug("fetch %s: fresh (%.1fh TTL remaining)", link.url, remaining)
-        return link.page_count or 0
+        return link.page_count or 0, []
 
     external_dir.mkdir(parents=True, exist_ok=True)
     slug = _url_slug(link.url)
@@ -113,6 +117,9 @@ def fetch_link(
     # BFS progress tracking: how many URLs exist and are done per depth level.
     total_per_depth: dict[int, int] = {0: 1}
     done_per_depth: dict[int, int] = {}
+    # Link structure: url → saved filename; discovered (parent, child) url pairs.
+    url_to_filename: dict[str, str] = {}
+    discovered_edges: list[tuple[str, str]] = []
 
     while queue:
         if cancel_check is not None:
@@ -135,6 +142,7 @@ def fetch_link(
         out_path = external_dir / f"{slug}{suffix}.html"
         out_path.write_text(html, encoding="utf-8")
         saved += 1
+        url_to_filename[url] = out_path.name
         done_per_depth[depth] = done_per_depth.get(depth, 0) + 1
         log.info("fetch: %s → %s", url, out_path.name)
 
@@ -150,6 +158,7 @@ def fetch_link(
                     total_per_depth.get(depth + 1, 0) + len(new_links)
                 )
             for child in new_links:
+                discovered_edges.append((url, child))
                 queue.append((child, depth + 1))
 
         if progress_cb is not None:
@@ -164,7 +173,12 @@ def fetch_link(
 
     link.last_fetched = time.time()
     link.page_count = saved
-    return saved
+    edges = [
+        (url_to_filename[p], url_to_filename[c])
+        for p, c in discovered_edges
+        if p in url_to_filename and c in url_to_filename
+    ]
+    return saved, edges
 
 
 def fetch_all(
@@ -179,19 +193,40 @@ def fetch_all(
     Returns {url: pages_saved}. Stale links are re-fetched; fresh ones
     are skipped unless force=True. Writes updated timestamps back to
     links.json so subsequent runs respect the TTL.
+
+    Also writes `external/page_links.json` whenever any pages were
+    (re-)crawled: `[{"from": "slug.html", "to": "slug__p2.html"}, …]`.
+    This file records the BFS parent→child hyperlink structure so
+    `index_all` can insert LINKS_TO edges between File nodes.
     """
+    import json as _json
+
     links = load_links(data_dir)
     if not links:
         return {}
 
     external_dir = data_dir / "external"
     results: dict[str, int] = {}
+    all_edges: list[dict] = []
+    any_crawled = False
     for lk in links:
         if only_url and lk.url != only_url:
             continue
-        count = fetch_link(lk, external_dir, force=force,
-                           cancel_check=cancel_check, progress_cb=progress_cb)
+        count, edges = fetch_link(lk, external_dir, force=force,
+                                  cancel_check=cancel_check, progress_cb=progress_cb)
         results[lk.url] = count
+        if edges:
+            any_crawled = True
+            all_edges.extend({"from": f, "to": t} for f, t in edges)
 
     save_links(data_dir, links)
+
+    if any_crawled and external_dir.exists():
+        try:
+            (external_dir / "page_links.json").write_text(
+                _json.dumps(all_edges, indent=2), encoding="utf-8"
+            )
+        except OSError as exc:
+            log.warning("fetch_all: could not write page_links.json: %s", exc)
+
     return results
