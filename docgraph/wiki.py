@@ -253,6 +253,11 @@ def build_wiki(
     # the next time the user runs index. Wiki works from the existing DB, so
     # the fetched pages don't affect this wiki run — they keep links fresh
     # for the subsequent index → wiki pipeline.
+    try:
+        from docgraph.index import _wire_extra_paths
+        _wire_extra_paths(cfg)
+    except Exception as _we:
+        log.debug("wiki extra-paths wiring skipped: %s", _we)
     if fetch_links:
         try:
             from docgraph.index import _maybe_fetch_links
