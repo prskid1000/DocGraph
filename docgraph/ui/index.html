@@ -268,8 +268,9 @@
     .inspector-file {
       padding: 8px 12px; font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
       font-size: 11px; color: var(--accent); background: var(--bg-alt); border-bottom: 1px solid var(--border-soft);
-      display: flex; align-items: center; gap: 8px;
+      display: flex; align-items: center; gap: 8px; overflow: hidden;
     }
+    .inspector-file .file-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
     .inspector-file .file-tag {
       font-size: 9px; padding: 2px 6px; border-radius: 3px; background: var(--accent-2); color: #0b0e14; font-weight: 700;
     }
@@ -2077,7 +2078,7 @@ function runCommunities(iters){
       ins.classList.add("show");
       $("#inspector-file").innerHTML = "";
       $("#inspector-file").appendChild(el("span", { className: "file-tag" }, "FILE"));
-      $("#inspector-file").appendChild(document.createTextNode(file));
+      $("#inspector-file").appendChild(el("span", { className: "file-path", title: file }, file));
       // Show tabs only for previewable file types; reset to Code tab
       const canPreview = _PREVIEWABLE.has(_insExt(file));
       $("#inspector-tabs").classList.toggle("code-only", !canPreview);
@@ -2429,7 +2430,7 @@ function runCommunities(iters){
       ins.classList.add("show");
       $("#inspector-file").innerHTML = "";
       $("#inspector-file").appendChild(el("span", { className: "file-tag" }, "WIKI"));
-      $("#inspector-file").appendChild(document.createTextNode(title || slug));
+      $("#inspector-file").appendChild(el("span", { className: "file-path", title: slug }, title || slug));
       // Wiki content is already rendered HTML — no preview tab needed
       $("#inspector-tabs").classList.add("code-only");
       _switchInsTab("code");
