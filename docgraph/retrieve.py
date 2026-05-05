@@ -392,6 +392,7 @@ class Retriever:
             "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
             "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",
             "DECORATED_BY", "RETURNS", "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH",
+            "LINKS_TO",
         )
         for _ in range(hops):
             if not frontier:
@@ -809,6 +810,7 @@ class Retriever:
         "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
         "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",
         "DECORATED_BY", "RETURNS", "SIMILAR_TO", "TESTS", "CO_CHANGED_WITH",
+        "LINKS_TO",
     )
 
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
@@ -892,7 +894,7 @@ class Retriever:
         node_ids = {n["id"] for n in nodes}
 
         edges: list[dict] = []
-        for edge in ("IMPORTS", "CO_CHANGED_WITH"):
+        for edge in ("IMPORTS", "CO_CHANGED_WITH", "LINKS_TO"):
             try:
                 erows = self.db.fetch_all(
                     f"MATCH (a:File)-[r:{edge}]->(b:File) RETURN a.id AS src, b.id AS dst"
