@@ -128,6 +128,7 @@ _SCOPE_BOUNDARY_PATTERNS: dict[str, str] = {
     "php":        r"^(?:public|private|protected|static|abstract|final)\s+function|^(?:class|interface|trait|namespace|function)\s",
     "elixir":     r"^(?:def|defp|defmodule|defmacro|defstruct|@)\s",
     "swift":      r"^(?:public|private|fileprivate|internal|open|static|class|struct|enum|protocol|extension|func|init)\s",
+    "markdown":   r"^#{1,6}\s",
 }
 
 

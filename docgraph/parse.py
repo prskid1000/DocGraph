@@ -55,6 +55,8 @@ EXT_TO_LANG: dict[str, str] = {
     ".json": "json",
     ".yaml": "yaml",
     ".yml": "yaml",
+    ".md": "markdown",
+    ".markdown": "markdown",
 }
 
 
@@ -82,6 +84,7 @@ LANGUAGES: dict[str, tuple[str, str]] = {
     "css": ("tree_sitter_css", "language"),
     "json": ("tree_sitter_json", "language"),
     "yaml": ("tree_sitter_yaml", "language"),
+    "markdown": ("tree_sitter_markdown", "language"),
 }
 
 
@@ -280,6 +283,15 @@ TAGS_QUERIES: dict[str, str] = {
 """,
     "json": "",
     "yaml": "",
+    # Headings become "section" entities. tree-sitter-markdown uses `inline`
+    # for the heading text in ATX headings (# style) and `paragraph` wrapping
+    # `inline` for setext headings (underlined style).
+    "markdown": """
+(atx_heading
+  (inline) @name) @definition.section
+(setext_heading
+  (paragraph (inline) @name)) @definition.section
+""",
 }
 
 
@@ -385,6 +397,7 @@ DEF_KIND_MAP = {
     "definition.class": "class",
     "definition.interface": "interface",
     "definition.variable": "variable",
+    "definition.section": "section",
 }
 
 _KIND_PRIORITY = {
@@ -393,6 +406,7 @@ _KIND_PRIORITY = {
     "method": 1,
     "function": 1,
     "variable": 2,
+    "section": 3,
 }
 
 
