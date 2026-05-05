@@ -235,6 +235,8 @@ def build_wiki(
     depth: int = 12,
     cancel_token=None,
     progress_cb=None,
+    fetch_links: bool = True,
+    force_fetch: bool = False,
 ) -> list[WikiPage]:
     """Generate (or re-generate) wiki pages for every module (one per
     directory, capped at `depth` directory levels). Saves to
@@ -247,6 +249,17 @@ def build_wiki(
     `depth=1` = top-level dirs only (old behavior). `depth=12` (default)
     = one page per leaf folder for any reasonable repo.
     """
+    # Pre-fetch stale external links so fresh HTML pages land in the graph
+    # the next time the user runs index. Wiki works from the existing DB, so
+    # the fetched pages don't affect this wiki run — they keep links fresh
+    # for the subsequent index → wiki pipeline.
+    if fetch_links:
+        try:
+            from docgraph.index import _maybe_fetch_links
+            _maybe_fetch_links(cfg, force=force_fetch)
+        except Exception as _fe:
+            log.debug("wiki pre-fetch skipped: %s", _fe)
+
     llm = llm or LLMClient(LLMConfig(
         host=getattr(cfg, "llm_host", "localhost"),
         port=int(getattr(cfg, "llm_port", 1235) or 1235),

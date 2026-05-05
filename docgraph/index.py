@@ -70,6 +70,79 @@ def _gpu_providers() -> list[str]:
     return list(GPU_PROVIDERS)
 
 
+def _wire_extra_paths(cfg: Config) -> None:
+    """Re-read repos.json at index time and patch cfg.extra_roots for any
+    paths added after the host started (e.g. via /api/repos or the tray UI).
+    Safe per the workspace writer lock that serializes index/wiki runs."""
+    import json as _json
+    repos_file = cfg.data_dir / "repos.json"
+    if not repos_file.exists():
+        return
+    try:
+        raw = _json.loads(repos_file.read_text(encoding="utf-8"))
+        paths = [Path(p).resolve() for p in raw if p]
+    except Exception:
+        return
+
+    for p in paths:
+        if p == cfg.repo_root or p in cfg.extra_roots:
+            continue
+        if not p.exists():
+            log.debug("_wire_extra_paths: skipping missing path %s", p)
+            continue
+        cfg.extra_roots.append(p)
+        try:
+            from docgraph.ignores import assemble_ignores
+            import pathspec as _ps
+            patterns, ecosystems = assemble_ignores(p)
+            cfg.ignore_specs[p] = _ps.PathSpec.from_lines("gitignore", patterns)
+            cfg.user_ignore_specs[p] = _ps.PathSpec.from_lines("gitignore", [])
+            cfg.ai_block_specs[p] = _ps.PathSpec.from_lines("gitignore", [])
+            cfg.detected_ecosystems[p] = ecosystems
+        except Exception as exc:
+            log.warning("_wire_extra_paths: ignore-spec setup failed for %s: %s", p, exc)
+
+
+def _maybe_fetch_links(cfg: Config, force: bool = False) -> None:
+    """Fetch stale external links and wire external_dir into cfg.extra_roots.
+
+    Called before index_all() (and build_wiki()). If links.json has entries,
+    runs the fetch step then appends cfg.external_dir to cfg.extra_roots so
+    walk_files() picks up the downloaded HTML pages. Patches ignore_specs in
+    place — safe because index/wiki runs are serialized per root via the
+    workspace writer lock.
+    """
+    try:
+        from docgraph.links import load_links
+        from docgraph.fetch import fetch_all
+    except ImportError:
+        return
+
+    if not load_links(cfg.data_dir):
+        return
+
+    fetch_all(cfg.data_dir, force=force)
+
+    external_dir = cfg.external_dir
+    if not external_dir.exists() or not list(external_dir.glob("*.html")):
+        return
+
+    if external_dir in cfg.extra_roots:
+        return
+
+    cfg.extra_roots.append(external_dir)
+    try:
+        from docgraph.ignores import assemble_ignores
+        import pathspec as _ps
+        patterns, _ = assemble_ignores(external_dir)
+        cfg.ignore_specs[external_dir] = _ps.PathSpec.from_lines("gitignore", patterns)
+        cfg.user_ignore_specs[external_dir] = _ps.PathSpec.from_lines("gitignore", [])
+        cfg.ai_block_specs[external_dir] = _ps.PathSpec.from_lines("gitignore", [])
+        cfg.detected_ecosystems[external_dir] = []
+    except Exception as exc:
+        log.warning("_maybe_fetch_links: ignore-spec setup failed: %s", exc)
+
+
 # --- Walker ---------------------------------------------------------------
 
 
@@ -383,7 +456,8 @@ class Indexer:
 
     # ---- Main entrypoint ----
     def index_all(self, incremental: bool = True, progress_cb: ProgressCb = None,
-                  cancel_token: "CancelToken | None" = None) -> dict:
+                  cancel_token: "CancelToken | None" = None,
+                  fetch_links: bool = True, force_fetch: bool = False) -> dict:
         self.progress_cb = progress_cb
         # Cooperative cancel: poll `cancel_token.raise_if_set()` at major
         # phase boundaries. Mid-phase cancellation is unsafe (inside Kuzu
@@ -418,6 +492,10 @@ class Indexer:
                     state["last"] = now
                     _emit(phase, state["done"], total)
             return push
+
+        _wire_extra_paths(self.cfg)
+        if fetch_links:
+            _maybe_fetch_links(self.cfg, force=force_fetch)
 
         _ck()
         _emit("start")

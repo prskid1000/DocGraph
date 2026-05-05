@@ -51,6 +51,13 @@ app = typer.Typer(
     help="Local code knowledge graph: index any repo, query via MCP or web UI.",
     no_args_is_help=True,
 )
+
+links_app = typer.Typer(name="links", help="Manage external links per root.", no_args_is_help=True)
+app.add_typer(links_app)
+
+repos_app = typer.Typer(name="repos", help="Manage extra local paths per root.", no_args_is_help=True)
+app.add_typer(repos_app)
+
 console = Console()
 
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
@@ -68,6 +75,159 @@ def _setup_logging(verbose: bool) -> None:
 def version() -> None:
     """Print version."""
     console.print(f"docgraph {__version__}")
+
+
+# ── docgraph links ─────────────────────────────────────────────────────────
+
+
+@links_app.command("list")
+def links_list(
+    path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
+) -> None:
+    """List configured external links and their fetch status."""
+    import time as _time
+    from docgraph.links import load_links
+
+    cfg = load_config(path)
+    links = load_links(cfg.data_dir)
+    if not links:
+        console.print("[yellow]No external links configured.[/yellow]")
+        return
+    t = Table(show_header=True, box=None)
+    t.add_column("URL")
+    t.add_column("Depth", justify="center")
+    t.add_column("TTL (h)", justify="center")
+    t.add_column("Last Fetched")
+    t.add_column("Pages", justify="center")
+    for lk in links:
+        if lk.last_fetched:
+            delta = int(_time.time() - lk.last_fetched)
+            age = f"{delta // 3600}h ago" if delta >= 3600 else f"{delta // 60}m ago"
+            stale = " [yellow](stale)[/]" if lk.is_stale() else ""
+            fetched = age + stale
+        else:
+            fetched = "[dim]never[/]"
+        t.add_row(lk.url, str(lk.depth), str(lk.ttl_hours), fetched,
+                  str(lk.page_count) if lk.page_count is not None else "—")
+    console.print(t)
+
+
+@links_app.command("add")
+def links_add(
+    url: str = typer.Argument(..., help="URL to crawl"),
+    path: Path = typer.Option(Path.cwd(), "--path", "-p", help="Repo root"),
+    depth: int = typer.Option(1, "--depth", "-d", help="Crawl depth (1–5)"),
+    ttl: float = typer.Option(24.0, "--ttl", help="Hours before stale (default 24)"),
+) -> None:
+    """Add or update an external link for a root."""
+    from docgraph.links import upsert_link
+
+    cfg = load_config(path)
+    upsert_link(cfg.data_dir, url, depth=depth, ttl_hours=ttl)
+    console.print(f"[green]Added:[/green] {url}  (depth={depth}, ttl={ttl}h)")
+
+
+@links_app.command("remove")
+def links_remove(
+    url: str = typer.Argument(..., help="URL to remove"),
+    path: Path = typer.Option(Path.cwd(), "--path", "-p", help="Repo root"),
+) -> None:
+    """Remove an external link from a root."""
+    from docgraph.links import remove_link
+
+    cfg = load_config(path)
+    remove_link(cfg.data_dir, url)
+    console.print(f"[yellow]Removed:[/yellow] {url}")
+
+
+@links_app.command("fetch")
+def links_fetch(
+    path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
+    force: bool = typer.Option(False, "--force", "-f",
+                                help="Re-fetch even if still fresh (ignore TTL)"),
+    url: str | None = typer.Option(None, "--url", help="Fetch only this URL"),
+) -> None:
+    """Fetch external links now without re-indexing."""
+    from docgraph.fetch import fetch_all
+
+    cfg = load_config(path)
+    console.print(f"[cyan]Fetching links for {cfg.repo_root}…[/cyan]")
+    results = fetch_all(cfg.data_dir, force=force, only_url=url)
+    if not results:
+        console.print("[yellow]No links configured or nothing to fetch.[/yellow]")
+        return
+    for u, count in results.items():
+        console.print(f"  [green]{u}[/green] → {count} page(s) saved")
+
+
+# ── docgraph repos ────────────────────────────────────────────────────────
+
+
+@repos_app.command("list")
+def repos_list(
+    path: Path = typer.Argument(Path.cwd(), help="Repo root (default: cwd)"),
+) -> None:
+    """List extra local paths configured for a root."""
+    import json as _json
+
+    cfg = load_config(path)
+    repos_file = cfg.data_dir / "repos.json"
+    if not repos_file.exists():
+        console.print("[yellow]No extra paths configured.[/yellow]")
+        return
+    try:
+        raw = _json.loads(repos_file.read_text(encoding="utf-8"))
+    except Exception:
+        raw = []
+    if not raw:
+        console.print("[yellow]No extra paths configured.[/yellow]")
+        return
+    t = Table(show_header=True, box=None)
+    t.add_column("Extra path")
+    for p in raw:
+        t.add_row(str(p))
+    console.print(t)
+
+
+@repos_app.command("add")
+def repos_add(
+    extra: str = typer.Argument(..., help="Local path to add"),
+    path: Path = typer.Option(Path.cwd(), "--path", "-p", help="Repo root"),
+) -> None:
+    """Add an extra local path to a root."""
+    import json as _json
+
+    cfg = load_config(path)
+    repos_file = cfg.data_dir / "repos.json"
+    try:
+        raw = _json.loads(repos_file.read_text(encoding="utf-8")) if repos_file.exists() else []
+    except Exception:
+        raw = []
+    resolved = str(Path(extra).resolve())
+    if resolved not in raw:
+        raw.append(resolved)
+        repos_file.write_text(_json.dumps(raw))
+    console.print(f"[green]Added:[/green] {resolved}")
+
+
+@repos_app.command("remove")
+def repos_remove(
+    extra: str = typer.Argument(..., help="Local path to remove"),
+    path: Path = typer.Option(Path.cwd(), "--path", "-p", help="Repo root"),
+) -> None:
+    """Remove an extra local path from a root."""
+    import json as _json
+
+    cfg = load_config(path)
+    repos_file = cfg.data_dir / "repos.json"
+    try:
+        raw = _json.loads(repos_file.read_text(encoding="utf-8")) if repos_file.exists() else []
+    except Exception:
+        raw = []
+    resolved = str(Path(extra).resolve())
+    raw = [p for p in raw if p != resolved]
+    repos_file.write_text(_json.dumps(raw))
+    console.print(f"[yellow]Removed:[/yellow] {resolved}")
 
 
 @app.command()
@@ -133,6 +293,15 @@ def index(
         None, "--llm-prompt-docstring-file",
         help="Path to a custom docstring prompt template "
              "(must keep {kind}/{name}/{language}/{body} placeholders). ",
+    ),
+    fetch_links: bool = typer.Option(
+        True, "--fetch-links/--no-fetch-links",
+        help="Fetch stale external links before indexing (default: on). "
+             "Skips URLs whose TTL has not expired.",
+    ),
+    force_fetch: bool = typer.Option(
+        False, "--force-fetch-links",
+        help="Re-fetch ALL external links regardless of TTL.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -200,7 +369,8 @@ def index(
     db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
     db.init_schema()
     indexer = Indexer(cfg, db)
-    stats = indexer.index_all(incremental=not full)
+    stats = indexer.index_all(incremental=not full,
+                               fetch_links=fetch_links, force_fetch=force_fetch)
     table = Table(show_header=False, box=None)
     for k, v in stats.items():
         table.add_row(k, f"{v:.2f}" if isinstance(v, float) else str(v))
@@ -708,6 +878,14 @@ def wiki(
         help="Path to a custom wiki output-format tail. Replaces the built-in "
              "tail; the rendered fact block above it stays. ",
     ),
+    fetch_links: bool = typer.Option(
+        True, "--fetch-links/--no-fetch-links",
+        help="Fetch stale external links before building the wiki (default: on).",
+    ),
+    force_fetch: bool = typer.Option(
+        False, "--force-fetch-links",
+        help="Re-fetch ALL external links regardless of TTL.",
+    ),
 ) -> None:
     """Generate (or rebuild) the LLM-grounded wiki for the indexed repo.
 
@@ -751,7 +929,9 @@ def wiki(
         bar.update(task_id, completed=i, description=f"[cyan]wiki[/] {mod}")
 
     with bar:
-        pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress, force=force, depth=depth)
+        pages = build_wiki(cfg, db, llm, only_module=module, progress=_progress,
+                           force=force, depth=depth,
+                           fetch_links=fetch_links, force_fetch=force_fetch)
         if task_id is not None:
             bar.update(task_id, completed=len(pages) or bar.tasks[task_id].total)
     console.print(f"[green]Built {len(pages)} wiki page(s).[/green]")

@@ -310,6 +310,8 @@ def make_app(workspace: Workspace) -> FastAPI:
         p = payload or {}
         only = p.get("module") if isinstance(p, dict) else None
         force = bool(p.get("force")) if isinstance(p, dict) else False
+        fetch_links_wiki = bool(p.get("fetch_links", True)) if isinstance(p, dict) else True
+        force_fetch_wiki = bool(p.get("force_fetch_links", False)) if isinstance(p, dict) else False
         default_depth = int(getattr(slot.cfg, "wiki_depth", 12) or 12)
         try:
             depth = int(p.get("depth", default_depth)) if isinstance(p, dict) else default_depth
@@ -339,7 +341,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             try:
                 pages = await asyncio.to_thread(
                     build_wiki, slot.cfg, slot.db_ro, None, only, None, force, depth,
-                    token, _progress_cb,
+                    token, _progress_cb, fetch_links_wiki, force_fetch_wiki,
                 )
                 result = {"built": len(pages), "modules": [pg.module for pg in pages]}
                 job_manager.finish_job(job.id, "completed", result=result)
@@ -497,6 +499,8 @@ def make_app(workspace: Workspace) -> FastAPI:
         from docgraph.embed import Embedder, GPU_PROVIDERS
         slot = _slot(root)
         full = bool((payload or {}).get("full", False))
+        fetch_links = bool((payload or {}).get("fetch_links", True))
+        force_fetch = bool((payload or {}).get("force_fetch_links", False))
         # Reset before kicking off so a stale cancel from a previous run
         # doesn't immediately abort.
         workspace.reset_cancel(slot.cfg.repo_root)
@@ -544,7 +548,9 @@ def make_app(workspace: Workspace) -> FastAPI:
                 with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
                     stats = indexer.index_all(incremental=not full,
                                                cancel_token=token,
-                                               progress_cb=_progress_cb)
+                                               progress_cb=_progress_cb,
+                                               fetch_links=fetch_links,
+                                               force_fetch=force_fetch)
                 try:
                     indexer.db.close()
                 except Exception:
@@ -575,6 +581,106 @@ def make_app(workspace: Workspace) -> FastAPI:
     # Admin: cancel the currently-running long-op (index / wiki) for a
     # root. Cooperative — the long op polls a per-root token at safe
     # checkpoints and raises `OperationCancelled` when it fires. Idempotent.
+    # ── Extra local paths CRUD ──────────────────────────────────────────
+
+    @app.get("/api/repos")
+    async def api_repos_list(root: RootSlug = DEFAULT):
+        import json as _json
+        slot = _slot(root)
+        repos_file = slot.cfg.data_dir / "repos.json"
+        if not repos_file.exists():
+            return []
+        try:
+            return _json.loads(repos_file.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+    @app.post("/api/repos")
+    async def api_repos_add(payload: dict, root: RootSlug = DEFAULT):
+        import json as _json
+        slot = _slot(root)
+        p = str((payload or {}).get("path", "") or "").strip()
+        if not p:
+            raise HTTPException(400, "path required")
+        repos_file = slot.cfg.data_dir / "repos.json"
+        try:
+            raw = _json.loads(repos_file.read_text(encoding="utf-8")) if repos_file.exists() else []
+        except Exception:
+            raw = []
+        resolved = str(Path(p).resolve())
+        if resolved not in raw:
+            raw.append(resolved)
+            repos_file.write_text(_json.dumps(raw))
+        return {"paths": raw}
+
+    @app.delete("/api/repos")
+    async def api_repos_remove(path: str, root: RootSlug = DEFAULT):
+        import json as _json
+        slot = _slot(root)
+        repos_file = slot.cfg.data_dir / "repos.json"
+        try:
+            raw = _json.loads(repos_file.read_text(encoding="utf-8")) if repos_file.exists() else []
+        except Exception:
+            raw = []
+        resolved = str(Path(path).resolve())
+        raw = [p for p in raw if p != resolved]
+        repos_file.write_text(_json.dumps(raw))
+        return {"paths": raw}
+
+    # ── External links CRUD ─────────────────────────────────────────────
+
+    @app.get("/api/links")
+    async def api_links_list(root: RootSlug = DEFAULT):
+        from docgraph.links import load_links
+        from dataclasses import asdict
+        slot = _slot(root)
+        return [asdict(lk) for lk in load_links(slot.cfg.data_dir)]
+
+    @app.post("/api/links")
+    async def api_links_upsert(payload: dict, root: RootSlug = DEFAULT):
+        from docgraph.links import upsert_link
+        slot = _slot(root)
+        url = str(payload.get("url", "")).strip()
+        if not url:
+            raise HTTPException(400, "url required")
+        depth = int(payload.get("depth", 1))
+        ttl_hours = float(payload.get("ttl_hours", 24.0))
+        links = upsert_link(slot.cfg.data_dir, url, depth, ttl_hours)
+        return {"links": len(links)}
+
+    @app.delete("/api/links")
+    async def api_links_remove(url: str, root: RootSlug = DEFAULT):
+        from docgraph.links import remove_link
+        slot = _slot(root)
+        links = remove_link(slot.cfg.data_dir, url)
+        return {"links": len(links)}
+
+    @app.post("/api/links/fetch")
+    async def api_links_fetch(payload: dict | None = None, root: RootSlug = DEFAULT):
+        """Trigger a standalone fetch job (no re-index)."""
+        from docgraph.fetch import fetch_all
+        slot = _slot(root)
+        p = payload or {}
+        force = bool(p.get("force", False))
+        only_url: str | None = p.get("url") or None
+
+        job = job_manager.create_job("fetch", str(slot.cfg.repo_root), None)
+
+        async def _run():
+            try:
+                results = await asyncio.to_thread(
+                    fetch_all, slot.cfg.data_dir, force, only_url
+                )
+                job_manager.finish_job(job.id, "completed", result=results)
+            except Exception as exc:
+                log.exception("api_links_fetch failed: %s", exc)
+                job_manager.finish_job(job.id, "failed", error=str(exc))
+
+        asyncio.create_task(_run())
+        return {"job_id": job.id, "status": "running"}
+
+    # ────────────────────────────────────────────────────────────────────
+
     @app.post("/api/admin/cancel")
     async def api_admin_cancel(root: RootSlug = DEFAULT):
         slot = _slot(root)

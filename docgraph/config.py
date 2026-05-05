@@ -77,6 +77,11 @@ class Config:
     wiki_depth: int = 12
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
+
+    @property
+    def external_dir(self) -> Path:
+        """Directory for fetched external-link HTML files: <data_dir>/external/."""
+        return self.data_dir / "external"
     # Patterns the USER explicitly added (.gitignore / .docgraphignore /
     # .cursorindexingignore) — does NOT include universal generated/binary
     # defaults.
