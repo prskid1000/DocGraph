@@ -309,9 +309,24 @@ class Workspace:
             # close on Windows; force a GC pass before rmtree to release.
             gc.collect()
             data_dir = slot.cfg.data_dir
+            # Preserve user configuration that survives a clear.
+            _PRESERVE = ("repos.json", "links.json")
+            saved: dict[str, bytes] = {}
+            for name in _PRESERVE:
+                p = data_dir / name
+                if p.exists():
+                    try:
+                        saved[name] = p.read_bytes()
+                    except Exception:
+                        pass
             if data_dir.exists():
                 shutil.rmtree(data_dir, ignore_errors=False)
             data_dir.mkdir(parents=True, exist_ok=True)
+            for name, content in saved.items():
+                try:
+                    (data_dir / name).write_bytes(content)
+                except Exception:
+                    pass
             tmp = GraphDB(slot.cfg.db_path, embedding_dim=slot.cfg.embedding_dim)
             try:
                 tmp.init_schema()
