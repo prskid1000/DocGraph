@@ -22,7 +22,9 @@ Local code knowledge graph. Tree-sitter parses, fastembed embeds (ONNX), Kuzu st
 | File | Purpose |
 |---|---|
 | `cli.py` | Typer entry. `host` is the unified command; `serve`/`mcp`/`watch` delegate to it. Every config knob is a flag. |
-| `config.py` | `load_config(repo_root, **overrides)` — fully kwarg-driven Config. Auto-detects ecosystems, respects `.gitignore` + `.docgraphignore`. `extra_roots` indexes multiple paths into ONE DB (different from workspace multi-root). |
+| `config.py` | `load_config(repo_root, **overrides)` — fully kwarg-driven Config. Auto-detects ecosystems, respects `.gitignore` + `.docgraphignore`. `extra_roots` indexes multiple paths into ONE DB (different from workspace multi-root). `root_extra_paths(root)` / `save_root_extra_paths(root, paths)` r/w `<root>/.docgraph/repos.json`. `root_links(root)` / `save_root_links(root, links)` r/w `<root>/.docgraph/links.json`. |
+| `links.py` | `ExternalLink` dataclass (`url`, `depth`, `max_pages`, `ttl_hours`, `last_fetched`, `page_count`). `load_links` / `upsert_link`. |
+| `fetch.py` | BFS web crawler. `fetch_link(link, cancel_check, progress_cb)` — crawls up to `max_pages` pages at up to `depth` BFS levels. `fetch_all(cfg, cancel_check, progress_cb)` iterates all configured links. Progress callback signature: `(depth_level: int, done: int, total_at_depth: int)`. |
 | `workspace.py` | `Workspace` registry of `RootSlot`s. Each slot owns its RO Kuzu connection + Retriever. Watcher gets a writer via `take_writer()` / `release_writer()` (which reopens RO — Kuzu writer-visibility quirk). 4-step `resolve()`: exact path → slug → file-prefix → default. |
 | `parse.py` | tree-sitter wrappers + tags queries. Method qname rescoping is keyed on `id(node)` not on the qname string (sibling classes with same method name collided). |
 | `index.py` | Parallel pipeline + per-file delta. **Most complex file.** |
@@ -116,7 +118,7 @@ Long ops (`/api/admin/index`, `/api/wiki/build`) are cooperatively cancellable v
 
 ## Ignore architecture
 
-Three layers: (1) **Universal** baseline (VCS / OS junk / lockfiles / env / binaries, plus unambiguously-named dep dirs); (2) **Ecosystem autodetect** via marker files (`package.json`, `pom.xml`, `Cargo.toml`, `*.csproj`, ...) → unions in templates with ambiguously-named build dirs (`target/`, `build/`, `dist/`, ...); (3) **User files** (`.gitignore` / `.docgraphignore` / `.cursorindexingignore` exclude; `.cursorignore` indexes-but-redacts).
+Three layers: (1) **Universal** baseline (VCS / OS junk / lockfiles / env / binaries, plus unambiguously-named dep dirs, **plus documentation-only files**: `README*`, `CHANGELOG*`, `LICENSE*`, `CONTRIBUTING*`, `AUTHORS*`, `CODEOWNERS`); (2) **Ecosystem autodetect** via marker files (`package.json`, `pom.xml`, `Cargo.toml`, `*.csproj`, ...) → unions in templates with ambiguously-named build dirs (`target/`, `build/`, `dist/`, ...); (3) **User files** (`.gitignore` / `.docgraphignore` / `.cursorindexingignore` exclude; `.cursorignore` indexes-but-redacts). Extra paths (`repos.json`) honour the same three layers — `_wire_extra_paths` mirrors `Config.__post_init__` to load user ignore files from within each extra path's directory.
 
 `Config.is_ignored()` covers 1+2+user-exclude. `Config.is_ai_blocked()` / `ai_blocked_logical()` cover the AI-block tier.
 
@@ -196,6 +198,18 @@ taskkill //F //IM python.exe                                  # release DB lock 
 - Auto-start: `docgraph.host.auto_start: true` in telecode's `settings.json`.
 
 No code changes needed on the docgraph side — telecode just spawns the existing `host` CLI. Pointer: `<telecode>/docgraph/` package + the **DocGraph integration** section in `<telecode>/CLAUDE.md`.
+
+## External links
+
+`_maybe_fetch_links(cfg, force, cancel_check, progress_cb)` in `index.py` runs at the start of every index pass. It calls `fetch_all(cfg, cancel_check, progress_cb)` which iterates `<root>/.docgraph/links.json`. For each link older than `ttl_hours`, `fetch_link` runs a BFS crawl:
+
+- `depth=0` → seed page only (single HTTP GET, no link extraction)
+- `depth=1` → seed + all links found on the seed page
+- `max_pages=N` → stop after N total pages saved (0 = unlimited)
+- Cancel is propagated: `cancel_check` is called before each page fetch; `OperationCancelled` bubbles up and aborts the whole crawl
+- Progress: `progress_cb(depth_level, done, total_at_depth)` is called after each page; tray renders `[1/12] fetching · level N · done/total`
+
+Fetched pages are written to `<root>/.docgraph/fetched/<slug>/` and indexed as `File` nodes in the normal parse pass.
 
 ## Known limitations / next-up
 

@@ -57,9 +57,11 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 - **Multi-root** — `docgraph host --root A --root B` runs one process serving N independent repos, each with its own `.docgraph/graph.kuzu`. Every API/MCP call accepts a `root=<slug>` arg (closed enum, validated at the protocol layer). The single web UI's repo picker is populated from `GET /api/roots`.
 - **Indexer-side `--repo` (repeatable)** still works for monorepos: merges several path roots into one index. Different from multi-root above.
-- **Smart default ignores** — universal baseline (Cursor parity: `node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs only ignored when their marker file is detected.
+- **Smart default ignores** — universal baseline (`node_modules/`, `__pycache__/`, `.venv/`, `.next/`, `.gradle/`, lockfiles, binaries, plus Jupyter / MLflow / wandb / DVC / R / Haskell / Zig caches, plus documentation-only files: `README*`, `CHANGELOG*`, `LICENSE*`, `CONTRIBUTING*`, `AUTHORS*`, `CODEOWNERS`) layered with per-ecosystem autodetect (Node / Python / Maven / Gradle / Rust / .NET / Angular / Android / Swift / Ruby / Dart / Elixir / Scala / PHP / Go / Terraform / Unity) — ambiguous build dirs only ignored when their marker file is detected.
 - **Two-tier ignore** — `.cursorindexingignore` skips files entirely; `.cursorignore` indexes them but redacts bodies/snippets returned to the AI. The HTTP API also sandboxes `/api/file_content` to the repo root.
 - **Cursor-rules compatible** — drops in existing `.cursor/rules/*.mdc` and `AGENTS.md`; exposes them via `rules_for(file)`.
+- **External links** — each root can crawl external URLs alongside the code. Configure in `<root>/.docgraph/links.json`. BFS with `depth` (0 = seed page only; 1 = seed + all direct links), `max_pages` cap, and a `ttl_hours` staleness window. Fetched pages are indexed as `File` nodes with full embeddings and appear in search results alongside code. Re-fetched automatically when stale at the start of each index run.
+- **Extra local paths** — `<root>/.docgraph/repos.json` lists sibling repo paths to fold into the same graph. Useful for monorepos where subdirectories live at different absolute paths.
 
 ### Optional augmentation
 
@@ -270,9 +272,11 @@ Nodes: `File`, `Module`, `Class`, `Function`, `Variable`, and `Chunk`. `Function
 
 ## Languages bundled
 
-Out of the box: **python, javascript, typescript, tsx, java, go, rust, c, cpp, c_sharp, ruby, php, bash, html, css, json, yaml**.
+Out of the box: **python, javascript, typescript, tsx, java, go, rust, c, cpp, c_sharp, ruby, php, bash, html, css, json, yaml, markdown**.
 
-Adding more is two steps:
+Markdown files are indexed as sections keyed on ATX (`##`) and setext headings. Heading text is the entity name; the section body is embedded and searchable.
+
+Adding more languages is two steps:
 
 ```bash
 pip install tree-sitter-<lang>
@@ -308,6 +312,8 @@ Data lives at `<repo>/.docgraph/`:
 - `cache.json` — per-file `{hash, entities, edges}` for delta updates
 - `wiki/` — generated module pages
 - `llm_docstrings.json` — body-hash-keyed cache of generated docstrings
+- `repos.json` — extra sibling paths folded into this root's graph
+- `links.json` — external URLs with crawl config `{url, depth, max_pages, ttl_hours}`
 
 ## How incremental works
 
@@ -373,7 +379,7 @@ docgraph host --root /path/to/repo-a --root /path/to/repo-b   # one process, one
 docgraph host --root /path/to/repo-a --watch /path/to/repo-a  # also reindex repo-a on file change
 ```
 
-The workspace is **immutable for the host's lifetime** — adding/removing a root requires a host restart. Deliberate: keeps the closed-enum schema valid for the whole process.
+The workspace is **immutable for the host's lifetime** — adding/removing a root requires a host restart. Deliberate: keeps the closed-enum schema valid for the whole process. When supervised by telecode, the host restarts automatically when root paths are added or removed from the tray UI.
 
 A different concept lives one layer down: `docgraph index --repo` lets the **indexer** walk multiple sibling paths into ONE `.docgraph/graph.kuzu` (useful for monorepos). The two shapes can coexist.
 
