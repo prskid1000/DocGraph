@@ -317,6 +317,13 @@ def make_app(workspace: Workspace) -> FastAPI:
             depth = int(p.get("depth", default_depth)) if isinstance(p, dict) else default_depth
         except (TypeError, ValueError):
             depth = default_depth
+        # If a wiki job is already running for this root, return its id.
+        for _j in list(job_manager.jobs.values()):
+            if (_j.type == "wiki" and _j.root == str(slot.cfg.repo_root)
+                    and _j.status == "running"):
+                log.info("api_wiki_build: reusing running job %s for %s", _j.id, slot.cfg.repo_root)
+                return {"built": -1, "modules": [], "job_id": _j.id, "status": "running"}
+
         workspace.reset_cancel(slot.cfg.repo_root)
         token = workspace.cancel_token_for(slot.cfg.repo_root)
 
@@ -501,6 +508,14 @@ def make_app(workspace: Workspace) -> FastAPI:
         full = bool((payload or {}).get("full", False))
         fetch_links = bool((payload or {}).get("fetch_links", True))
         force_fetch = bool((payload or {}).get("force_fetch_links", False))
+        # If an index job is already running for this root, return its id
+        # rather than starting a second writer that would deadlock.
+        for _j in list(job_manager.jobs.values()):
+            if (_j.type == "index" and _j.root == str(slot.cfg.repo_root)
+                    and _j.status == "running"):
+                log.info("api_admin_index: reusing running job %s for %s", _j.id, slot.cfg.repo_root)
+                return {"slug": slot.slug, "full": full, "job_id": _j.id, "status": "running"}
+
         # Reset before kicking off so a stale cancel from a previous run
         # doesn't immediately abort.
         workspace.reset_cancel(slot.cfg.repo_root)
