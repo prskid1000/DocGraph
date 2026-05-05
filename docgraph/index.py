@@ -94,10 +94,32 @@ def _wire_extra_paths(cfg: Config) -> None:
         try:
             from docgraph.ignores import assemble_ignores
             import pathspec as _ps
-            patterns, ecosystems = assemble_ignores(p)
-            cfg.ignore_specs[p] = _ps.PathSpec.from_lines("gitignore", patterns)
-            cfg.user_ignore_specs[p] = _ps.PathSpec.from_lines("gitignore", [])
-            cfg.ai_block_specs[p] = _ps.PathSpec.from_lines("gitignore", [])
+            index_patterns, ecosystems = assemble_ignores(p)
+            # Mirror Config.__post_init__: read user-level ignore files so
+            # .gitignore / .docgraphignore inside the extra path are honoured.
+            user_patterns: list[str] = []
+            for _fname in (".gitignore", ".docgraphignore", ".cursorindexingignore"):
+                _ign = p / _fname
+                if _ign.exists():
+                    try:
+                        user_patterns.extend(
+                            _ign.read_text(encoding="utf-8", errors="ignore").splitlines()
+                        )
+                    except Exception:
+                        pass
+            index_patterns.extend(user_patterns)
+            cfg.ignore_specs[p] = _ps.PathSpec.from_lines("gitignore", index_patterns)
+            cfg.user_ignore_specs[p] = _ps.PathSpec.from_lines("gitignore", user_patterns)
+            ai_patterns: list[str] = []
+            _ci = p / ".cursorignore"
+            if _ci.exists():
+                try:
+                    ai_patterns.extend(
+                        _ci.read_text(encoding="utf-8", errors="ignore").splitlines()
+                    )
+                except Exception:
+                    pass
+            cfg.ai_block_specs[p] = _ps.PathSpec.from_lines("gitignore", ai_patterns)
             cfg.detected_ecosystems[p] = ecosystems
         except Exception as exc:
             log.warning("_wire_extra_paths: ignore-spec setup failed for %s: %s", p, exc)
