@@ -125,7 +125,11 @@ def _wire_extra_paths(cfg: Config) -> None:
             log.warning("_wire_extra_paths: ignore-spec setup failed for %s: %s", p, exc)
 
 
-def _maybe_fetch_links(cfg: Config, force: bool = False) -> None:
+def _maybe_fetch_links(
+    cfg: Config,
+    force: bool = False,
+    cancel_check: "Callable[[], None] | None" = None,
+) -> None:
     """Fetch stale external links and wire external_dir into cfg.extra_roots.
 
     Called before index_all() (and build_wiki()). If links.json has entries,
@@ -143,7 +147,7 @@ def _maybe_fetch_links(cfg: Config, force: bool = False) -> None:
     if not load_links(cfg.data_dir):
         return
 
-    fetch_all(cfg.data_dir, force=force)
+    fetch_all(cfg.data_dir, force=force, cancel_check=cancel_check)
 
     external_dir = cfg.external_dir
     if not external_dir.exists() or not list(external_dir.glob("*.html")):
@@ -518,7 +522,8 @@ class Indexer:
         _wire_extra_paths(self.cfg)
         if fetch_links:
             _emit("fetch_links")
-            _maybe_fetch_links(self.cfg, force=force_fetch)
+            _maybe_fetch_links(self.cfg, force=force_fetch,
+                               cancel_check=cancel_token.raise_if_set if cancel_token is not None else None)
 
         _ck()
         _emit("start")

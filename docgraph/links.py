@@ -19,6 +19,7 @@ class ExternalLink:
     ttl_hours: float = 24.0
     last_fetched: float | None = None   # Unix timestamp; None = never fetched
     page_count: int | None = None       # pages saved on last successful fetch
+    max_pages: int = 0                  # 0 = unlimited; caps BFS regardless of depth
 
     def is_stale(self) -> bool:
         if self.last_fetched is None:
@@ -51,6 +52,7 @@ def load_links(data_dir: Path) -> list[ExternalLink]:
                     if entry.get("last_fetched") is not None else None,
                 page_count=int(entry["page_count"])
                     if entry.get("page_count") is not None else None,
+                max_pages=int(entry.get("max_pages", 0)),
             ))
         return out
     except Exception:
@@ -66,7 +68,8 @@ def save_links(data_dir: Path, links: list[ExternalLink]) -> None:
 
 
 def upsert_link(
-    data_dir: Path, url: str, depth: int = 1, ttl_hours: float = 24.0
+    data_dir: Path, url: str, depth: int = 1, ttl_hours: float = 24.0,
+    max_pages: int = 0,
 ) -> list[ExternalLink]:
     """Add or update a link by URL. Returns the updated list."""
     links = load_links(data_dir)
@@ -74,9 +77,11 @@ def upsert_link(
         if lk.url == url:
             lk.depth = depth
             lk.ttl_hours = ttl_hours
+            lk.max_pages = max_pages
             save_links(data_dir, links)
             return links
-    links.append(ExternalLink(url=url, depth=depth, ttl_hours=ttl_hours))
+    links.append(ExternalLink(url=url, depth=depth, ttl_hours=ttl_hours,
+                              max_pages=max_pages))
     save_links(data_dir, links)
     return links
 

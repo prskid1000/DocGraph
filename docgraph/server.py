@@ -660,7 +660,9 @@ def make_app(workspace: Workspace) -> FastAPI:
             raise HTTPException(400, "url required")
         depth = int(payload.get("depth", 1))
         ttl_hours = float(payload.get("ttl_hours", 24.0))
-        links = upsert_link(slot.cfg.data_dir, url, depth, ttl_hours)
+        max_pages = int(payload.get("max_pages", 0))
+        links = upsert_link(slot.cfg.data_dir, url, depth, ttl_hours,
+                            max_pages=max_pages)
         return {"links": len(links)}
 
     @app.delete("/api/links")

@@ -17,6 +17,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Callable
 from html.parser import HTMLParser
 from pathlib import Path
 
@@ -77,12 +78,20 @@ def _fetch_page(url: str) -> str | None:
         return None
 
 
-def fetch_link(link: ExternalLink, external_dir: Path, force: bool = False) -> int:
+def fetch_link(
+    link: ExternalLink,
+    external_dir: Path,
+    force: bool = False,
+    cancel_check: Callable[[], None] | None = None,
+) -> int:
     """Fetch `link` into `external_dir`. Returns the number of pages saved.
 
     Skips entirely when the link is still fresh and `force` is False.
     Pages are written as `<url_slug>.html` (seed) and `<url_slug>__p2.html`,
     `__p3.html` … for subsequent crawl pages.
+
+    `cancel_check` is called between page fetches; it should raise to abort.
+    `link.max_pages > 0` caps the BFS regardless of depth.
 
     Mutates `link.last_fetched` and `link.page_count` in place; the
     caller is responsible for calling `save_links()` afterward.
@@ -97,8 +106,14 @@ def fetch_link(link: ExternalLink, external_dir: Path, force: bool = False) -> i
     visited: set[str] = set()
     queue: list[tuple[str, int]] = [(link.url, 0)]
     saved = 0
+    max_pages = link.max_pages or 0
 
     while queue:
+        if cancel_check is not None:
+            cancel_check()
+        if max_pages and saved >= max_pages:
+            log.debug("fetch %s: max_pages=%d reached, stopping", link.url, max_pages)
+            break
         url, depth = queue.pop(0)
         if url in visited:
             continue
@@ -135,6 +150,7 @@ def fetch_all(
     data_dir: Path,
     force: bool = False,
     only_url: str | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, int]:
     """Fetch all (or one) external links registered for this root.
 
@@ -151,7 +167,7 @@ def fetch_all(
     for lk in links:
         if only_url and lk.url != only_url:
             continue
-        count = fetch_link(lk, external_dir, force=force)
+        count = fetch_link(lk, external_dir, force=force, cancel_check=cancel_check)
         results[lk.url] = count
 
     save_links(data_dir, links)
