@@ -6,6 +6,9 @@ imported modules, sub-files), feed it to the LLM, and save the resulting
 Markdown to `.docgraph/wiki/<slug>.md`. The web UI lists and renders these
 pages; agents can also read them directly.
 
+External documentation indexing is a separate phase — crawled URLs are
+indexed once and cached, then reused across wiki generations.
+
 Off by default. Triggered by `docgraph wiki` or via `/api/wiki/build`.
 """
 from __future__ import annotations
@@ -20,6 +23,7 @@ from pathlib import Path
 from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.llm import LLMClient, LLMConfig
+from docgraph.external_docs import load_indexed_docs, format_indexed_docs_for_prompt
 
 log = logging.getLogger(__name__)
 
@@ -152,8 +156,13 @@ def _facts_for_module(db: GraphDB, module: str, files: list[str]) -> dict:
     }
 
 
-def _wiki_prompt(facts: dict) -> str:
-    """Build a prompt from a fact sheet. Asks for grounded prose."""
+def _wiki_prompt(facts: dict, external_docs_context: str = "") -> str:
+    """Build a prompt from a fact sheet. Asks for grounded prose.
+    
+    Args:
+        facts: The fact sheet for a module (classes, functions, imports, etc.)
+        external_docs_context: Optional context from indexed external documentation
+    """
     parts: list[str] = [
         f"You are writing a documentation page for the `{facts['module']}` module of a codebase.",
         f"It contains {facts['file_count']} files. Use ONLY the facts below — do not invent.",
@@ -183,6 +192,12 @@ def _wiki_prompt(facts: dict) -> str:
     if facts.get("tests"):
         tests = ", ".join(sorted({t.get("file", "") for t in facts["tests"]}))
         parts.append(f"- Tests covering it: {tests}")
+    
+    # Include external documentation context if available
+    if external_docs_context:
+        parts.append("")
+        parts.append(external_docs_context)
+    
     parts += ["", "## Output format", _wiki_output_format()]
     return "\n".join(parts)
 
@@ -241,6 +256,8 @@ def build_wiki(
 
     `depth=1` = top-level dirs only (old behavior). `depth=12` (default)
     = one page per leaf folder for any reasonable repo.
+    
+    External documentation context is loaded from cache (see external_docs.py).
     """
     llm = llm or LLMClient(LLMConfig(
         host=getattr(cfg, "llm_host", "localhost"),
@@ -279,6 +296,17 @@ def build_wiki(
             log.debug("wiki progress_cb raised; ignoring", exc_info=True)
 
     _emit("start", 0, len(groups))
+    
+    # Load indexed external docs from cache (separate phase)
+    external_docs_context = ""
+    try:
+        indexed_docs = load_indexed_docs(cfg)
+        if indexed_docs:
+            external_docs_context = format_indexed_docs_for_prompt(indexed_docs, limit=5)
+            _emit("load_external_docs", len(indexed_docs), len(indexed_docs))
+    except Exception as e:
+        log.debug(f"wiki: failed to load external docs: {e}")
+    
     pages: list[WikiPage] = []
     for i, g in enumerate(groups):
         # Cancel checkpoint between modules. Each page is its own LLM
@@ -326,7 +354,7 @@ def build_wiki(
             except Exception:
                 pass
         facts = _facts_for_module(db, module, g["files"])
-        prompt = _wiki_prompt(facts)
+        prompt = _wiki_prompt(facts, external_docs_context=external_docs_context)
         # Use chat() not _call_openai — _call_openai routes through _clean()
         # which truncates to a single line (correct for one-sentence
         # docstrings, fatal for multi-paragraph wiki pages).
