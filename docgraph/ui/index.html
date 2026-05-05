@@ -1526,30 +1526,17 @@ function runCommunities(iters){
       const sortedByPR = [...layout].sort((a,b)=>b.pagerank-a.pagerank).slice(0, labelMax);
       for (const n of sortedByPR) {
         if (vis && !vis.has(n.id)) continue;
-        ctx.fillText(nodeLabel(n), n.x + n.r + 3, n.y + 3);
+        ctx.fillText(n.name, n.x + n.r + 3, n.y + 3);
       }
       if (hoverId !== null) {
         const n = layoutById.get(hoverId);
         if (n) {
           ctx.fillStyle = "#fff";
           ctx.font = "12px ui-sans-serif, system-ui, sans-serif";
-          ctx.fillText(nodeLabel(n), n.x + n.r + 4, n.y + 4);
+          ctx.fillText(n.name, n.x + n.r + 4, n.y + 4);
         }
       }
       ctx.restore();
-    }
-
-    // Short display label for a graph node.
-    // File nodes show basename only; external crawl pages show just the page number (p14).
-    function nodeLabel(n) {
-      const name = n.name || "";
-      if (n.kind !== "File") return name;
-      const slash = Math.max(name.lastIndexOf("/"), name.lastIndexOf("\\"));
-      const base = slash >= 0 ? name.slice(slash + 1) : name;
-      const pageM = base.match(/__p(\d+)\.html?$/i);
-      if (pageM) return `p${pageM[1]}`;
-      if (base.length > 26) return base.slice(0, 24) + "…";
-      return base;
     }
 
     // Cheap neighbor lookup for highlight dimming
