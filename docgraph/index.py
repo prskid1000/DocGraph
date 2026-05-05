@@ -148,10 +148,15 @@ def _maybe_fetch_links(
     if not load_links(cfg.data_dir):
         return
 
-    fetch_all(cfg.data_dir, force=force, cancel_check=cancel_check,
+    external_dir = cfg.external_dir
+    # If pages were wiped (e.g. after `docgraph clear`) the TTL timestamp in
+    # links.json is stale relative to the file-system state — the link looks
+    # fresh but has no cached pages. Force a re-fetch in that case so a Clear
+    # + Index cycle doesn't silently produce 0 entities.
+    pages_missing = not external_dir.exists() or not list(external_dir.glob("*.html"))
+    fetch_all(cfg.data_dir, force=force or pages_missing, cancel_check=cancel_check,
               progress_cb=progress_cb)
 
-    external_dir = cfg.external_dir
     if not external_dir.exists() or not list(external_dir.glob("*.html")):
         return
 
