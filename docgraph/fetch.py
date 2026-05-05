@@ -83,6 +83,7 @@ def fetch_link(
     external_dir: Path,
     force: bool = False,
     cancel_check: Callable[[], None] | None = None,
+    progress_cb: Callable[[int, int, int], None] | None = None,
 ) -> int:
     """Fetch `link` into `external_dir`. Returns the number of pages saved.
 
@@ -91,6 +92,8 @@ def fetch_link(
     `__p3.html` … for subsequent crawl pages.
 
     `cancel_check` is called between page fetches; it should raise to abort.
+    `progress_cb(depth, done_at_depth, total_at_depth)` is called after each
+    page save. `total_at_depth` grows as new links are discovered.
     `link.max_pages > 0` caps the BFS regardless of depth.
 
     Mutates `link.last_fetched` and `link.page_count` in place; the
@@ -107,6 +110,9 @@ def fetch_link(
     queue: list[tuple[str, int]] = [(link.url, 0)]
     saved = 0
     max_pages = link.max_pages or 0
+    # BFS progress tracking: how many URLs exist and are done per depth level.
+    total_per_depth: dict[int, int] = {0: 1}
+    done_per_depth: dict[int, int] = {}
 
     while queue:
         if cancel_check is not None:
@@ -129,6 +135,7 @@ def fetch_link(
         out_path = external_dir / f"{slug}{suffix}.html"
         out_path.write_text(html, encoding="utf-8")
         saved += 1
+        done_per_depth[depth] = done_per_depth.get(depth, 0) + 1
         log.info("fetch: %s → %s", url, out_path.name)
 
         if depth < link.depth:
@@ -137,9 +144,23 @@ def fetch_link(
                 extractor.feed(html)
             except Exception:
                 pass
-            for child in extractor.links:
-                if child not in visited:
-                    queue.append((child, depth + 1))
+            new_links = [c for c in extractor.links if c not in visited]
+            if new_links:
+                total_per_depth[depth + 1] = (
+                    total_per_depth.get(depth + 1, 0) + len(new_links)
+                )
+            for child in new_links:
+                queue.append((child, depth + 1))
+
+        if progress_cb is not None:
+            try:
+                progress_cb(
+                    depth,
+                    done_per_depth[depth],
+                    total_per_depth.get(depth, 1),
+                )
+            except Exception:
+                pass
 
     link.last_fetched = time.time()
     link.page_count = saved
@@ -151,6 +172,7 @@ def fetch_all(
     force: bool = False,
     only_url: str | None = None,
     cancel_check: Callable[[], None] | None = None,
+    progress_cb: Callable[[int, int, int], None] | None = None,
 ) -> dict[str, int]:
     """Fetch all (or one) external links registered for this root.
 
@@ -167,7 +189,8 @@ def fetch_all(
     for lk in links:
         if only_url and lk.url != only_url:
             continue
-        count = fetch_link(lk, external_dir, force=force, cancel_check=cancel_check)
+        count = fetch_link(lk, external_dir, force=force,
+                           cancel_check=cancel_check, progress_cb=progress_cb)
         results[lk.url] = count
 
     save_links(data_dir, links)

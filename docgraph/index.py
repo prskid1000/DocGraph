@@ -129,6 +129,7 @@ def _maybe_fetch_links(
     cfg: Config,
     force: bool = False,
     cancel_check: "Callable[[], None] | None" = None,
+    progress_cb: "Callable[[int, int, int], None] | None" = None,
 ) -> None:
     """Fetch stale external links and wire external_dir into cfg.extra_roots.
 
@@ -147,7 +148,8 @@ def _maybe_fetch_links(
     if not load_links(cfg.data_dir):
         return
 
-    fetch_all(cfg.data_dir, force=force, cancel_check=cancel_check)
+    fetch_all(cfg.data_dir, force=force, cancel_check=cancel_check,
+              progress_cb=progress_cb)
 
     external_dir = cfg.external_dir
     if not external_dir.exists() or not list(external_dir.glob("*.html")):
@@ -522,8 +524,13 @@ class Indexer:
         _wire_extra_paths(self.cfg)
         if fetch_links:
             _emit("fetch_links")
+
+            def _fetch_progress(depth: int, done: int, total: int) -> None:
+                _emit(f"fetch:{depth}", done, total)
+
             _maybe_fetch_links(self.cfg, force=force_fetch,
-                               cancel_check=cancel_token.raise_if_set if cancel_token is not None else None)
+                               cancel_check=cancel_token.raise_if_set if cancel_token is not None else None,
+                               progress_cb=_fetch_progress)
 
         _ck()
         _emit("start")
