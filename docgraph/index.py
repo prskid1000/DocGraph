@@ -495,6 +495,7 @@ class Indexer:
 
         _wire_extra_paths(self.cfg)
         if fetch_links:
+            _emit("fetch_links")
             _maybe_fetch_links(self.cfg, force=force_fetch)
 
         _ck()
