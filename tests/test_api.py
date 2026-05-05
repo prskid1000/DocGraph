@@ -234,13 +234,6 @@ def test_rules_for(client: TestClient):
     assert isinstance(r.json(), list)
 
 
-def test_search_docs_empty(client: TestClient):
-    r = client.get("/api/search_docs", params={"q": "anything", "limit": 5})
-    assert r.status_code == 200
-    # No docs ingested in the conftest repo → empty list
-    assert r.json() == []
-
-
 def test_graph_dump(client: TestClient):
     r = client.get("/api/graph", params={"limit_nodes": 100})
     assert r.status_code == 200

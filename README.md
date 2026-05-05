@@ -28,7 +28,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
 - **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML. No torch dep — `pip install onnxruntime-gpu` / `-directml` / `-silicon`. Falls back to CPU silently if no GPU runtime is installed.
-- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound calls are opt-in: `docgraph docs add <url>` and `--llm-model <name>` (you supply the local server).
+- **Local-only by default** — no telemetry, no cloud round-trips. The only outbound calls are opt-in LLM requests via `--llm-model <name>` (you supply the local server).
 - **Configuration is flags-only.** No `DOCGRAPH_*` environment variables. Every knob is a CLI flag or a `load_config(...)` kwarg, so the spawn surface is fully visible in `ps` / Process Hacker.
 
 ### Retrieval
@@ -63,7 +63,6 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 ### Optional augmentation
 
-- **`@Docs` ingestion** — `docgraph docs add <url>` fetches and embeds external API docs; `search_docs(query)` MCP tool surfaces them. Idempotent.
 - **LLM-augmented docstrings (opt-in)** — `--llm-model <name>` enables it; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash.
 - **LLM-grounded wiki (opt-in)** — `docgraph wiki` walks every top-level module, builds a fact sheet from Kuzu, and asks the same local LLM to write a 200-300 word Markdown page per module. Saved to `.docgraph/wiki/<slug>.md` and shown in the Web UI.
 - **Right-panel Chat tab (opt-in)** — when `--llm-model` is set, the Web UI's right panel adds a **Chat** tab next to **Detail**. It POSTs `/api/chat` against the same configured local LLM, renders Markdown + JSON in replies, and — when an entity is selected in the graph — automatically attaches that entity's snippet/file/language as a system-message preamble so the model has the source without any copy-paste. Chat output isn't capped on OpenAI-compatible servers (the model writes until done); the meta line tracks the active root and re-pulls config when you switch the root selector. The tab stays hidden when no LLM is configured.
@@ -123,9 +122,6 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | `--workers INT` | `0` (auto) | Override worker count. `0` = `max(2, cpu_count - 1)`. |
 | `--embed-batch-size INT` | `256` (`32` with `--gpu`) | Lower if you hit GPU device-hung errors with `--gpu` / DirectML. |
 | `--embed-model STR` | `BAAI/bge-small-en-v1.5` | Override the fastembed model. Schema dim auto-aligns. Switching dim on an existing DB requires `clear` + reindex. |
-| `--documents` / `--no-documents` | `false` | Index repo documents (`.md` / `.txt` / `.rst` / small CSVs) as `Doc` nodes and binary / heavy files (`.pdf` / `.xlsx` / …) as `Asset` nodes with `REFERENCES_` edges. |
-| `--text-exts STR` | `md,markdown,txt,rst,csv` | Text-doc extensions. Implies `--documents`. |
-| `--asset-exts STR` | `pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,…` | Asset extensions. Implies `--documents`. |
 | `--verbose`, `-v` | `false` | Verbose logs |
 
 ### `docgraph host [path]`
@@ -139,7 +135,7 @@ docgraph host --root /repo-a --root /repo-b         # multi-root
 docgraph host --root /repo-a --watch /repo-a        # also reindex on change
 ```
 
-Accepts every `index`-time flag too (`--gpu`, `--embed-model`, `--llm-*`, `--rerank-default`, `--rerank-model`, `--rerank-gpu`, `--documents`, `--text-exts`, `--asset-exts`) plus:
+Accepts every `index`-time flag too (`--gpu`, `--embed-model`, `--llm-*`, `--rerank-default`, `--rerank-model`, `--rerank-gpu`) plus:
 
 | Flag | Default | Description |
 |---|---|---|
@@ -218,10 +214,6 @@ Delete `.docgraph/` for the repo (DB + cache + repos list).
 
 Print a JSON snippet ready to paste into Cursor / Claude Desktop's MCP config.
 
-### `docgraph docs add <url>` / `docs list` / `docs remove <url>`
-
-Fetch a URL, chunk + embed it, store as `Doc` nodes for `search_docs`. Idempotent. `--path PATH` (default cwd) selects which repo's `.docgraph/` to write to.
-
 ### `docgraph version`
 
 Print version.
@@ -263,7 +255,6 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 | `git_blame(file, line_start, line_end?)` | `git blame` per line |
 | `git_recent(file?, limit=20)` | Recent commits, optionally scoped to a file |
 | `rules_for(file)` | Auto-attach rules: `.cursor/rules/*.mdc` glob match + `AGENTS.md` / `CLAUDE.md` always-on |
-| `search_docs(query, limit=10)` | Semantic search across ingested external docs (`docgraph docs add <url>`) |
 | `list_roots()` | `[{slug, path, default, watching, last_indexed_at}, …]` |
 
 ## Relationships extracted
@@ -271,21 +262,11 @@ Copy the printed JSON into your client's MCP config. Example for Claude Desktop:
 | Tier | Edges |
 |---|---|
 | **Structural** | `CONTAINS`, `IMPORTS`, `IMPORTS_SYMBOL` (file → specific Class / Function imported by name) |
-| **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_` (also `File`/`Doc`/`Function`/`Class` → `Asset` when `--documents`), `RETURNS` |
+| **Behavioral** | `CALLS`, `INSTANTIATES`, `REFERENCES_`, `RETURNS` |
 | **Type system** | `INHERITS`, `IMPLEMENTS`, `OVERRIDES` (child→parent method via the inheritance closure), `DECORATED_BY` |
 | **Differentiators** | `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic name match) |
 
-Nodes: `File`, `Module`, `Class`, `Function`, `Variable`, `Chunk`, `Doc`, plus `Asset` (when `--documents` is on). `Function` / `Class` carry an embedding + PageRank score; `Doc` / `Chunk` carry embeddings; `Asset` is metadata only.
-
-## Document + asset indexing (opt-in)
-
-`docgraph index --documents` adds two extra tiers on top of the code graph:
-
-- **Tier 2 — text Docs.** `.md` / `.markdown` / `.txt` / `.rst` and small CSVs (≤ 1 MiB) extracted with stdlib only (no pypdf / openpyxl / python-docx), chunked, embedded, stored as `Doc(source=<repo-relative-path>, …)`. Surfaced through `search_docs`.
-- **Tier 3 — binary / heavy Assets.** `.pdf` / `.xlsx` / `.docx` / `.png` / `.mp4` / `.parquet` / fonts / archives / 3D meshes / installers become `Asset` nodes — metadata only.
-- **`REFERENCES_` edges.** Format-aware path scan emits edges from `File` / `Doc` / `Function` / `Class` to matching Assets. So `cypher("MATCH (a:Asset)<-[:REFERENCES_]-(n) WHERE a.path CONTAINS 'logo' RETURN n.path")` answers "where is this image used?" as a graph query.
-
-Idempotent — re-runs drop the file-tier `Doc` and `Asset` rows first; URL-tier `Doc` rows from `@Docs add` are preserved.
+Nodes: `File`, `Module`, `Class`, `Function`, `Variable`, and `Chunk`. `Function` / `Class` carry an embedding + PageRank score; `Chunk` carries embeddings.
 
 ## Languages bundled
 
@@ -349,12 +330,9 @@ Every retriever route accepts a `root=<slug>` query parameter. The slug is one o
 | `POST /api/admin/index` (`{full?: bool}`) | In-process incremental (or `full=true`) reindex via the workspace's writer-lock dance. Response: `{slug, full, stats, log}`. |
 | `POST /api/admin/clear` | Wipe a root's index (DB + cache + wiki). Broadcasts a `reindex_done {events: -1}` SSE. |
 | `POST /api/admin/cancel` | Cancel an in-flight `/api/admin/index` or `/api/wiki/build`. Returns 499 on the long-op. |
-| `GET  /api/docs/list` | Cursor `@Docs` parity readout — every URL ingested into this root with chunk counts. |
-| `POST /api/docs/add`  (`{url}`) | Fetch + chunk + embed a URL. Idempotent. Reuses the host's writer connection. |
-| `POST /api/docs/remove` (`{url}`) | Delete every `Doc` chunk for a URL. Returns `{url, removed_chunks}`. |
 | `POST /mcp` | Mounted FastMCP HTTP transport |
 | `GET /api/search?q=...&kind=...&limit=10` | Same as the MCP tool |
-| `GET /api/definition`, `/references`, `/call_graph`, `/file_map`, `/neighborhood`, `/explore`, `/impact_of`, `/test_impact`, `/git_changes`, `/git_blame`, `/git_recent`, `/rules_for`, `/search_docs` | All MCP retriever tools as REST GETs |
+| `GET /api/definition`, `/references`, `/call_graph`, `/file_map`, `/neighborhood`, `/explore`, `/impact_of`, `/test_impact`, `/git_changes`, `/git_blame`, `/git_recent`, `/rules_for` | All MCP retriever tools as REST GETs |
 | `POST /api/cypher` (`{query, limit}`) | Read-only Cypher |
 | `GET /api/graph?limit_nodes=2000` | All nodes + edges for the viewer |
 | `GET /api/stats` | Entity counts + per-edge-table counts |

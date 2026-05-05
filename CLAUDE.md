@@ -35,8 +35,6 @@ Local code knowledge graph. Tree-sitter parses, fastembed embeds (ONNX), Kuzu st
 | `rules.py` | `.cursor/rules/*.mdc` + `AGENTS.md` / `CLAUDE.md` glob-matching. |
 | `llm.py` | urllib client for OpenAI/Anthropic-compatible local servers. Sends `reasoning_effort: "none"` so reasoning models skip thinking. Prompt overrides via `set_docstring_prompt(text)`. |
 | `wiki.py` | LLM module wiki via `build_wiki(cfg, db, llm)`. Prompt-tail override via `set_wiki_prompt_tail(text)`. Falls back to a fact-sheet rendering when LLM unreachable. |
-| `docs.py` | URL fetch + HTML→text + chunk + `Doc` ingest (Cursor `@Docs` parity). `add_doc/remove_doc` accept an existing writer so `/api/docs/*` reuses the writer it already took. |
-| `documents.py` | Tier-2 (text Docs) + tier-3 (Asset metadata) walker. Reference extraction is format-aware. CSV size gate at 1 MiB. Off by default. |
 | `watch.py` | `watchfiles` loop. `watch_workspace` runs N async per-root tasks. Workspace-wide `Semaphore(1)` serializes reindexes. SSE `reindex_done {repo_slug, ts, events}`. |
 | `mcp_tools.py` | 15 retriever tools + `list_roots`. Dynamic `RootSlug` enum from workspace slugs. **No `from __future__ import annotations`** — Pydantic can't resolve closure-local enums otherwise. |
 | `mcp_stdio_proxy.py` | Strict stdio↔HTTP proxy for editors. Probes a running host first; refuses if scope path isn't a registered root. `--standalone` opts out. |
@@ -98,7 +96,7 @@ Files: `test_unit`, `test_indexer`, `test_retrieval`, `test_new_tools`, `test_mu
 
 Base: `search`, `definition`, `references`, `call_graph`, `file_map`, `neighborhood`.
 
-Differentiators: `explore`, `impact_of`, `test_impact`, `cypher` (read-only), `git_changes`, `git_blame`, `git_recent`, `rules_for`, `search_docs`, `search(rerank=True)`, `list_roots`.
+Differentiators: `explore`, `impact_of`, `test_impact`, `cypher` (read-only), `git_changes`, `git_blame`, `git_recent`, `rules_for`, `search(rerank=True)`, `list_roots`.
 
 Every retriever-backed tool ends with `root: RootSlug` typed as a dynamic `(str, Enum)` built from workspace slugs at boot. Single-root → enum has one default value (LLM doesn't see it). Multi-root → LLM picks from a closed set; protocol rejects typos. Don't add tools without a strong reason — `search` accepts `focus_file` / `focus_symbol` for personalized PageRank.
 
@@ -110,7 +108,7 @@ Every retriever-backed tool ends with `root: RootSlug` typed as a dynamic `(str,
 
 ## Cancellation
 
-Long ops (`/api/admin/index`, `/api/wiki/build`) are cooperatively cancellable via `POST /api/admin/cancel?root=<slug>`. One `CancelToken` per root in `cancel.py`. Long ops call `token.raise_if_set()` at phase boundaries (parse / embed / symbol-table / edge / tier-4 / pagerank / documents) — never mid-Kuzu-COPY or mid-ONNX, those would corrupt state. Routes translate `OperationCancelled` to HTTP 499. Telecode POSTs cancel **before** dropping the asyncio task, otherwise the connection drops first and the server never sees the signal. New long ops: same pattern (`reset_cancel` → `cancel_token_for` → pass in → `except OperationCancelled` → 499).
+Long ops (`/api/admin/index`, `/api/wiki/build`) are cooperatively cancellable via `POST /api/admin/cancel?root=<slug>`. One `CancelToken` per root in `cancel.py`. Long ops call `token.raise_if_set()` at phase boundaries (parse / embed / symbol-table / edge / tier-4 / pagerank) — never mid-Kuzu-COPY or mid-ONNX, those would corrupt state. Routes translate `OperationCancelled` to HTTP 499. Telecode POSTs cancel **before** dropping the asyncio task, otherwise the connection drops first and the server never sees the signal. New long ops: same pattern (`reset_cancel` → `cancel_token_for` → pass in → `except OperationCancelled` → 499).
 
 ## Watch mode
 
@@ -127,16 +125,6 @@ Adding an ecosystem: add to `TEMPLATES` + `_DETECTORS` in `ignores.py`.
 ## Sub-function chunking
 
 `summary.chunk_body(body, language=None)` splits entities > 1500 chars at scope boundaries (regex per language) once buffer crosses `CHUNK_TARGET_CHARS` (700). At hard cap (`CHUNK_MAX_CHARS` = 1400), mid-body split with overlap. Scope-aware flushes drop overlap so the next chunk starts cleanly. Stored as `Chunk` nodes with `CONTAINS_CHUNK` from parent. `Retriever._chunk_max_sims()` runs ALL chunk vectors against query once per search; entity score = `max(entity_sim, best_chunk_sim)`. Adding a language: drop a regex into `_SCOPE_BOUNDARY_PATTERNS`.
-
-## Document + asset indexing (opt-in)
-
-Off by default. Enable with `--documents` (or set extension lists, which imply `--documents`).
-
-- **Tier 2 — text Docs**: `md` / `markdown` / `txt` / `rst` / small CSVs (size-gated to 1 MiB). Stdlib only — no pypdf / openpyxl / python-docx. Stored as `Doc(source=<repo-relative-path>, …)`.
-- **Tier 3 — Assets**: `pdf` / `xlsx` / `docx` / `png` / `mp4` / `parquet` / fonts / archives / 3D meshes / installers. **No content extraction**, just `Asset(path, ext, size, mime, repo)`.
-- **Reference resolution**: format-aware string extraction, normalized lookup against asset paths → `REFERENCES_` edges (single edge table, multiple FROM/TO pairs).
-- URL Docs vs file Docs share the same table — disambiguated by leading scheme on `Doc.source`. Cleanup deletes only file-tier rows.
-- Walking uses `Config.is_ignored()` for **directory** pruning but `Config.is_user_ignored()` for **files** — the universal `*.pdf` / `*.png` exclusions would otherwise pre-empt tier 3.
 
 ## LLM + GPU
 
@@ -194,7 +182,6 @@ taskkill //F //IM python.exe                                  # release DB lock 
 - Reasoning-model endpoint without `reasoning_effort: "none"` → empty content.
 - `from __future__ import annotations` in `mcp_tools.py` / `server.py` → Pydantic can't resolve the closure-local `RootSlug` enum.
 - `str(enum_member)` on a `(str, Enum)` returns `'RootSlug.X'`, not `'x'`. Use `member.value`.
-- Wiping URL `Doc` rows with the file-tier cleanup query → kills every `@Docs` URL chunk. Filter by `NOT d.source STARTS WITH 'http(s)://'`.
 - Walking with `Config.is_ignored()` at the file level for the document pass → universal `*.pdf` / `*.png` swallow every asset before tier 3 sees it. Use `is_user_ignored()` for files; `is_ignored()` only for directory pruning.
 - DirectML embeddings can `DXGI_ERROR_DEVICE_HUNG` mid-inference under VRAM contention. The session is poisoned afterward. `Embedder.embed()` catches it, drops the cache, retries on CPU. Don't remove the recovery wrapper.
 - Mounting FastMCP into FastAPI without `lifespan="on"` in uvicorn → `/mcp` 500s.

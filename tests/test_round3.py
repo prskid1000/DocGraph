@@ -1,4 +1,4 @@
-"""Tests for round 3: cross-encoder reranker, scope-aware resolution, @Docs."""
+"""Tests for round 3: cross-encoder reranker and scope-aware resolution."""
 from __future__ import annotations
 
 import gc
@@ -10,131 +10,9 @@ import pytest
 
 from docgraph.config import load_config
 from docgraph.db import GraphDB
-from docgraph.docs import chunk_doc, html_to_text
 from docgraph.embed import Embedder
 from docgraph.index import Indexer
 from docgraph.rerank import Reranker
-from docgraph.retrieve import Retriever
-
-
-# --- HTML → text -------------------------------------------------------
-
-
-def test_html_to_text_strips_scripts():
-    html = """
-    <html>
-      <head><title>API Docs</title>
-        <style>body { color: red; }</style>
-        <script>var x = 1;</script>
-      </head>
-      <body>
-        <h1>Login</h1>
-        <p>Authenticate users by passing username and password.</p>
-        <script>analytics();</script>
-      </body>
-    </html>
-    """
-    title, text = html_to_text(html)
-    assert title == "API Docs"
-    assert "Authenticate users" in text
-    assert "var x" not in text
-    assert "analytics" not in text
-
-
-def test_html_to_text_preserves_pre():
-    html = "<p>Try:</p><pre>import x\nx.run()</pre>"
-    _, text = html_to_text(html)
-    assert "import x" in text
-    assert "```" in text  # we wrap <pre> blocks in markdown fences
-
-
-def test_chunk_doc_short_one_chunk():
-    text = "short docs"
-    assert chunk_doc(text) == [text]
-
-
-def test_chunk_doc_long_split_on_paragraphs():
-    paragraphs = [f"Paragraph {i} " * 30 for i in range(10)]
-    text = "\n\n".join(paragraphs)
-    chunks = chunk_doc(text)
-    assert len(chunks) > 1
-    # No chunk should massively exceed the target size
-    assert all(len(c) < 1500 for c in chunks)
-
-
-# --- @Docs end-to-end (offline; mock fetch_url) -----------------------
-
-
-@pytest.fixture
-def docs_repo(tmp_path: Path) -> Path:
-    (tmp_path / ".git").mkdir()  # so find_repo_root locks here
-    return tmp_path
-
-
-def test_add_list_remove_doc(docs_repo: Path):
-    from docgraph import docs as docs_mod
-
-    cfg = load_config(docs_repo)
-
-    fake_html = """
-    <html><head><title>Test API</title></head>
-    <body><h1>Login</h1><p>Pass username and password to authenticate users.</p>
-    <p>Returns a session token on success.</p></body></html>
-    """
-    with patch.object(docs_mod, "fetch_url", return_value=docs_mod.html_to_text(fake_html)):
-        out = docs_mod.add_doc(cfg, "https://example.com/api")
-    assert out["chunks"] >= 1
-    assert out["title"] == "Test API"
-
-    # Need a fresh reader to see the writes
-    gc.collect()
-    rows = docs_mod.list_docs(cfg)
-    assert any(r["source"] == "https://example.com/api" for r in rows)
-
-    n = docs_mod.remove_doc(cfg, "https://example.com/api")
-    assert n >= 1
-
-
-def test_search_docs_returns_relevant(docs_repo: Path):
-    from docgraph import docs as docs_mod
-
-    cfg = load_config(docs_repo)
-    fake_pages = {
-        "https://example.com/auth": (
-            "Auth API",
-            "Authenticate users by passing username and password. "
-            "Returns a session token on success.",
-        ),
-        "https://example.com/files": (
-            "Files API",
-            "Upload, download and delete files. Files are stored in S3.",
-        ),
-    }
-    for url, (title, body) in fake_pages.items():
-        with patch.object(docs_mod, "fetch_url", return_value=(title, body)):
-            docs_mod.add_doc(cfg, url)
-
-    gc.collect()
-    db = GraphDB(cfg.db_path, read_only=True)
-    embedder = Embedder(cfg.embedding_model)
-    r = Retriever(db, embedder, cfg=cfg)
-
-    results = r.search_docs("how do I log in users", limit=5)
-    assert results
-    # Auth doc should rank above the files doc for an auth-related query
-    assert "auth" in results[0]["source"]
-
-
-def test_search_docs_empty_when_no_docs(tmp_path: Path):
-    cfg = load_config(tmp_path)
-    db = GraphDB(cfg.db_path, embedding_dim=384)
-    db.init_schema()
-    del db
-    gc.collect()
-    db = GraphDB(cfg.db_path, read_only=True)
-    embedder = Embedder(cfg.embedding_model)
-    r = Retriever(db, embedder, cfg=cfg)
-    assert r.search_docs("anything") == []
 
 
 # --- Reranker (mocked to avoid model download) ------------------------

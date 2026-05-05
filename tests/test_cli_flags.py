@@ -180,7 +180,7 @@ def test_llm_model_alone_does_not_enable_docstrings(tmp_path: Path) -> None:
 
 @pytest.mark.parametrize("cmd", [
     "version", "index", "host", "watch", "serve", "mcp",
-    "stats", "wiki", "clear", "install-mcp", "docs", "daemon",
+    "stats", "wiki", "clear", "install-mcp", "daemon",
 ])
 def test_every_command_has_help(cmd: str) -> None:
     out = _help_text(cmd)

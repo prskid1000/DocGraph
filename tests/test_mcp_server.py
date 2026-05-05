@@ -20,7 +20,7 @@ EXPECTED_TOOLS = {
     "search", "definition", "references", "call_graph", "file_map", "neighborhood",
     "explore", "impact_of", "test_impact", "cypher",
     "git_changes", "git_blame", "git_recent",
-    "rules_for", "search_docs",
+    "rules_for",
     "list_roots",
 }
 
@@ -67,8 +67,8 @@ def test_all_tools_registered(mcp):
 
 def test_tool_count(mcp):
     tools = _run(mcp.list_tools())
-    # 15 retriever-backed tools + list_roots
-    assert len(tools) == 16
+    # 14 retriever-backed tools + list_roots
+    assert len(tools) == 15
 
 
 def test_list_roots_tool(mcp):
@@ -200,13 +200,6 @@ def test_rules_for_tool(mcp):
     assert isinstance(out, list)
     # No .mdc files in conftest repo, so list is empty (or contains AGENTS.md
     # if it ever gets seeded). Either way: a list, no error.
-
-
-def test_search_docs_tool_empty(mcp):
-    out = _structured(_run(mcp.call_tool("search_docs", {"query": "anything"})))
-    assert isinstance(out, list)
-    # No docs ingested in conftest → empty
-    assert out == []
 
 
 def test_unknown_tool_raises(mcp):

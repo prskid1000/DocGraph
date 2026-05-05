@@ -1,6 +1,6 @@
 """Cooperative cancellation for long-running host operations.
 
-The host runs index / wiki / docs-add via `await asyncio.to_thread(...)`,
+The host runs index / wiki via `await asyncio.to_thread(...)`,
 so the underlying threadpool worker doesn't notice when the asyncio task
 is cancelled (e.g. the client disconnects). This module provides a
 threadsafe `CancelToken` the long ops poll at safe checkpoints, plus a

@@ -155,12 +155,6 @@ def make_mcp(workspace: Workspace) -> FastMCP:
         return _retriever(root).git_recent(file=file, limit=limit)
 
     @mcp.tool()
-    def search_docs(query: str, limit: int = 10, root: RootSlug = DEFAULT) -> list[dict]:
-        """Semantic search across ingested external documentation.
-        Add docs first: `docgraph docs add <url>`. Cursor @Docs parity."""
-        return _retriever(root).search_docs(query, limit=limit)
-
-    @mcp.tool()
     def rules_for(file: str, root: RootSlug = DEFAULT) -> list[dict]:
         """Auto-attach rules for `file`: matches .cursor/rules/*.mdc by glob,
         plus AGENTS.md / CLAUDE.md as always-on. Compatible with the Cursor

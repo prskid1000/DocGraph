@@ -376,10 +376,6 @@ def make_app(workspace: Workspace) -> FastAPI:
     async def api_rules_for(file: str, root: RootSlug = DEFAULT):
         return _r(root).rules_for(file)
 
-    @app.get("/api/search_docs")
-    async def api_search_docs(q: str, limit: int = 10, root: RootSlug = DEFAULT):
-        return _r(root).search_docs(q, limit=limit)
-
     @app.get("/api/graph")
     async def api_graph(limit_nodes: int = 10000, root: RootSlug = DEFAULT):
         return _r(root).graph_dump(limit_nodes=limit_nodes)
@@ -737,105 +733,6 @@ def make_app(workspace: Workspace) -> FastAPI:
         except Exception as exc:
             raise HTTPException(502, f"LLM call failed: {exc}") from exc
         return {"content": content, "model": client.cfg.model}
-
-    # External docs (`@Docs` parity). Add takes the writer; list reads from
-    # the slot's existing RO handle; remove takes the writer briefly.
-    @app.get("/api/docs/list")
-    async def api_docs_list(root: RootSlug = DEFAULT):
-        from docgraph.docs import list_docs
-        slot = _slot(root)
-        return await asyncio.to_thread(list_docs, slot.cfg)
-
-    @app.post("/api/docs/add")
-    async def api_docs_add(payload: dict, root: RootSlug = DEFAULT):
-        from docgraph.docs import prepare_doc, store_prepared_doc
-        slot = _slot(root)
-        url = (payload or {}).get("url", "").strip()
-        if not url:
-            raise HTTPException(400, "url is required")
-
-        workspace.reset_cancel(slot.cfg.repo_root)
-        token = workspace.cancel_token_for(slot.cfg.repo_root)
-        
-        job = job_manager.create_job("docs_add", str(slot.cfg.repo_root), token)
-        # mark queued progress so callers see initial state immediately
-        try:
-            job_manager.update_job_progress(job.id, {"phase": "queued", "current": 0, "total": 0, "message": "queued", "ts": time.time()})
-        except Exception:
-            pass
-
-        # progress callback for add_doc: phase, current, total, message
-        def _progress_cb(phase: str, current: int = 0, total: int = 0, message: str = "") -> None:
-            import time as _t
-            payload = {
-                "job_id": job.id,
-                "repo_slug": slot.slug,
-                "phase": phase,
-                "current": int(current),
-                "total": int(total),
-                "message": message,
-                "ts": _t.time(),
-            }
-            broadcast(app, "docs_progress", payload)
-            try:
-                job_manager.update_job_progress(job.id, payload)
-            except Exception:
-                pass
-
-        def _do() -> dict:
-            prepared = prepare_doc(slot.cfg, url, cancel_token=token, progress_cb=_progress_cb)
-            if prepared.get("error"):
-                return prepared
-            writer = workspace.take_writer(slot.cfg.repo_root)
-            try:
-                return store_prepared_doc(
-                    slot.cfg,
-                    prepared,
-                    db=writer,
-                    cancel_token=token,
-                    progress_cb=_progress_cb,
-                )
-            finally:
-                workspace.release_writer(slot.cfg.repo_root)
-
-        async def _run_job():
-            try:
-                out = await asyncio.to_thread(_do)
-                if isinstance(out, dict) and out.get("error"):
-                    job_manager.finish_job(job.id, "failed", error=out["error"])
-                else:
-                    job_manager.finish_job(job.id, "completed", result=out)
-            except OperationCancelled:
-                workspace.reset_cancel(slot.cfg.repo_root)
-                job_manager.finish_job(job.id, "cancelled", error="docs add cancelled")
-            except Exception as exc:
-                log.exception("api_docs_add failed: %s", exc)
-                job_manager.finish_job(job.id, "failed", error=str(exc))
-
-        asyncio.create_task(_run_job())
-        return {"url": url, "job_id": job.id, "status": "running"}
-
-    @app.post("/api/docs/remove")
-    async def api_docs_remove(payload: dict, root: RootSlug = DEFAULT):
-        from docgraph.docs import remove_doc
-        slot = _slot(root)
-        url = (payload or {}).get("url", "").strip()
-        if not url:
-            raise HTTPException(400, "url is required")
-
-        def _do() -> int:
-            writer = workspace.take_writer(slot.cfg.repo_root)
-            try:
-                return remove_doc(slot.cfg, url, db=writer)
-            finally:
-                workspace.release_writer(slot.cfg.repo_root)
-
-        try:
-            removed = await asyncio.to_thread(_do)
-        except Exception as exc:
-            log.exception("api_docs_remove failed: %s", exc)
-            raise HTTPException(500, f"docs remove failed: {exc}") from exc
-        return {"url": url, "removed_chunks": removed}
 
     # Mount the FastMCP HTTP app under /mcp. Telecode's bridge does
     # POST http://host:port/mcp; Starlette redirects /mcp → /mcp/ which

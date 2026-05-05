@@ -56,18 +56,6 @@ console = Console()
 LOG_FMT = "%(asctime)s %(levelname)-7s %(name)s: %(message)s"
 
 
-def _parse_ext_csv(raw: str | None) -> tuple[str, ...] | None:
-    """Parse a CSV extension list into a normalized tuple. None / empty
-    returns None so load_config falls back to its defaults."""
-    if not raw:
-        return None
-    out = tuple(
-        e.strip().lstrip(".").lower()
-        for e in raw.split(",") if e.strip()
-    )
-    return out or None
-
-
 def _setup_logging(verbose: bool) -> None:
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
@@ -137,24 +125,6 @@ def index(
         0, "--workers",
         help="Override the indexer worker count. 0 = auto (max(2, cpu_count - 1)).",
     ),
-    documents: bool = typer.Option(
-        False, "--documents/--no-documents",
-        help="Also index repo documents (.md/.txt/.rst/small CSVs) and "
-             "register heavy / binary files (.pdf/.xlsx/.png/.mp4/etc.) "
-             "as Asset nodes with REFERENCES_ edges from any code/doc that "
-             "mentions them by path. Off by default.",
-    ),
-    text_exts: str = typer.Option(
-        "", "--text-exts",
-        help="Comma-separated list of extensions for the text-doc tier "
-             "(default: md,markdown,txt,rst,csv). Implies --documents.",
-    ),
-    asset_exts: str = typer.Option(
-        "", "--asset-exts",
-        help="Comma-separated list of extensions for the asset tier "
-             "(default: pdf,xlsx,docx,png,jpg,svg,mp4,parquet,zip,...). "
-             "Implies --documents.",
-    ),
     embed_model: str | None = typer.Option(
         None, "--embed-model",
         help="HF id of the embedding model.",
@@ -184,8 +154,6 @@ def index(
     (Apple Silicon) to light it up. Silently falls back to CPU otherwise.
     """
     _setup_logging(verbose)
-    text_exts_t = _parse_ext_csv(text_exts)
-    asset_exts_t = _parse_ext_csv(asset_exts)
     cfg = load_config(
         path,
         extra_roots=repo if repo else None,
@@ -197,9 +165,6 @@ def index(
         llm_model=llm_model or "qwen3.6-35b",
         llm_format=llm_format,
         llm_max_tokens=llm_max_tokens,
-        index_documents=bool(documents or text_exts or asset_exts),
-        text_extensions=text_exts_t,
-        asset_extensions=asset_exts_t,
     )
     if workers > 0:
         cfg.workers = workers
@@ -397,20 +362,6 @@ def host(
         None, "--llm-prompt-wiki-file",
         help="Path to a custom wiki output-format tail. ",
     ),
-    # Document + asset indexing (opt-in, mirrors `docgraph index`).
-    documents: bool = typer.Option(
-        False, "--documents",
-        help="Enable the tier-2/3 document + asset pass on indexes "
-             "triggered through this host.",
-    ),
-    text_exts: str | None = typer.Option(
-        None, "--text-exts",
-        help="Comma-separated text extensions. Implies --documents. ",
-    ),
-    asset_exts: str | None = typer.Option(
-        None, "--asset-exts",
-        help="Comma-separated asset extensions. Implies --documents. ",
-    ),
     # Lock manager timeouts. Reads block briefly when a writer is held;
     # writers queue. Tuning these trades 503-bounces for client-side
     # latency. Watcher writes always queue (no timeout).
@@ -421,7 +372,7 @@ def host(
     ),
     write_wait_timeout: float = typer.Option(
         60.0, "--write-wait-timeout",
-        help="Seconds an API index/docs writer waits in queue before "
+        help="Seconds an API index writer waits in queue before "
              "503'ing. Watcher writes ignore this (always queue).",
     ),
     wiki_write_timeout: float = typer.Option(
@@ -478,7 +429,6 @@ def host(
         "rerank_default": rerank_default,
         "rerank_gpu": rerank_gpu,
         "wiki_depth": wiki_depth,
-        "index_documents": bool(documents or text_exts or asset_exts),
     }
     if embed_model:                overrides["embedding_model"] = embed_model
     if embed_dim:                  overrides["embedding_dim"] = embed_dim
@@ -499,11 +449,6 @@ def host(
     if llm_max_tokens_chat is not None: overrides["llm_max_tokens_chat"] = llm_max_tokens_chat
     if llm_api_key:                overrides["llm_api_key"] = llm_api_key
     if llm_timeout:                overrides["llm_timeout"] = llm_timeout
-    text_exts_t = _parse_ext_csv(text_exts)
-    asset_exts_t = _parse_ext_csv(asset_exts)
-    if text_exts_t:                overrides["text_extensions"] = text_exts_t
-    if asset_exts_t:               overrides["asset_extensions"] = asset_exts_t
-
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
     # Apply lock-timeout overrides directly on the workspace's LockTimeouts
@@ -828,60 +773,6 @@ def clear(
     if cfg.data_dir.exists():
         shutil.rmtree(cfg.data_dir)
     console.print(f"[green]Cleared[/green] {cfg.data_dir}")
-
-
-docs_app = typer.Typer(help="Manage external documentation (Cursor @Docs parity).")
-app.add_typer(docs_app, name="docs")
-
-
-@docs_app.command("add")
-def docs_add(
-    url: str = typer.Argument(..., help="Documentation URL to fetch and index"),
-    path: Path = typer.Option(Path.cwd(), "--path", help="Repo whose .docgraph/ to write to"),
-) -> None:
-    """Fetch a URL, chunk + embed it, store as Doc nodes for semantic search."""
-    cfg = load_config(path)
-    from docgraph.docs import add_doc
-    console.print(f"[cyan]Fetching[/cyan] {url}")
-    try:
-        out = add_doc(cfg, url)
-    except Exception as e:  # noqa: BLE001
-        console.print(f"[red]Failed:[/red] {e}")
-        raise typer.Exit(1)
-    if "error" in out:
-        console.print(f"[yellow]{out['error']}[/yellow]")
-        raise typer.Exit(1)
-    console.print(f"[green]Indexed[/green] {out['chunks']} chunks — {out['title'] or url}")
-
-
-@docs_app.command("list")
-def docs_list(
-    path: Path = typer.Option(Path.cwd(), "--path"),
-) -> None:
-    """List all ingested doc URLs and their chunk counts."""
-    cfg = load_config(path)
-    from docgraph.docs import list_docs
-    rows = list_docs(cfg)
-    if not rows:
-        console.print("[yellow]No docs ingested yet. Try:[/yellow] docgraph docs add <url>")
-        return
-    table = Table(title="Ingested docs")
-    table.add_column("Source"); table.add_column("Title"); table.add_column("Chunks", justify="right")
-    for r in rows:
-        table.add_row(r["source"], r.get("title") or "", str(r["chunks"]))
-    console.print(table)
-
-
-@docs_app.command("remove")
-def docs_remove(
-    url: str = typer.Argument(...),
-    path: Path = typer.Option(Path.cwd(), "--path"),
-) -> None:
-    """Delete all chunks for a previously-ingested doc URL."""
-    cfg = load_config(path)
-    from docgraph.docs import remove_doc
-    n = remove_doc(cfg, url)
-    console.print(f"[green]Removed[/green] {n} chunks for {url}")
 
 
 daemon_app = typer.Typer(help="Manage the optional embedding daemon (faster cold start across CLI invocations).")

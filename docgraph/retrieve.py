@@ -805,39 +805,6 @@ class Retriever:
             return []
         return _rules_for(self.cfg, file)
 
-    # --- @Docs (external knowledge) ---------------------------------------
-
-    def search_docs(self, query: str, limit: int = 10) -> list[dict]:
-        """Semantic search across ingested external documentation
-        (`docgraph docs add <url>`). Cursor `@Docs` parity."""
-        try:
-            rows = self.db.fetch_all(
-                "MATCH (d:Doc) RETURN d.id AS id, d.source AS source, "
-                "d.title AS title, d.idx AS idx, d.body AS body, "
-                "d.embedding AS embedding"
-            )
-        except Exception:
-            return []
-        if not rows:
-            return []
-        qvec = self.embedder.embed([query])[0]
-        mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
-        qv = np.array(qvec, dtype=np.float32)
-        qv = qv / (np.linalg.norm(qv) + 1e-9)
-        mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
-        sims = (mat @ qv).tolist()
-        out = []
-        for r, s in zip(rows, sims):
-            out.append({
-                "source": r["source"],
-                "title": r["title"],
-                "idx": r["idx"],
-                "snippet": (r["body"] or "")[:600],
-                "score": float(s),
-            })
-        out.sort(key=lambda x: x["score"], reverse=True)
-        return out[:limit]
-
     _ALL_GRAPH_EDGES = (
         "CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
         "IMPLEMENTS", "OVERRIDES", "REFERENCES_", "INSTANTIATES",

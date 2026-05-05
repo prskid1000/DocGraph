@@ -74,9 +74,7 @@ class Workspace:
         self._order: list[Path] = []
         self._embedders: dict[tuple[str, bool], Embedder] = {}
         # One cooperative-cancel token per root, shared across whatever
-        # long-op is currently running for that root (index / wiki /
-        # docs-add — only one runs at a time per root because they all
-        # take the writer lock).
+        # long-op is currently running for that root (index / wiki).
         self._cancel_tokens: dict[Path, CancelToken] = {}
         # Lock timeouts (read gate / writer queue / wiki) — surfaced via
         # CLI flags + telecode settings. The host caches the running

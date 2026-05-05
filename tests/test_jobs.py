@@ -129,29 +129,6 @@ def test_wiki_job(tmp_path: Path, monkeypatch):
         assert "result" in rj.json()
         assert rj.json()["result"]["built"] == 1
 
-def test_docs_add_job(tmp_path: Path, monkeypatch):
-    cfg = setup_repo(tmp_path, "docs_repo")
-    ws = Workspace([cfg])
-    app = make_app(ws)
-    
-    # Mock add_doc to avoid network
-    def mock_add_doc(*args, **kwargs):
-        return {"url": "http://example.com", "chunks": 10}
-    
-    import docgraph.docs
-    monkeypatch.setattr(docgraph.docs, "add_doc", mock_add_doc)
-    
-    with TestClient(app) as client:
-        r = client.post("/api/docs/add", json={"url": "http://example.com"})
-        assert r.status_code == 200
-        job_id = r.json()["job_id"]
-        
-        for _ in range(20):
-            time.sleep(0.5)
-            rj = client.get(f"/api/jobs/{job_id}")
-            if rj.json()["status"] == "completed":
-                break
-        
 def test_multiple_concurrent_jobs(tmp_path: Path):
     # Setup 3 different repos
     cfgs = [setup_repo(tmp_path, f"repo_concurrent_{i}") for i in range(3)]

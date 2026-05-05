@@ -10,7 +10,7 @@ handle so the writer can grab the file lock).
 
 - Writers queue. `acquire_write(label, timeout)` blocks until the
   current writer releases or times out. Watcher reindex / API index /
-  wiki / docs-add all go through here.
+  wiki all go through here.
 - Readers don't take the lock — they pass through when no writer is
   active. When a writer IS active, `wait_idle(timeout)` blocks until
   the writer drains. Times out → caller raises HTTP 503.
@@ -184,7 +184,7 @@ class DBLock:
 class LockTimeouts:
     """Per-host lock timeouts. Surface via CLI flags + telecode settings."""
     read_wait: float = 5.0          # reader gate timeout
-    write_wait: float = 60.0        # API index / docs writer queue timeout
+    write_wait: float = 60.0        # API index writer queue timeout
     wiki_write: float = 180.0       # wiki builds run longer
     watcher_write: float = 0.0      # 0 = wait forever (watch always queues)
     force_free_after: float = 300.0 # log + cancel a writer holding > 5 min
