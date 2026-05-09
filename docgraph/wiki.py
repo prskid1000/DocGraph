@@ -272,7 +272,7 @@ def build_wiki(
         format=getattr(cfg, "llm_format", "openai") or "openai",
         max_tokens=int(getattr(cfg, "llm_max_tokens", 150) or 150),
         api_key=getattr(cfg, "llm_api_key", "") or None,
-        timeout=int(getattr(cfg, "llm_timeout", 60) or 60),
+        timeout=int(getattr(cfg, "llm_timeout", 1800) or 1800),
     ))
     # Wiki pages need much more headroom than docstrings (150 tokens).
     # Bump for the wiki call only — the original LLMConfig stays unchanged

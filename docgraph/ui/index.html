@@ -324,10 +324,11 @@
     #chat { display: none; flex-direction: column; flex: 1; min-height: 0; padding: 0; }
     #chat[data-active="1"] { display: flex; }
     .chat-attach {
-      display: flex; align-items: center; gap: 6px; padding: 6px 12px;
+      align-items: center; gap: 6px; padding: 6px 12px;
       border-bottom: 1px solid var(--border); background: var(--bg-alt);
       font-size: 11px;
     }
+    .chat-attach:not([hidden]) { display: flex; }
     .chat-attach-label { color: var(--fg-dim); }
     .chat-attach-name {
       color: var(--accent); font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
@@ -2494,6 +2495,7 @@ function runCommunities(iters){
         buttons.forEach(b => b.classList.toggle("active", b.dataset.tab === name));
         // Detail panel uses default block layout; Chat uses flex via [data-active].
         panels.detail.style.display = name === "detail" ? "" : "none";
+        panels.chat.hidden = name !== "chat";
         panels.chat.dataset.active = name === "chat" ? "1" : "";
         if (name === "chat") {
           const ta = document.getElementById("chat-input");

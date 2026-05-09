@@ -822,7 +822,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             api_key=getattr(cfg, "llm_api_key", "") or None,
             # max_tokens here is only used as the Anthropic fallback below.
             max_tokens=int(explicit_cap or 8192),
-            timeout=int(getattr(cfg, "llm_timeout", 60) or 60),
+            timeout=int(getattr(cfg, "llm_timeout", 1800) or 1800),
         ))
         try:
             if client.cfg.format == "anthropic":

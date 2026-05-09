@@ -68,9 +68,8 @@ class Config:
     # API key for the LLM server (forwarded as Authorization / x-api-key
     # depending on `llm_format`). Empty = no auth header.
     llm_api_key: str = ""
-    # Per-request HTTP timeout in seconds for LLM calls. Wiki page generation
-    # on large modules can take 30s+ on local servers.
-    llm_timeout: int = 60
+    # Per-request HTTP timeout in seconds for LLM calls.
+    llm_timeout: int = 1800
     # Wiki module-grouping depth used by the host's /api/wiki/build when the
     # request payload doesn't override it. 1 = top-level dirs only,
     # 12 = one page per leaf folder.
@@ -265,7 +264,7 @@ def load_config(
     llm_max_tokens_wiki: int = 4096,
     llm_max_tokens_chat: int = 0,
     llm_api_key: str = "",
-    llm_timeout: int = 60,
+    llm_timeout: int = 1800,
     wiki_depth: int = 12,
     workers: int | None = None,
     embed_batch_size: int = 256,
