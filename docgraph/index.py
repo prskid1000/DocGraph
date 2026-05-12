@@ -1250,7 +1250,8 @@ class Indexer:
                 state=state,
             )
 
-        # Persist state (last-known git HEAD per root, etc.)
+        # Persist state (last-known git HEAD, last_indexed_at, etc.)
+        state["last_indexed_at"] = time.time()
         self._save_state(state)
 
         # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----

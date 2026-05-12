@@ -129,9 +129,19 @@ class Workspace:
         embedder = self._embedder_for(cfg)
         retriever = Retriever(db_ro, embedder, cfg=cfg)
         slug = slug_for_root(root)
+        state_path = cfg.data_dir / "state.json"
+        try:
+            import json as _json
+            _state = _json.loads(state_path.read_text()) if state_path.exists() else {}
+            _last_indexed = _state.get("last_indexed_at") or None
+            if _last_indexed is not None:
+                _last_indexed = float(_last_indexed)
+        except Exception:
+            _last_indexed = None
         slot = RootSlot(
             cfg=cfg, db_ro=db_ro, retriever=retriever,
             slug=slug,
+            last_indexed_at=_last_indexed,
             lock=DBLock(name=slug),
         )
         self._slots[root] = slot
