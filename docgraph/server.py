@@ -145,8 +145,8 @@ def make_app(workspace: Workspace) -> FastAPI:
     # SSE (would deadlock — consumer waits for events emitted AFTER the
     # write completes) and the chat endpoint (LLM-only, no DB).
     _GATE_SKIP_PREFIXES = (
-        "/api/jobs/", "/api/admin/cancel", "/api/locks",
-        "/api/roots", "/api/llm_config", "/api/events",
+        "/api/jobs/", "/api/admin/cancel", "/api/admin/models_status",
+        "/api/locks", "/api/roots", "/api/llm_config", "/api/events",
         "/api/chat", "/api/file_content",
     )
 
@@ -216,6 +216,13 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.get("/api/roots")
     async def api_roots():
         return workspace.list()
+
+    # Pooled embedder + reranker load state. Cheap (no IO, no model
+    # work) — telecode polls this from its tray Status section to
+    # paint per-model indicators alongside the host info.
+    @app.get("/api/admin/models_status")
+    async def api_models_status():
+        return workspace.models_status()
 
     # Lock observability — show what's holding writers / queue depths.
     # Useful for debugging "why is /api/stats slow" or "why is the UI

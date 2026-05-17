@@ -402,6 +402,56 @@ class Workspace:
         so a stale prior cancel doesn't immediately abort the new run."""
         self.cancel_token_for(root).reset()
 
+    # ── model load state ──────────────────────────────────────────────
+    def models_status(self) -> dict:
+        """Snapshot of pooled embedder + reranker load state. Designed
+        for status dashboards: returns load flag, idle age, configured
+        unload window, and the configured model name per class. Cheap —
+        no IO, just reads from in-memory pools.
+
+        Each entry: `{loaded, last_used_sec, idle_for_sec, unload_after,
+        model}`. `last_used_sec=0` when the model has never been touched
+        (or has been since unloaded)."""
+        import time as _time
+        with self._lock:
+            embedders = list(self._embedders.items())
+            rerankers = list(self._rerankers.items())
+        now = _time.monotonic()
+
+        def _one(model_name: str, gpu: bool, loaded: bool, last: float,
+                 threshold: float) -> dict:
+            idle_for = (now - last) if (loaded and last > 0) else 0.0
+            return {
+                "loaded":         loaded,
+                "model":          model_name,
+                "gpu":            bool(gpu),
+                "idle_for_sec":   round(idle_for, 1),
+                "unload_after":   float(threshold or 0.0),
+            }
+
+        embed_entries: list[dict] = []
+        for (model, gpu), emb in embedders:
+            embed_entries.append(_one(
+                model_name=model, gpu=gpu,
+                loaded=emb.is_loaded(),
+                last=emb.last_used(),
+                threshold=self.embed_unload_after,
+            ))
+        rerank_entries: list[dict] = []
+        for (model, gpu), r in rerankers:
+            rerank_entries.append(_one(
+                model_name=model or "default", gpu=gpu,
+                loaded=r.is_loaded(),
+                last=r.last_used(),
+                threshold=self.rerank_unload_after,
+            ))
+        return {
+            "embed": embed_entries,
+            "rerank": rerank_entries,
+            "embed_unload_after":  float(self.embed_unload_after or 0.0),
+            "rerank_unload_after": float(self.rerank_unload_after or 0.0),
+        }
+
     # ── idle unloader ──────────────────────────────────────────────────
     def start_idle_unloader_async(self, check_interval: float = 30.0) -> None:
         """Launch the periodic eviction task on the running loop.
