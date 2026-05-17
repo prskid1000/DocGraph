@@ -102,6 +102,20 @@ pip install onnxruntime-silicon      # Apple Silicon (CoreML)
 
 DocGraph picks whichever provider is installed automatically; without one it stays on CPU.
 
+### Local dev install (Windows)
+
+For working on docgraph itself rather than consuming it as a package:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\setup.ps1
+# .\setup.ps1 -Recreate   # wipe .venv and reinstall
+# .\setup.ps1 -Gpu none   # skip the directml install (default: directml)
+# .\setup.ps1 -Gpu cuda   # use onnxruntime-gpu instead
+# .\setup.ps1 -NoShim     # skip writing ~/.local/bin/docgraph.bat
+```
+
+Creates `.venv` next to the script, `pip install -e .`, swaps the base `onnxruntime` for `onnxruntime-directml` so DML is available, and drops a `docgraph.bat` shim into `~/.local/bin` so the CLI is on PATH. The repo's own `docgraph.bat` resolves the venv via `%~dp0` and works from any clone location.
+
 ## CLI reference
 
 `path` argument defaults to the current directory; the repo root is auto-detected by walking up to find `.git`. **Every knob is a flag — there are no `DOCGRAPH_*` environment variables.**

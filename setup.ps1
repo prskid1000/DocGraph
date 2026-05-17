@@ -9,13 +9,17 @@
 #   .\setup.ps1 -Recreate       # wipe .venv and start fresh
 #   .\setup.ps1 -Python python3.11
 #   .\setup.ps1 -NoShim         # skip the ~/.local/bin shim
+#   .\setup.ps1 -Gpu none       # skip GPU ORT install (default: directml on Windows)
+#   .\setup.ps1 -Gpu cuda       # use onnxruntime-gpu (NVIDIA + CUDA toolkit required)
 
 [CmdletBinding()]
 param(
     [string]$Python = "python",
     [switch]$Recreate,
     [switch]$NoShim,
-    [string]$ShimDir = (Join-Path $HOME ".local\bin")
+    [string]$ShimDir = (Join-Path $HOME ".local\bin"),
+    [ValidateSet("directml", "cuda", "none")]
+    [string]$Gpu = "directml"
 )
 
 $ErrorActionPreference = "Stop"
@@ -48,6 +52,20 @@ if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed (exit $LASTEXITCODE)" }
 Write-Host "Installing docgraph (editable) ..."
 & $VenvPython -m pip install -e $Root
 if ($LASTEXITCODE -ne 0) { throw "docgraph install failed (exit $LASTEXITCODE)" }
+
+# GPU runtime - pyproject.toml only declares the base `onnxruntime` (CPU);
+# GPU is opt-in per docgraph's design. Swap to the requested variant here.
+# The directml/gpu wheels ship the CPU provider too, so we uninstall the
+# base package first to avoid a conflicting double-install.
+if ($Gpu -ne "none") {
+    $gpuPkg = if ($Gpu -eq "directml") { "onnxruntime-directml" } else { "onnxruntime-gpu" }
+    Write-Host "Installing GPU runtime ($gpuPkg) ..."
+    & $VenvPython -m pip uninstall -y onnxruntime 2>&1 | Out-Null
+    & $VenvPython -m pip install $gpuPkg
+    if ($LASTEXITCODE -ne 0) { throw "$gpuPkg install failed (exit $LASTEXITCODE)" }
+    $check = & $VenvPython -c "import onnxruntime as ort; print(','.join(ort.get_available_providers()))"
+    Write-Host "  ORT providers: $check"
+}
 
 if (-not $NoShim) {
     if (-not (Test-Path $ShimDir)) {

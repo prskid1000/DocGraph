@@ -168,6 +168,12 @@ Embedding model: any fastembed-supported HF id via `--embed-model`. Schema dim a
 taskkill //F //IM python.exe                                  # release DB lock (Windows)
 ```
 
+### Bootstrap on a fresh Windows box
+
+`setup.ps1` at the repo root creates `.venv`, runs `pip install -e .`, swaps the base CPU `onnxruntime` for `onnxruntime-directml` (so `--gpu` actually works without separate user action), and drops a `docgraph.bat` shim into `~/.local/bin`. Flags: `-Recreate`, `-Python`, `-Gpu directml|cuda|none` (default `directml`), `-NoShim`, `-ShimDir`. The DirectML swap is a setup-time convenience and does NOT change the package dependency in `pyproject.toml` — the "GPU is opt-in" hard rule still holds; setup.ps1 just exercises that opt-in by default on Windows.
+
+The repo's `docgraph.bat` resolves the venv via `%~dp0` so the shim works from any clone location.
+
 ## Things that have broken before — don't repeat
 
 - Non-cp1252 chars (`∈`) in MCP tool docstrings → crashes the call on Windows.
