@@ -1,8 +1,10 @@
 """Embedding wrapper around fastembed (ONNX runtime, no torch dep)."""
 from __future__ import annotations
 
+import gc
 import logging
 import threading
+import time
 from typing import Callable, Iterable, Iterator
 
 import numpy as np
@@ -111,10 +113,18 @@ class Embedder:
         # (name, options_dict) tuples for adapter-id selection.
         self.providers = providers
         self._model: TextEmbedding | None = None
+        # Monotonic timestamp of the last successful embed call. The idle
+        # unloader on the workspace polls this and evicts the model when
+        # it goes untouched for longer than `Config.unload_after` seconds.
+        self._last_used: float = 0.0
+        self._lock = threading.Lock()
 
     def _ensure(self) -> TextEmbedding:
         if self._model is not None:
             return self._model
+        # Reaching here means we'll load — mark touch so the idle unloader
+        # never sees a freshly-loaded session sitting at last_used=0.
+        self._last_used = time.monotonic()
         # Process-wide cache: a second Embedder() with matching config skips
         # the ~1s ONNX-session load and uses the existing in-memory model.
         # We resolve providers up front so the cache key reflects what was
@@ -252,11 +262,14 @@ class Embedder:
         on_progress: Callable[[int], None] | None,
     ) -> np.ndarray:
         model = self._ensure()
+        # Touch at start AND end so a long batch isn't evicted mid-flight.
+        self._last_used = time.monotonic()
         arrs: list[np.ndarray] = []
         for vec in model.embed(texts_list, batch_size=batch_size):
             arrs.append(np.asarray(vec, dtype=np.float32))
             if on_progress is not None:
                 on_progress(1)
+        self._last_used = time.monotonic()
         if not arrs:
             return np.zeros((0, self.dim), dtype=np.float32)
         return np.stack(arrs)
@@ -297,8 +310,40 @@ class Embedder:
             # DirectML can hang at 256; use 32 if we're on GPU.
             batch_size = 32 if self.providers else 256
         model = self._ensure()
+        self._last_used = time.monotonic()
         for vec in model.embed(list(texts), batch_size=batch_size):
             yield np.asarray(vec, dtype=np.float32)
+        self._last_used = time.monotonic()
+
+    # ── Idle unload ─────────────────────────────────────────────────────
+    def is_loaded(self) -> bool:
+        return self._model is not None
+
+    def last_used(self) -> float:
+        return self._last_used
+
+    def unload(self) -> bool:
+        """Drop the in-memory ONNX session and its cache entries. Returns
+        True if something was actually evicted. Safe to call when already
+        unloaded — a no-op. Held under `self._lock` so a concurrent
+        `_ensure()` either reloads cleanly or completes before we drop."""
+        with self._lock:
+            if self._model is None:
+                return False
+            # Resolve provider list the same way _ensure does so we evict
+            # both possible cache keys (requested vs. CPU fallback).
+            providers = self._available_providers(self.providers) if self.providers else None
+            with _MODEL_CACHE_LOCK:
+                for key in (_cache_key(self.model_name, providers),
+                            _cache_key(self.model_name, self.providers)):
+                    _MODEL_CACHE.pop(key, None)
+            self._model = None
+        # Force a GC pass — ONNX Runtime session objects hold native
+        # buffers via pybind11; without an explicit collect the VRAM
+        # / RAM stays pinned until the next allocation pressure.
+        gc.collect()
+        log.info("Embedder %s: unloaded after idle", self.model_name)
+        return True
 
     @property
     def dim(self) -> int:

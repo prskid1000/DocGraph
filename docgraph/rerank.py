@@ -11,8 +11,10 @@ first use so users who never set rerank=True never pay the download.
 """
 from __future__ import annotations
 
+import gc
 import logging
 import os
+import time
 from threading import Lock
 
 log = logging.getLogger(__name__)
@@ -33,10 +35,14 @@ class Reranker:
         self.providers = providers
         self._lock = Lock()
         self._encoder = None
+        # Monotonic timestamp of the last successful score call. Polled
+        # by the workspace's idle unloader.
+        self._last_used: float = 0.0
 
     def _ensure(self):
         with self._lock:
             if self._encoder is None:
+                self._last_used = time.monotonic()
                 from fastembed.rerank.cross_encoder import TextCrossEncoder
                 log.info(
                     f"Loading cross-encoder reranker: {self.model_name}"
@@ -63,7 +69,28 @@ class Reranker:
         if not documents:
             return []
         enc = self._ensure()
-        return list(enc.rerank(query, documents))
+        self._last_used = time.monotonic()
+        scores = list(enc.rerank(query, documents))
+        self._last_used = time.monotonic()
+        return scores
+
+    # ── Idle unload ─────────────────────────────────────────────────────
+    def is_loaded(self) -> bool:
+        return self._encoder is not None
+
+    def last_used(self) -> float:
+        return self._last_used
+
+    def unload(self) -> bool:
+        """Drop the in-memory cross-encoder. Returns True if something
+        was actually evicted. Idempotent."""
+        with self._lock:
+            if self._encoder is None:
+                return False
+            self._encoder = None
+        gc.collect()
+        log.info("Reranker %s: unloaded after idle", self.model_name)
+        return True
 
     def rerank(
         self,

@@ -74,6 +74,13 @@ class Config:
     # request payload doesn't override it. 1 = top-level dirs only,
     # 12 = one page per leaf folder.
     wiki_depth: int = 12
+    # Auto-unload the embedding + reranker ONNX sessions after this many
+    # seconds of inactivity. 0 = disabled (default). The host's workspace
+    # runs a periodic check; embedders and rerankers self-evict when their
+    # last_used timestamp falls outside the window. Mirrors telecode's
+    # `llamacpp.idle_unload_sec` knob but on the docgraph side, since
+    # embeddings + rerank models live inside the host process.
+    unload_after: float = 0.0
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
 
@@ -268,6 +275,7 @@ def load_config(
     wiki_depth: int = 12,
     workers: int | None = None,
     embed_batch_size: int = 256,
+    unload_after: float = 0.0,
 ) -> Config:
     """Build a Config from explicit kwargs.
 
@@ -323,5 +331,6 @@ def load_config(
         llm_timeout=llm_timeout,
         wiki_depth=wiki_depth,
         embed_batch_size=embed_batch_size,
+        unload_after=unload_after,
         **({"workers": workers} if workers is not None else {}),
     )

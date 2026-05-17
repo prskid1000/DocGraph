@@ -28,6 +28,7 @@ from docgraph.config import Config
 from docgraph.db import GraphDB
 from docgraph.embed import Embedder, GPU_PROVIDERS
 from docgraph.locks import DBLock, LockTimeouts
+from docgraph.rerank import Reranker
 from docgraph.retrieve import Retriever
 
 log = logging.getLogger(__name__)
@@ -73,9 +74,18 @@ class Workspace:
         self._slots: dict[Path, RootSlot] = {}
         self._order: list[Path] = []
         self._embedders: dict[tuple[str, bool], Embedder] = {}
+        # Cross-encoder rerankers, pooled the same way as embedders so
+        # multiple roots with identical (model, gpu) share one ONNX session.
+        # Tracked centrally so the idle unloader can iterate them.
+        self._rerankers: dict[tuple[str, bool], Reranker] = {}
         # One cooperative-cancel token per root, shared across whatever
         # long-op is currently running for that root (index / wiki).
         self._cancel_tokens: dict[Path, CancelToken] = {}
+        # Idle-unload window (seconds). 0 = disabled. Set from CLI via
+        # `host --idle-unload-sec`; the background task is started by
+        # `start_idle_unloader_async` when the lifespan boots.
+        self.unload_after: float = 0.0
+        self._idle_task: asyncio.Task | None = None
         # Lock timeouts (read gate / writer queue / wiki) — surfaced via
         # CLI flags + telecode settings. The host caches the running
         # event loop on startup so sync callers (the watcher thread) can
@@ -111,6 +121,21 @@ class Workspace:
     # Internal alias for back-compat — older call sites can still use this.
     _embedder_for = embedder_for
 
+    def reranker_for(self, cfg: Config) -> Reranker:
+        """Workspace-pooled cross-encoder. Multiple roots with identical
+        `(rerank_model, rerank_gpu)` share one session — same rationale as
+        `embedder_for`. Lazy-created on first call. Held centrally so the
+        idle unloader can evict them as a group."""
+        from docgraph.embed import resolve_providers
+        model = cfg.rerank_model or ""
+        key = (model, bool(cfg.rerank_gpu))
+        r = self._rerankers.get(key)
+        if r is None:
+            providers = resolve_providers(cfg.rerank_gpu)
+            r = Reranker(model_name=(model or None), providers=providers)
+            self._rerankers[key] = r
+        return r
+
     def _add_locked(self, cfg: Config) -> RootSlot:
         root = cfg.repo_root.resolve()
         if root in self._slots:
@@ -127,7 +152,7 @@ class Workspace:
             db_w.close()
         db_ro = GraphDB(cfg.db_path, read_only=True)
         embedder = self._embedder_for(cfg)
-        retriever = Retriever(db_ro, embedder, cfg=cfg)
+        retriever = Retriever(db_ro, embedder, cfg=cfg, workspace=self)
         slug = slug_for_root(root)
         state_path = cfg.data_dir / "state.json"
         try:
@@ -244,7 +269,7 @@ class Workspace:
                 slot.db_writer = None
             slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
             embedder = self._embedder_for(slot.cfg)
-            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
+            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
         await slot.lock.release_write()
 
     def take_writer(self, root: str | Path, label: str = "api",
@@ -296,7 +321,7 @@ class Workspace:
                 slot.db_writer = None
             slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
             embedder = self._embedder_for(slot.cfg)
-            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
+            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
         if loop is not None and loop.is_running():
             asyncio.run_coroutine_threadsafe(slot.lock.release_write(), loop)
 
@@ -344,7 +369,7 @@ class Workspace:
                 tmp.close()
             slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
             embedder = self._embedder_for(slot.cfg)
-            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg)
+            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
 
     def mark_watching(self, root: str | Path, watching: bool) -> None:
         slot = self.resolve(root)
@@ -375,8 +400,69 @@ class Workspace:
         so a stale prior cancel doesn't immediately abort the new run."""
         self.cancel_token_for(root).reset()
 
+    # ── idle unloader ──────────────────────────────────────────────────
+    def start_idle_unloader_async(self, check_interval: float = 30.0) -> None:
+        """Launch the periodic eviction task on the running loop.
+
+        No-op when `unload_after <= 0` or already running. The task polls
+        every `check_interval` seconds, asking each pooled Embedder /
+        Reranker whether its `last_used` is older than `unload_after`,
+        and calling `unload()` on the ones that qualify. Loading is lazy
+        on the next call, so eviction is transparent to callers.
+
+        Safe to call from `make_app`'s lifespan — no work happens until
+        models are actually loaded *and* go idle.
+        """
+        if self.unload_after <= 0:
+            return
+        if self._idle_task is not None and not self._idle_task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._idle_task = loop.create_task(
+            self._idle_unloader_loop(check_interval),
+            name="docgraph-idle-unloader",
+        )
+
+    async def _idle_unloader_loop(self, check_interval: float) -> None:
+        import time as _time
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+                threshold = self.unload_after
+                if threshold <= 0:
+                    continue  # disabled mid-flight
+                now = _time.monotonic()
+                # Snapshot under the lock; eviction itself is on the
+                # model's own lock so we can release ours first.
+                with self._lock:
+                    embedders = list(self._embedders.values())
+                    rerankers = list(self._rerankers.values())
+                for m in embedders + rerankers:
+                    if not m.is_loaded():
+                        continue
+                    last = m.last_used()
+                    if last <= 0:
+                        continue  # never used → leave the warm spot alone
+                    if now - last >= threshold:
+                        try:
+                            m.unload()
+                        except Exception as exc:
+                            log.warning("idle unload failed for %r: %s", m, exc)
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:  # pragma: no cover — defensive
+                log.warning("idle unloader loop: %s", exc)
+
     # ── lifecycle ───────────────────────────────────────────────────────
     def close(self) -> None:
+        # Cancel the idle unloader first so it doesn't race with the
+        # embedder cache being emptied beneath it.
+        if self._idle_task is not None and not self._idle_task.done():
+            self._idle_task.cancel()
+        self._idle_task = None
         with self._lock:
             for slot in self._slots.values():
                 try:
@@ -391,6 +477,7 @@ class Workspace:
             self._slots.clear()
             self._order.clear()
             self._embedders.clear()
+            self._rerankers.clear()
 
     def __enter__(self) -> "Workspace":
         return self

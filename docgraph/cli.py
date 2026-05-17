@@ -557,6 +557,12 @@ def host(
              "only flips the cancel token so the holder bails at next "
              "checkpoint.",
     ),
+    idle_unload_sec: float = typer.Option(
+        0.0, "--idle-unload-sec",
+        help="Auto-unload embedding + reranker ONNX sessions after this "
+             "many seconds of inactivity. 0 (default) = never unload. "
+             "Models reload lazily on the next request.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Run the unified DocGraph host: web UI + JSON API + MCP HTTP, multi-root.
@@ -619,8 +625,11 @@ def host(
     if llm_max_tokens_chat is not None: overrides["llm_max_tokens_chat"] = llm_max_tokens_chat
     if llm_api_key:                overrides["llm_api_key"] = llm_api_key
     if llm_timeout:                overrides["llm_timeout"] = llm_timeout
+    if idle_unload_sec > 0:        overrides["unload_after"] = idle_unload_sec
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
+    # Propagate to the workspace so the lifespan can start the unloader.
+    workspace.unload_after = float(idle_unload_sec or 0.0)
     # Apply lock-timeout overrides directly on the workspace's LockTimeouts
     # struct (workspace built before this point so it already has defaults
     # via LockTimeouts()).

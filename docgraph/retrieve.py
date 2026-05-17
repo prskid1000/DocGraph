@@ -21,10 +21,17 @@ from docgraph.rules import rules_for as _rules_for
 
 
 class Retriever:
-    def __init__(self, db: GraphDB, embedder: Embedder, cfg: Config | None = None):
+    def __init__(self, db: GraphDB, embedder: Embedder, cfg: Config | None = None,
+                 workspace=None):
         self.db = db
         self.embedder = embedder
         self.cfg = cfg
+        # When set, the reranker is borrowed from the workspace's pool
+        # rather than created locally. This keeps the cross-encoder
+        # session shared across roots AND tracked by the workspace's
+        # idle unloader — without a workspace ref we'd hold a private
+        # Reranker that would never be eligible for eviction.
+        self.workspace = workspace
         self._ranker: PersonalizedRanker | None = None
         self._reranker: Reranker | None = None
         # Per-label BM25 indexes built on first use. Keyed by label so each
@@ -32,6 +39,9 @@ class Retriever:
         self._bm25: dict[str, tuple[BM25Index, list[int]]] = {}
 
     def _reranker_(self) -> Reranker:
+        # Prefer the workspace pool so the idle unloader can see it.
+        if self.workspace is not None and self.cfg is not None:
+            return self.workspace.reranker_for(self.cfg)
         if self._reranker is None:
             # cfg.rerank_model may be "" — Reranker falls back to its built-in
             # default (jinaai/jina-reranker-v1-tiny-en).

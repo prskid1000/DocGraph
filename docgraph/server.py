@@ -104,6 +104,11 @@ def make_app(workspace: Workspace) -> FastAPI:
         # run_coroutine_threadsafe. Must happen before the watcher is
         # spawned so there's no window where the loop is missing.
         workspace.attach_loop(asyncio.get_running_loop())
+        # Idle unloader: no-op when workspace.unload_after <= 0. Started
+        # here so the periodic task lives on the same event loop that
+        # runs the API/MCP handlers — the task is cancelled in
+        # `workspace.close()` on shutdown.
+        workspace.start_idle_unloader_async()
         async with mcp_http.lifespan(_app):
             yield
 
