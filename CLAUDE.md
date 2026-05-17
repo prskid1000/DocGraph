@@ -138,7 +138,7 @@ Reranker GPU is independent: `cfg.rerank_gpu` / `--rerank-gpu`. Same fallback st
 
 Embedding model: any fastembed-supported HF id via `--embed-model`. Schema dim auto-derives. Switching dim on an existing DB is a hard error → `POST /api/admin/clear` + full reindex.
 
-Idle unload: `--idle-unload-sec N` (default 0 = never). When set, the workspace runs a periodic check (every 30s) and evicts pooled `Embedder` + `Reranker` ONNX sessions whose `last_used` is older than `N` seconds. Both are pooled on the workspace (`workspace.embedder_for(cfg)` / `workspace.reranker_for(cfg)`) so eviction is single-source. Reload is lazy on the next embed / score call. Use this to free VRAM when the host sits between searches — pairs well with telecode's `llamacpp.idle_unload_sec` for end-to-end model unloading.
+Idle unload: per-class thresholds — `--embed-idle-unload-sec N` and `--rerank-idle-unload-sec N` (both default 0 = never). When either > 0 the workspace runs a periodic check (every 30s) and evicts pooled `Embedder` / `Reranker` ONNX sessions whose `last_used` is older than its respective threshold. Both are pooled on the workspace (`workspace.embedder_for(cfg)` / `workspace.reranker_for(cfg)`) so eviction is single-source. Reload is lazy on the next embed / score call. Use this to free VRAM when the host sits between searches — pairs well with telecode's `llamacpp.idle_unload_sec` for end-to-end model unloading.
 
 ## Coding conventions
 

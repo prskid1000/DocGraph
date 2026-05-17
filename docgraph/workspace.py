@@ -81,10 +81,12 @@ class Workspace:
         # One cooperative-cancel token per root, shared across whatever
         # long-op is currently running for that root (index / wiki).
         self._cancel_tokens: dict[Path, CancelToken] = {}
-        # Idle-unload window (seconds). 0 = disabled. Set from CLI via
-        # `host --idle-unload-sec`; the background task is started by
-        # `start_idle_unloader_async` when the lifespan boots.
-        self.unload_after: float = 0.0
+        # Per-class idle-unload windows (seconds). 0 = disabled. Set from
+        # CLI via `host --embed-idle-unload-sec` / `--rerank-idle-unload-sec`;
+        # the background task is started by `start_idle_unloader_async`
+        # when the lifespan boots.
+        self.embed_unload_after: float = 0.0
+        self.rerank_unload_after: float = 0.0
         self._idle_task: asyncio.Task | None = None
         # Lock timeouts (read gate / writer queue / wiki) — surfaced via
         # CLI flags + telecode settings. The host caches the running
@@ -404,16 +406,17 @@ class Workspace:
     def start_idle_unloader_async(self, check_interval: float = 30.0) -> None:
         """Launch the periodic eviction task on the running loop.
 
-        No-op when `unload_after <= 0` or already running. The task polls
-        every `check_interval` seconds, asking each pooled Embedder /
-        Reranker whether its `last_used` is older than `unload_after`,
-        and calling `unload()` on the ones that qualify. Loading is lazy
-        on the next call, so eviction is transparent to callers.
+        No-op when both thresholds are <= 0 (nothing to evict) or the
+        task is already running. The task polls every `check_interval`
+        seconds, asking each pooled Embedder / Reranker whether its
+        `last_used` is older than its respective threshold, and calling
+        `unload()` on the ones that qualify. Loading is lazy on the
+        next call, so eviction is transparent to callers.
 
         Safe to call from `make_app`'s lifespan — no work happens until
         models are actually loaded *and* go idle.
         """
-        if self.unload_after <= 0:
+        if self.embed_unload_after <= 0 and self.rerank_unload_after <= 0:
             return
         if self._idle_task is not None and not self._idle_task.done():
             return
@@ -431,8 +434,9 @@ class Workspace:
         while True:
             try:
                 await asyncio.sleep(check_interval)
-                threshold = self.unload_after
-                if threshold <= 0:
+                embed_thr = self.embed_unload_after
+                rerank_thr = self.rerank_unload_after
+                if embed_thr <= 0 and rerank_thr <= 0:
                     continue  # disabled mid-flight
                 now = _time.monotonic()
                 # Snapshot under the lock; eviction itself is on the
@@ -440,8 +444,12 @@ class Workspace:
                 with self._lock:
                     embedders = list(self._embedders.values())
                     rerankers = list(self._rerankers.values())
-                for m in embedders + rerankers:
-                    if not m.is_loaded():
+                pairs = (
+                    [(m, embed_thr) for m in embedders] +
+                    [(m, rerank_thr) for m in rerankers]
+                )
+                for m, threshold in pairs:
+                    if threshold <= 0 or not m.is_loaded():
                         continue
                     last = m.last_used()
                     if last <= 0:

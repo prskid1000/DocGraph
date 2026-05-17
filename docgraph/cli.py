@@ -557,11 +557,17 @@ def host(
              "only flips the cancel token so the holder bails at next "
              "checkpoint.",
     ),
-    idle_unload_sec: float = typer.Option(
-        0.0, "--idle-unload-sec",
-        help="Auto-unload embedding + reranker ONNX sessions after this "
-             "many seconds of inactivity. 0 (default) = never unload. "
-             "Models reload lazily on the next request.",
+    embed_idle_unload_sec: float = typer.Option(
+        0.0, "--embed-idle-unload-sec",
+        help="Auto-unload the embedding ONNX session after this many "
+             "seconds of inactivity. 0 (default) = never unload. "
+             "Reloads lazily on the next embed call.",
+    ),
+    rerank_idle_unload_sec: float = typer.Option(
+        0.0, "--rerank-idle-unload-sec",
+        help="Auto-unload the cross-encoder reranker after this many "
+             "seconds of inactivity. 0 (default) = never unload. "
+             "Reloads lazily on the next reranked search.",
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
@@ -625,11 +631,13 @@ def host(
     if llm_max_tokens_chat is not None: overrides["llm_max_tokens_chat"] = llm_max_tokens_chat
     if llm_api_key:                overrides["llm_api_key"] = llm_api_key
     if llm_timeout:                overrides["llm_timeout"] = llm_timeout
-    if idle_unload_sec > 0:        overrides["unload_after"] = idle_unload_sec
+    if embed_idle_unload_sec > 0:  overrides["embed_unload_after"]  = embed_idle_unload_sec
+    if rerank_idle_unload_sec > 0: overrides["rerank_unload_after"] = rerank_idle_unload_sec
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
     # Propagate to the workspace so the lifespan can start the unloader.
-    workspace.unload_after = float(idle_unload_sec or 0.0)
+    workspace.embed_unload_after  = float(embed_idle_unload_sec  or 0.0)
+    workspace.rerank_unload_after = float(rerank_idle_unload_sec or 0.0)
     # Apply lock-timeout overrides directly on the workspace's LockTimeouts
     # struct (workspace built before this point so it already has defaults
     # via LockTimeouts()).
