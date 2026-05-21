@@ -88,14 +88,6 @@ class Workspace:
         # when the lifespan boots.
         self.embed_unload_after: float = 0.0
         self.rerank_unload_after: float = 0.0
-        # When True, after the idle unloader's eviction pass leaves every
-        # pooled model unloaded, the host self-SIGTERMs so the supervisor
-        # (telecode) respawns it. Frees the CUDA context too — `unload()`
-        # alone cannot, since the context lives as long as the process.
-        self.auto_shutdown_on_idle: bool = False
-        # Latched once the unloader has decided to shut down so we don't
-        # send a second signal while the host is teardown-ing.
-        self._shutdown_signalled: bool = False
         self._idle_task: asyncio.Task | None = None
         # Lock timeouts (read gate / writer queue / wiki) — surfaced via
         # CLI flags + telecode settings. The host caches the running
@@ -523,46 +515,10 @@ class Workspace:
                             m.unload()
                         except Exception as exc:
                             log.warning("idle unload failed for %r: %s", m, exc)
-                # After the eviction pass, optionally self-terminate so
-                # the ~300 MB CUDA context is freed too. Gate on (a) the
-                # flag, (b) at least one model has been instantiated (the
-                # dict is empty until first use — don't shut down a
-                # never-touched host), and (c) every instantiated model is
-                # now unloaded. Supervisor respawns within ~2 s.
-                if (
-                    self.auto_shutdown_on_idle
-                    and not self._shutdown_signalled
-                    and (embedders or rerankers)
-                    and all(not m.is_loaded() for m in embedders)
-                    and all(not m.is_loaded() for m in rerankers)
-                ):
-                    self._maybe_self_shutdown()
             except asyncio.CancelledError:
                 return
             except Exception as exc:  # pragma: no cover — defensive
                 log.warning("idle unloader loop: %s", exc)
-
-    def _maybe_self_shutdown(self) -> None:
-        """Send SIGTERM to our own pid so the supervisor respawns us. We
-        prefer SIGTERM over `os._exit(0)` so uvicorn's lifespan can unwind
-        (close DB connections, drain SSE subscribers) before exit. The
-        latch prevents a second signal during teardown."""
-        import os
-        import signal
-        self._shutdown_signalled = True
-        log.info(
-            "auto_shutdown_on_idle: all pooled models unloaded — "
-            "SIGTERMing self (pid %d) to release CUDA context",
-            os.getpid(),
-        )
-        try:
-            # Windows has no SIGTERM in the traditional sense; signal.SIGTERM
-            # maps to a kill on this process. The supervisor's wait+restart
-            # loop treats this the same as a crash.
-            os.kill(os.getpid(), signal.SIGTERM)
-        except Exception as exc:  # pragma: no cover — last resort
-            log.warning("self-SIGTERM failed (%s) — falling back to os._exit", exc)
-            os._exit(0)
 
     # ── lifecycle ───────────────────────────────────────────────────────
     def close(self) -> None:

@@ -88,14 +88,6 @@ class Config:
     # convention but per-model-class on the docgraph side.
     embed_unload_after: float = 0.0
     rerank_unload_after: float = 0.0
-    # When True, after every pooled model has been idle-unloaded the host
-    # process self-terminates (SIGTERM). The supervisor (telecode) respawns
-    # it on demand. Frees the CUDA context (~300 MB on consumer GPUs),
-    # which `Embedder.unload()` alone cannot — `torch.cuda.empty_cache()`
-    # only releases the caching allocator's reserved pool, not the runtime
-    # context, kernel cache, or cuBLAS/cuDNN lazy init. Off by default;
-    # only meaningful when at least one of {embed,rerank}_unload_after > 0.
-    auto_shutdown_on_idle: bool = False
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
 
@@ -294,7 +286,6 @@ def load_config(
     embed_batch_size: int = 256,
     embed_unload_after: float = 0.0,
     rerank_unload_after: float = 0.0,
-    auto_shutdown_on_idle: bool = False,
 ) -> Config:
     """Build a Config from explicit kwargs.
 
@@ -354,6 +345,5 @@ def load_config(
         embed_batch_size=embed_batch_size,
         embed_unload_after=embed_unload_after,
         rerank_unload_after=rerank_unload_after,
-        auto_shutdown_on_idle=auto_shutdown_on_idle,
         **({"workers": workers} if workers is not None else {}),
     )
