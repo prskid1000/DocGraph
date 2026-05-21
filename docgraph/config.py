@@ -29,11 +29,12 @@ class Config:
     # (jinaai/jina-reranker-v1-tiny-en).
     rerank_default: bool = False
     rerank_model: str = ""
-    # Run the cross-encoder reranker on GPU (CUDA / DirectML / CoreML / ROCm
-    # in that order, falling back to CPU). Off by default — the reranker model
-    # is small (~33 MB) and the cost of co-located GPU inference with embed
-    # passes is usually higher than the speedup. Independent from `gpu` so
-    # users can keep embeddings on GPU and reranking on CPU (or vice versa).
+    # Run the cross-encoder reranker on NVIDIA CUDA via torch, falling back
+    # to CPU if `torch.cuda.is_available()` is False. Off by default — the
+    # reranker model is small (~33 MB) and the cost of co-located GPU
+    # inference with embed passes is usually higher than the speedup.
+    # Independent from `gpu` so users can keep embeddings on GPU and
+    # reranking on CPU (or vice versa).
     rerank_gpu: bool = False
     # GPU acceleration for embeddings (and reranker). Off by default; when
     # True, the Embedder asks torch for CUDA and falls back to CPU silently
@@ -81,7 +82,7 @@ class Config:
     # 12 = one page per leaf folder.
     wiki_depth: int = 12
     # Auto-unload thresholds (seconds) for the pooled embedder + reranker
-    # ONNX sessions. 0 = disabled. Tuned independently so a workload that
+    # torch models. 0 = disabled. Tuned independently so a workload that
     # embeds constantly but reranks rarely (or vice versa) can shed only
     # the truly-idle model. Mirrors telecode's `llamacpp.idle_unload_sec`
     # convention but per-model-class on the docgraph side.

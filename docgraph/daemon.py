@@ -1,8 +1,9 @@
 """Optional cross-CLI embedding daemon.
 
-A long-lived TCP loopback server that holds a single ONNX session in memory.
-Clients (CLI invocations, MCP server, tests) can ask it to embed text instead
-of paying the ~1s ONNX session load on every fresh process.
+A long-lived TCP loopback server that holds a single torch /
+sentence-transformers session in memory. Clients (CLI invocations, MCP
+server, tests) can ask it to embed text instead of paying the ~2-3 s model
+load + (optional) torch.compile capture on every fresh process.
 
 Wire protocol — newline-delimited JSON, one request per line:
 
@@ -20,7 +21,7 @@ are written to `~/.docgraph/daemon.lock` so any docgraph process on the box
 can find it. Default port is 5577 (above the web UI's 5500 to avoid clashes).
 
 Opt-in. `Embedder` consults the lock file at construction time; if the daemon
-isn't running, the embedder loads its own ONNX session as before. Failures
+isn't running, the embedder loads its own torch session as before. Failures
 during a `daemon-routed` embed call (refused connection, malformed reply)
 fall back transparently to in-process embedding — never fails the request.
 """

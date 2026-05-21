@@ -12,7 +12,7 @@ Local code knowledge graph. Tree-sitter parses, sentence-transformers (torch) em
 - **Workspace is immutable for the host's lifetime.** Adding/removing roots requires a restart (telecode does this). No hot-reload endpoints.
 - **Kuzu is the only data store.** No SQLite/Chroma/Neo4j/Redis.
 - **No npm.** UI is one HTML file at `docgraph/ui/index.html`.
-- **Embeddings via torch + sentence-transformers** (no fastembed/ONNX anymore). GPU is opt-in — `--gpu` flips the `Embedder` to `device="cuda"` and silently falls back to CPU if `torch.cuda.is_available()` returns False. Install the matching torch wheel from `https://download.pytorch.org/whl/cuXY` for CUDA support; the default PyPI wheel is CPU-only. Mac / AMD GPU users stay on CPU.
+- **Embeddings via torch + sentence-transformers.** GPU is opt-in — `--gpu` flips the `Embedder` to `device="cuda"` and silently falls back to CPU if `torch.cuda.is_available()` returns False. Install the matching torch wheel from `https://download.pytorch.org/whl/cuXY` for CUDA support; the default PyPI wheel is CPU-only. Mac / AMD GPU users stay on CPU.
 - **No env vars.** All config is `load_config(...)` kwargs / CLI flags. `docgraph` reads zero `DOCGRAPH_*` env vars.
 - **Per-language processor classes are forbidden.** Add a language by adding two dict entries to `parse.py::LANGUAGES` + `TAGS_QUERIES`.
 - **Tools/routes use a closed-enum `root` parameter** built from workspace slugs at host startup. Single root → enum has one defaulted value, LLM doesn't see it.
@@ -88,7 +88,7 @@ If you change parse output shape, update cache writer **and** reader in lockstep
 .venv/Scripts/python -m pytest                 # ~90s, ~250 tests
 ```
 
-Files: `test_unit`, `test_indexer`, `test_retrieval`, `test_new_tools`, `test_multi_repo`, `test_cursor_parity`, `test_round3`, `test_api`, `test_mcp_server`, `test_llm` (mocked), `test_llm_live` (auto-skips if no LLM at `localhost:1235`), `test_daemon`, `test_workspace`, `test_cli_flags` (locks every flag telecode passes + the env-free contract), `test_embed_fallback` (DirectML `DXGI_ERROR_DEVICE_HUNG` recovery).
+Files: `test_unit`, `test_indexer`, `test_retrieval`, `test_new_tools`, `test_multi_repo`, `test_cursor_parity`, `test_round3`, `test_api`, `test_mcp_server`, `test_llm` (mocked), `test_llm_live` (auto-skips if no LLM at `localhost:1235`), `test_daemon`, `test_workspace`, `test_cli_flags` (locks every flag telecode passes + the env-free contract), `test_embed_fallback` (torch CUDA OOM / cuBLAS / cuDNN → CPU recovery).
 
 **Kuzu writer-visibility:** a writer connection doesn't see its own writes via subsequent `fetch_all`. Conftest closes the writer and reopens RO. Empty test results = forgot this.
 
@@ -110,7 +110,7 @@ Every retriever-backed tool ends with `root: RootSlug` typed as a dynamic `(str,
 
 ## Cancellation
 
-Long ops (`/api/admin/index`, `/api/wiki/build`) are cooperatively cancellable via `POST /api/admin/cancel?root=<slug>`. One `CancelToken` per root in `cancel.py`. Long ops call `token.raise_if_set()` at phase boundaries (parse / embed / symbol-table / edge / tier-4 / pagerank) — never mid-Kuzu-COPY or mid-ONNX, those would corrupt state. Routes translate `OperationCancelled` to HTTP 499. Telecode POSTs cancel **before** dropping the asyncio task, otherwise the connection drops first and the server never sees the signal. New long ops: same pattern (`reset_cancel` → `cancel_token_for` → pass in → `except OperationCancelled` → 499).
+Long ops (`/api/admin/index`, `/api/wiki/build`) are cooperatively cancellable via `POST /api/admin/cancel?root=<slug>`. One `CancelToken` per root in `cancel.py`. Long ops call `token.raise_if_set()` at phase boundaries (parse / embed / symbol-table / edge / tier-4 / pagerank) — never mid-Kuzu-COPY or mid-torch-forward, those would corrupt state. Routes translate `OperationCancelled` to HTTP 499. Telecode POSTs cancel **before** dropping the asyncio task, otherwise the connection drops first and the server never sees the signal. New long ops: same pattern (`reset_cancel` → `cancel_token_for` → pass in → `except OperationCancelled` → 499).
 
 ## Watch mode
 
@@ -182,7 +182,7 @@ The repo's `docgraph.bat` resolves the venv via `%~dp0` so the shim works from a
 
 - Non-cp1252 chars (`∈`) in MCP tool docstrings → crashes the call on Windows.
 - `type(r)` in Cypher → `function TYPE does not exist`. Use `label(r)`.
-- The daemon's embed-handler must NOT call `Embedder.embed()` (now daemon-aware → infinite recursion). Use `embedder._ensure().encode(...)` directly (sentence-transformers API, not fastembed's old `.embed()`).
+- The daemon's embed-handler must NOT call `Embedder.embed()` (now daemon-aware → infinite recursion). Use `embedder._ensure().encode(...)` directly.
 - Per-qname method rescoping must key on `id(def_node)`, not on the qname string — sibling classes collide otherwise.
 - `File.path` is the name property, not `File.name`.
 - Re-running the indexer with the host alive → DB lock error.

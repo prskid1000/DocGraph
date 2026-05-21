@@ -34,9 +34,7 @@ def _empty_cuda_cache() -> None:
 
 class Reranker:
     """Lazy wrapper around `sentence_transformers.CrossEncoder`. Thread-safe.
-
-    Public surface preserved from the fastembed era — only the constructor
-    changed (`providers=...` → `device=...`)."""
+    Public surface mirrors `Embedder`: `score()` / `rerank()` / `unload()`."""
 
     def __init__(
         self,

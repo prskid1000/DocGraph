@@ -491,7 +491,7 @@ class Indexer:
         self.progress_cb = progress_cb
         # Cooperative cancel: poll `cancel_token.raise_if_set()` at major
         # phase boundaries. Mid-phase cancellation is unsafe (inside Kuzu
-        # COPY or an ONNX embed call would corrupt state); between phases
+        # COPY or a torch forward pass would corrupt state); between phases
         # is fine because each phase commits before the next starts.
         def _ck():
             if cancel_token is not None:

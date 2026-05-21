@@ -348,11 +348,11 @@ def index(
         else:
             from docgraph.llm import set_docstring_prompt
             set_docstring_prompt(text)
-    if gpu:
-        # DirectML can hang the GPU at the default batch size of 256 on
-        # consumer cards. Auto-pick a safer default unless the user overrode it.
-        if embed_batch_size is None:
-            embed_batch_size = 32
+    if gpu and embed_batch_size is None:
+        # 32 is the safe default on consumer GPUs; larger batches can OOM
+        # on small VRAM cards or trigger CUDA Graphs recompiles when seq
+        # length varies sharply between batches.
+        embed_batch_size = 32
     if embed_batch_size is not None:
         cfg.embed_batch_size = embed_batch_size
 
@@ -362,7 +362,7 @@ def index(
             console.print(f"  + {r}")
     console.print(f"  workers: {cfg.workers}  db: {cfg.db_path}")
     if cfg.gpu:
-        console.print("  [magenta]GPU[/]: ONNX Runtime providers (CUDA/DirectML/CoreML/CPU)")
+        console.print("  [magenta]GPU[/]: torch CUDA (sentence-transformers)")
     if cfg.llm_docstrings:
         console.print(
             f"  [yellow]LLM docstrings[/]: {cfg.llm_format} @ "
@@ -480,8 +480,9 @@ def host(
     ),
     embed_batch_size: int = typer.Option(
         0, "--embed-batch-size",
-        help="Texts per ONNX session call. 0 = 256 (CPU sweet spot, 32 is "
-             "often better on GPU). Lower if --gpu saturates VRAM.",
+        help="Texts per `model.encode` call. 0 = 64 (sweet spot for "
+             "BGE-small on most GPUs and CPUs). Lower if --gpu saturates "
+             "VRAM with a bigger model.",
     ),
     wiki_depth: int = typer.Option(
         12, "--wiki-depth",
@@ -574,9 +575,10 @@ def host(
     ),
     embed_idle_unload_sec: float = typer.Option(
         0.0, "--embed-idle-unload-sec",
-        help="Auto-unload the embedding ONNX session after this many "
-             "seconds of inactivity. 0 (default) = never unload. "
-             "Reloads lazily on the next embed call.",
+        help="Auto-unload the embedding model after this many seconds of "
+             "inactivity. 0 (default) = never unload. Reloads lazily on "
+             "the next embed call. Frees VRAM via `torch.cuda.empty_cache()` "
+             "on unload.",
     ),
     rerank_idle_unload_sec: float = typer.Option(
         0.0, "--rerank-idle-unload-sec",
@@ -1011,7 +1013,7 @@ def daemon_start(
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Start the embedding daemon. Other docgraph processes on this host
-    will route their embed calls through it, sharing one warm ONNX session.
+    will route their embed calls through it, sharing one warm torch session.
 
     Foreground (default): blocks. Ctrl+C exits cleanly. Useful for tmux/screen.
     `--detach`: spawns a background process (Windows: DETACHED_PROCESS;

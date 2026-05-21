@@ -391,8 +391,8 @@ def test_chunk_body_javascript_breaks_at_function_boundaries():
 
 
 def test_embedder_cache_reuses_loaded_model():
-    """Two Embedder() instances with the same config share one ONNX session.
-    Loading the model a second time would take ~1s; the cache lookup is O(1)."""
+    """Two Embedder() instances with the same config share one torch session.
+    Loading the model a second time would take ~2-3 s; the cache lookup is O(1)."""
     from docgraph.embed import Embedder, clear_model_cache
 
     clear_model_cache()
@@ -400,7 +400,7 @@ def test_embedder_cache_reuses_loaded_model():
     model_a = a._ensure()
     b = Embedder("BAAI/bge-small-en-v1.5")
     model_b = b._ensure()
-    assert model_a is model_b, "expected shared ONNX session across Embedder() instances"
+    assert model_a is model_b, "expected shared torch session across Embedder() instances"
 
 
 def test_embedder_cache_isolates_different_models():

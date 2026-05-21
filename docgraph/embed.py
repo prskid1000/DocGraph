@@ -1,13 +1,13 @@
 """Embedding wrapper around sentence-transformers (torch backend).
 
-Replaces the old fastembed/ONNX path. The fastembed path was retired
-after repeated DirectML driver crashes (`nvwgf2umx.dll`) on Windows,
-and because torch's `+cuXY` wheels ship a self-contained CUDA + cuDNN
-runtime so GPU just works without a separate CUDA Toolkit install.
-
-GPU is still opt-in: `cfg.gpu` → `device="cuda"` if `torch.cuda.is_available()`,
-else silent CPU fallback. The process-wide `_MODEL_CACHE` is preserved so
-a second `Embedder(...)` with matching config reuses one loaded model.
+GPU is opt-in: `cfg.gpu` → `device="cuda"` if `torch.cuda.is_available()`,
+else silent CPU fallback. The process-wide `_MODEL_CACHE` is keyed on
+`(model_name, device, dtype)` so a second `Embedder(...)` with matching
+config reuses one loaded model. CUDA OOM / illegal-memory / cuBLAS / cuDNN
+errors mid-inference are caught by `embed()` — the cache entry is dropped,
+the model reloads on CPU, retried once. See the
+`Things that have broken before` entry in `CLAUDE.md` for the historical
+DirectML failure mode that motivated the recovery wrapper.
 """
 from __future__ import annotations
 
@@ -134,7 +134,7 @@ class Embedder:
     """`sentence-transformers` wrapper with process-wide cache, idle-unload
     bookkeeping, daemon routing, and CPU fallback on CUDA failure.
 
-    Public surface (preserved from the fastembed era):
+    Public surface:
         embed(texts, batch_size=None, on_progress=None) -> np.ndarray
         embed_iter(texts, batch_size=None) -> Iterator[np.ndarray]
         unload() / is_loaded() / last_used() / dim
