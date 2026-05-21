@@ -586,6 +586,14 @@ def host(
              "seconds of inactivity. 0 (default) = never unload. "
              "Reloads lazily on the next reranked search.",
     ),
+    auto_shutdown_on_idle: bool = typer.Option(
+        False, "--auto-shutdown-on-idle",
+        help="After every pooled model is idle-unloaded, the host process "
+             "self-SIGTERMs so the supervisor respawns it. Frees the "
+             "~300 MB CUDA context (which torch.cuda.empty_cache() cannot). "
+             "Only meaningful when at least one of "
+             "--embed-idle-unload-sec / --rerank-idle-unload-sec is set.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Run the unified DocGraph host: web UI + JSON API + MCP HTTP, multi-root.
@@ -650,11 +658,13 @@ def host(
     if llm_timeout:                overrides["llm_timeout"] = llm_timeout
     if embed_idle_unload_sec > 0:  overrides["embed_unload_after"]  = embed_idle_unload_sec
     if rerank_idle_unload_sec > 0: overrides["rerank_unload_after"] = rerank_idle_unload_sec
+    overrides["auto_shutdown_on_idle"] = auto_shutdown_on_idle
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
     # Propagate to the workspace so the lifespan can start the unloader.
     workspace.embed_unload_after  = float(embed_idle_unload_sec  or 0.0)
     workspace.rerank_unload_after = float(rerank_idle_unload_sec or 0.0)
+    workspace.auto_shutdown_on_idle = bool(auto_shutdown_on_idle)
     # Apply lock-timeout overrides directly on the workspace's LockTimeouts
     # struct (workspace built before this point so it already has defaults
     # via LockTimeouts()).
