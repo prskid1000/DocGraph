@@ -31,8 +31,12 @@ tree-sitter-css
 tree-sitter-json
 tree-sitter-yaml
 
-# Embeddings (ONNX-backed, no torch)
-fastembed>=0.4
+# Embeddings (torch backend via sentence-transformers).
+# torch is opt-CUDA: install from PyTorch's per-CUDA index for GPU support, e.g.
+#   pip install --index-url https://download.pytorch.org/whl/cu130 torch
+# `setup.ps1` does this automatically; pip install -r alone gives the CPU wheel.
+torch>=2.4
+sentence-transformers>=3.0
 
 # MCP / HTTP
 fastmcp>=2.0
@@ -48,12 +52,3 @@ scipy>=1.13
 pydantic>=2.9
 orjson>=3.10
 watchfiles>=0.24
-
-onnxruntime-directml
-
-# --- Optional GPU acceleration (uncomment ONE) ----------------------------
-# Enable with `docgraph index --gpu` or `DOCGRAPH_GPU=1`.
-# DocGraph never hard-depends on these; pick the one that matches your hardware.
-# onnxruntime-gpu        ; NVIDIA CUDA (Linux / Windows)
-# onnxruntime-directml   ; Any GPU on Windows (NVIDIA / AMD / Intel)
-# onnxruntime-silicon    ; Apple Silicon (CoreML)

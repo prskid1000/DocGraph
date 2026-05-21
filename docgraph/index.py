@@ -56,7 +56,7 @@ def _bar() -> Progress:
 
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder, GPU_PROVIDERS, resolve_providers
+from docgraph.embed import Embedder, resolve_device
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
 from docgraph.summary import build_embedding_text, chunk_body
@@ -64,10 +64,6 @@ from docgraph.summary import build_embedding_text, chunk_body
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, int, int], None] | None
-
-
-def _gpu_providers() -> list[str]:
-    return list(GPU_PROVIDERS)
 
 
 def _wire_extra_paths(cfg: Config) -> None:
@@ -262,7 +258,8 @@ class Indexer:
         self.db = db
         self.embedder = embedder or Embedder(
             cfg.embedding_model,
-            providers=resolve_providers(cfg.gpu),
+            device=resolve_device(cfg.gpu),
+            torch_compile=cfg.embed_torch_compile,
         )
         self._next_id = 1
         self.progress_cb: ProgressCb = None

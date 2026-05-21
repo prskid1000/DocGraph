@@ -515,7 +515,7 @@ def make_app(workspace: Workspace) -> FastAPI:
     async def api_admin_index(payload: dict | None = None,
                                root: RootSlug = DEFAULT):
         from docgraph.index import Indexer
-        from docgraph.embed import Embedder, GPU_PROVIDERS
+        from docgraph.embed import Embedder
         slot = _slot(root)
         full = bool((payload or {}).get("full", False))
         fetch_links = bool((payload or {}).get("fetch_links", True))

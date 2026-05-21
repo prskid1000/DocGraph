@@ -26,7 +26,7 @@ from pathlib import Path
 from docgraph.cancel import CancelToken
 from docgraph.config import Config
 from docgraph.db import GraphDB
-from docgraph.embed import Embedder, GPU_PROVIDERS
+from docgraph.embed import Embedder
 from docgraph.locks import DBLock, LockTimeouts
 from docgraph.rerank import Reranker
 from docgraph.retrieve import Retriever
@@ -73,11 +73,12 @@ class Workspace:
         self._lock = threading.Lock()
         self._slots: dict[Path, RootSlot] = {}
         self._order: list[Path] = []
-        self._embedders: dict[tuple[str, bool], Embedder] = {}
+        self._embedders: dict[tuple[str, bool, bool], Embedder] = {}
         # Cross-encoder rerankers, pooled the same way as embedders so
-        # multiple roots with identical (model, gpu) share one ONNX session.
-        # Tracked centrally so the idle unloader can iterate them.
-        self._rerankers: dict[tuple[str, bool], Reranker] = {}
+        # multiple roots with identical (model, gpu, torch_compile) share
+        # one torch session. Tracked centrally so the idle unloader can
+        # iterate them.
+        self._rerankers: dict[tuple[str, bool, bool], Reranker] = {}
         # One cooperative-cancel token per root, shared across whatever
         # long-op is currently running for that root (index / wiki).
         self._cancel_tokens: dict[Path, CancelToken] = {}
@@ -106,16 +107,17 @@ class Workspace:
     # ── construction helpers ────────────────────────────────────────────
     def embedder_for(self, cfg: Config) -> Embedder:
         """Return a workspace-pooled `Embedder` for this Config. Multiple
-        roots with the same `(embedding_model, gpu)` share one ONNX
-        session — important under GPU because DirectML / CUDA don't take
-        kindly to two sessions racing for the same device."""
-        key = (cfg.embedding_model, cfg.gpu)
+        roots with the same `(embedding_model, gpu, torch_compile)` share
+        one torch session — important under GPU because two CUDA contexts
+        racing for the same device is the fast lane to OOM."""
+        key = (cfg.embedding_model, cfg.gpu, cfg.embed_torch_compile)
         emb = self._embedders.get(key)
         if emb is None:
-            from docgraph.embed import resolve_providers
+            from docgraph.embed import resolve_device
             emb = Embedder(
                 cfg.embedding_model,
-                providers=resolve_providers(cfg.gpu),
+                device=resolve_device(cfg.gpu),
+                torch_compile=cfg.embed_torch_compile,
             )
             self._embedders[key] = emb
         return emb
@@ -125,16 +127,20 @@ class Workspace:
 
     def reranker_for(self, cfg: Config) -> Reranker:
         """Workspace-pooled cross-encoder. Multiple roots with identical
-        `(rerank_model, rerank_gpu)` share one session — same rationale as
-        `embedder_for`. Lazy-created on first call. Held centrally so the
-        idle unloader can evict them as a group."""
-        from docgraph.embed import resolve_providers
+        `(rerank_model, rerank_gpu, rerank_torch_compile)` share one
+        session — same rationale as `embedder_for`. Lazy-created on first
+        call. Held centrally so the idle unloader can evict them as a
+        group."""
+        from docgraph.embed import resolve_device
         model = cfg.rerank_model or ""
-        key = (model, bool(cfg.rerank_gpu))
+        key = (model, bool(cfg.rerank_gpu), bool(cfg.rerank_torch_compile))
         r = self._rerankers.get(key)
         if r is None:
-            providers = resolve_providers(cfg.rerank_gpu)
-            r = Reranker(model_name=(model or None), providers=providers)
+            r = Reranker(
+                model_name=(model or None),
+                device=resolve_device(cfg.rerank_gpu),
+                torch_compile=cfg.rerank_torch_compile,
+            )
             self._rerankers[key] = r
         return r
 

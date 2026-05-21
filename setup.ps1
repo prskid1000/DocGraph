@@ -3,14 +3,19 @@
 # Creates .venv next to this script, installs docgraph (editable), and drops
 # a `docgraph.bat` shim into the user's ~/.local/bin so the CLI is on PATH.
 #
+# torch is installed from PyTorch's per-CUDA index. The `+cuXY` wheels bundle
+# their own CUDA + cuDNN runtime, so GPU works without a separate CUDA
+# Toolkit install. CPU is the universal fallback.
+#
 # Usage (from anywhere):
 #   powershell -ExecutionPolicy Bypass -File <repo>\setup.ps1
 #   .\setup.ps1                 # if execution policy allows
 #   .\setup.ps1 -Recreate       # wipe .venv and start fresh
 #   .\setup.ps1 -Python python3.11
 #   .\setup.ps1 -NoShim         # skip the ~/.local/bin shim
-#   .\setup.ps1 -Gpu none       # skip GPU ORT install (default: directml on Windows)
-#   .\setup.ps1 -Gpu cuda       # use onnxruntime-gpu (NVIDIA + CUDA toolkit required)
+#   .\setup.ps1 -CudaVersion cpu       # CPU-only install (no CUDA wheel)
+#   .\setup.ps1 -CudaVersion cu124     # NVIDIA + CUDA 12.4 wheel
+#   .\setup.ps1 -CudaVersion cu130     # NVIDIA + CUDA 13.x wheel (default on Windows)
 
 [CmdletBinding()]
 param(
@@ -18,8 +23,8 @@ param(
     [switch]$Recreate,
     [switch]$NoShim,
     [string]$ShimDir = (Join-Path $HOME ".local\bin"),
-    [ValidateSet("directml", "cuda", "none")]
-    [string]$Gpu = "directml"
+    [ValidateSet("cu130", "cu124", "cpu")]
+    [string]$CudaVersion = "cu130"
 )
 
 $ErrorActionPreference = "Stop"
@@ -31,6 +36,7 @@ $VenvCli = Join-Path $VenvDir "Scripts\docgraph.exe"
 
 Write-Host "docgraph root : $Root"
 Write-Host "venv          : $VenvDir"
+Write-Host "torch wheel   : $CudaVersion"
 
 if ($Recreate -and (Test-Path $VenvDir)) {
     Write-Host "Removing existing .venv ..."
@@ -49,23 +55,29 @@ Write-Host "Upgrading pip ..."
 & $VenvPython -m pip install --upgrade pip
 if ($LASTEXITCODE -ne 0) { throw "pip upgrade failed (exit $LASTEXITCODE)" }
 
+# Install torch from PyTorch's per-CUDA index before the editable docgraph
+# install. pyproject.toml declares `torch>=2.4` without an index URL, so the
+# default install would pull a CPU wheel from PyPI even on a CUDA machine.
+# Pre-seeding torch from the right index makes the later `pip install -e .`
+# satisfy the dep against what's already installed.
+$TorchIndex = "https://download.pytorch.org/whl/$CudaVersion"
+Write-Host "Installing torch from $TorchIndex ..."
+& $VenvPython -m pip install --index-url $TorchIndex torch
+if ($LASTEXITCODE -ne 0) { throw "torch install failed (exit $LASTEXITCODE)" }
+
 Write-Host "Installing docgraph (editable) ..."
 & $VenvPython -m pip install -e $Root
 if ($LASTEXITCODE -ne 0) { throw "docgraph install failed (exit $LASTEXITCODE)" }
 
-# GPU runtime - pyproject.toml only declares the base `onnxruntime` (CPU);
-# GPU is opt-in per docgraph's design. Swap to the requested variant here.
-# The directml/gpu wheels ship the CPU provider too, so we uninstall the
-# base package first to avoid a conflicting double-install.
-if ($Gpu -ne "none") {
-    $gpuPkg = if ($Gpu -eq "directml") { "onnxruntime-directml" } else { "onnxruntime-gpu" }
-    Write-Host "Installing GPU runtime ($gpuPkg) ..."
-    & $VenvPython -m pip uninstall -y onnxruntime 2>&1 | Out-Null
-    & $VenvPython -m pip install $gpuPkg
-    if ($LASTEXITCODE -ne 0) { throw "$gpuPkg install failed (exit $LASTEXITCODE)" }
-    $check = & $VenvPython -c "import onnxruntime as ort; print(','.join(ort.get_available_providers()))"
-    Write-Host "  ORT providers: $check"
-}
+# Quick sanity check — log device / dtype / version so the install record
+# itself surfaces a misconfigured CUDA runtime before the host ever runs.
+$check = & $VenvPython -c @"
+import torch
+print('torch', torch.__version__,
+      '| cuda_available=', torch.cuda.is_available(),
+      '| device_count=', torch.cuda.device_count())
+"@
+Write-Host "  $check"
 
 if (-not $NoShim) {
     if (-not (Test-Path $ShimDir)) {

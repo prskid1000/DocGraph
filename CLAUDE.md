@@ -4,7 +4,7 @@ Things you can't infer from the code in 10 seconds. Read before non-trivial chan
 
 ## What this is
 
-Local code knowledge graph. Tree-sitter parses, fastembed embeds (ONNX), Kuzu stores, FastAPI + FastMCP serve. As of 2.2.0 a single `docgraph host` process serves **multiple roots** — one uvicorn, one MCP endpoint, one log, with a closed-enum `root` arg on every tool/route. v2 rewrite of an old Neo4j + ChromaDB + Streamlit + Vite stack (preserved at tag `v1-legacy` — don't resurrect).
+Local code knowledge graph. Tree-sitter parses, sentence-transformers (torch) embeds, Kuzu stores, FastAPI + FastMCP serve. As of 2.2.0 a single `docgraph host` process serves **multiple roots** — one uvicorn, one MCP endpoint, one log, with a closed-enum `root` arg on every tool/route. v2 rewrite of an old Neo4j + ChromaDB + Streamlit + Vite stack (preserved at tag `v1-legacy` — don't resurrect).
 
 ## Hard rules
 
@@ -12,7 +12,7 @@ Local code knowledge graph. Tree-sitter parses, fastembed embeds (ONNX), Kuzu st
 - **Workspace is immutable for the host's lifetime.** Adding/removing roots requires a restart (telecode does this). No hot-reload endpoints.
 - **Kuzu is the only data store.** No SQLite/Chroma/Neo4j/Redis.
 - **No npm.** UI is one HTML file at `docgraph/ui/index.html`.
-- **No torch.** Embeddings via fastembed/ONNX. GPU is opt-in via ORT providers (`pip install onnxruntime-gpu` / `-directml` / `-silicon`); we never depend on those.
+- **Embeddings via torch + sentence-transformers** (no fastembed/ONNX anymore). GPU is opt-in — `--gpu` flips the `Embedder` to `device="cuda"` and silently falls back to CPU if `torch.cuda.is_available()` returns False. Install the matching torch wheel from `https://download.pytorch.org/whl/cuXY` for CUDA support; the default PyPI wheel is CPU-only. Mac / AMD GPU users stay on CPU.
 - **No env vars.** All config is `load_config(...)` kwargs / CLI flags. `docgraph` reads zero `DOCGRAPH_*` env vars.
 - **Per-language processor classes are forbidden.** Add a language by adding two dict entries to `parse.py::LANGUAGES` + `TAGS_QUERIES`.
 - **Tools/routes use a closed-enum `root` parameter** built from workspace slugs at host startup. Single root → enum has one defaulted value, LLM doesn't see it.
@@ -29,8 +29,8 @@ Local code knowledge graph. Tree-sitter parses, fastembed embeds (ONNX), Kuzu st
 | `parse.py` | tree-sitter wrappers + tags queries. Method qname rescoping is keyed on `id(node)` not on the qname string (sibling classes with same method name collided). |
 | `index.py` | Parallel pipeline + per-file delta. **Most complex file.** |
 | `db.py` | Kuzu schema + bulk insert. Edges via `COPY FROM arrow (from='X', to='Y')` (10-50× faster than MATCH+CREATE). `_known_ids` filters dangling endpoints before COPY (which hard-errors on missing PKs). `close()` is explicit; needed because Windows + Kuzu's COPY internals don't release the file lock on `del` alone. |
-| `embed.py` | fastembed wrapper. Any fastembed model works — schema dim auto-derives from `dim_for_model()`. `Embedder(providers=...)` passes ORT providers. `GPU_PROVIDERS` = CUDA → DirectML → CoreML → ROCm → CPU. Process-wide `_MODEL_CACHE` keyed on `(model_name, providers)`. |
-| `rerank.py` | Lazy cross-encoder (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB) used when `search(rerank=True)`. Accepts `providers=` for GPU. |
+| `embed.py` | `sentence-transformers` wrapper over torch. Any HF sentence-transformers model works — schema dim auto-derives from `dim_for_model()` (static table + lazy probe for unknown models). `Embedder(device=...)` accepts `"cuda"` or `None`; re-checked against `torch.cuda.is_available()` at load time. Process-wide `_MODEL_CACHE` keyed on `(model_name, device, dtype)`. CPU-fallback recovery wraps `embed()` for CUDA OOM / illegal memory / driver crashes. |
+| `rerank.py` | Lazy `sentence_transformers.CrossEncoder` (`jinaai/jina-reranker-v1-tiny-en`, ~33 MB) used when `search(rerank=True)`. Accepts `device=` for GPU; same CPU-fallback recovery as `Embedder`. |
 | `retrieve.py` | Hybrid retrieval + `explore` / `impact_of` / `test_impact` / `cypher` / `git_*` / `rules_for`. **All Cypher lives here or in `db.py`.** |
 | `rank.py` | NetworkX PageRank + `PersonalizedRanker` (cached graph). |
 | `git_tools.py` | `git diff` / `blame` / `log`, joined to graph entities. |
@@ -132,13 +132,15 @@ Adding an ecosystem: add to `TEMPLATES` + `_DETECTORS` in `ignores.py`.
 
 LLM augmentation off by default; `--llm-model <name>` enables it. Talks to a local OpenAI-/Anthropic-compatible server (LM Studio / llama.cpp / vLLM / Ollama). Defaults: `localhost:1235`, openai. Every request carries `reasoning_effort: "none"` so reasoning models skip thinking — without it a 150-token budget comes back empty. Cache: `.docgraph/llm_docstrings.json` keyed by `sha256(body)`, rename-safe. Generated text is used **only** when no native docstring is present.
 
-Embedding GPU off by default; `--gpu` enables it. Routes through ORT providers (`GPU_PROVIDERS` chain). User installs `onnxruntime-gpu` / `-directml` / `-silicon`; we don't depend on those. `Embedder._ensure()` falls back to CPU on init failure (logs a warning). `cfg.gpu` is forwarded to every `Embedder(...)` site.
+Embedding GPU off by default; `--gpu` enables it. Routes through torch via sentence-transformers: `resolve_device(cfg.gpu)` returns `"cuda"` if and only if `torch.cuda.is_available()`, else `None` (CPU). `Embedder._ensure()` re-checks at load time so a config asking for cuda on a CPU box silently downgrades. `Embedder.embed()` wraps inference in CPU-fallback recovery — CUDA OOM / illegal-memory / cuBLAS / cuDNN errors drop the cached model, force CPU, retry once.
 
-Reranker GPU is independent: `cfg.rerank_gpu` / `--rerank-gpu`. Same fallback story.
+Reranker GPU is independent: `cfg.rerank_gpu` / `--rerank-gpu`. Same `device=` + CPU-fallback story.
 
-Embedding model: any fastembed-supported HF id via `--embed-model`. Schema dim auto-derives. Switching dim on an existing DB is a hard error → `POST /api/admin/clear` + full reindex.
+Embedding model: any HF sentence-transformers id via `--embed-model`. Schema dim auto-derives from `dim_for_model()` — static table for common models, lazy probe (load + read `get_sentence_embedding_dimension()`) for unknown ones. Switching dim on an existing DB is a hard error → `POST /api/admin/clear` + full reindex.
 
-Idle unload: per-class thresholds — `--embed-idle-unload-sec N` and `--rerank-idle-unload-sec N` (both default 0 = never). When either > 0 the workspace runs a periodic check (every 30s) and evicts pooled `Embedder` / `Reranker` ONNX sessions whose `last_used` is older than its respective threshold. Both are pooled on the workspace (`workspace.embedder_for(cfg)` / `workspace.reranker_for(cfg)`) so eviction is single-source. Reload is lazy on the next embed / score call. Use this to free VRAM when the host sits between searches — pairs well with telecode's `llamacpp.idle_unload_sec` for end-to-end model unloading.
+dtype: default is `fp16` on CUDA (~1.5–2× speedup, negligible cosine drift) and `fp32` on CPU. Override with `--embed-dtype bf16|fp32` if your GPU misbehaves on fp16.
+
+Idle unload: per-class thresholds — `--embed-idle-unload-sec N` and `--rerank-idle-unload-sec N` (both default 0 = never). When either > 0 the workspace runs a periodic check (every 30s) and evicts pooled `Embedder` / `Reranker` torch sessions whose `last_used` is older than its respective threshold. Both are pooled on the workspace (`workspace.embedder_for(cfg)` / `workspace.reranker_for(cfg)`) so eviction is single-source. Reload is lazy on the next embed / score call. `unload()` calls `torch.cuda.empty_cache()` to release VRAM. Pairs well with telecode's `llamacpp.idle_unload_sec` for end-to-end model unloading.
 
 ## Coding conventions
 
@@ -172,7 +174,7 @@ taskkill //F //IM python.exe                                  # release DB lock 
 
 ### Bootstrap on a fresh Windows box
 
-`setup.ps1` at the repo root creates `.venv`, runs `pip install -e .`, swaps the base CPU `onnxruntime` for `onnxruntime-directml` (so `--gpu` actually works without separate user action), and drops a `docgraph.bat` shim into `~/.local/bin`. Flags: `-Recreate`, `-Python`, `-Gpu directml|cuda|none` (default `directml`), `-NoShim`, `-ShimDir`. The DirectML swap is a setup-time convenience and does NOT change the package dependency in `pyproject.toml` — the "GPU is opt-in" hard rule still holds; setup.ps1 just exercises that opt-in by default on Windows.
+`setup.ps1` at the repo root creates `.venv`, installs torch from PyTorch's per-CUDA index (so the `+cuXY` wheel bundles its own CUDA + cuDNN runtime — no separate CUDA Toolkit install needed), runs `pip install -e .`, and drops a `docgraph.bat` shim into `~/.local/bin`. Flags: `-Recreate`, `-Python`, `-CudaVersion cu130|cu124|cpu` (default `cu130`), `-NoShim`, `-ShimDir`. The torch index URL is the only thing that changes between GPU/CPU installs — `pyproject.toml` declares plain `torch>=2.4`, and `setup.ps1` pre-seeds the right wheel before the editable install satisfies that dep against what's already installed.
 
 The repo's `docgraph.bat` resolves the venv via `%~dp0` so the shim works from any clone location.
 
@@ -180,7 +182,7 @@ The repo's `docgraph.bat` resolves the venv via `%~dp0` so the shim works from a
 
 - Non-cp1252 chars (`∈`) in MCP tool docstrings → crashes the call on Windows.
 - `type(r)` in Cypher → `function TYPE does not exist`. Use `label(r)`.
-- The daemon's embed-handler must NOT call `Embedder.embed()` (now daemon-aware → infinite recursion). Use `embedder._ensure().embed(...)` directly.
+- The daemon's embed-handler must NOT call `Embedder.embed()` (now daemon-aware → infinite recursion). Use `embedder._ensure().encode(...)` directly (sentence-transformers API, not fastembed's old `.embed()`).
 - Per-qname method rescoping must key on `id(def_node)`, not on the qname string — sibling classes collide otherwise.
 - `File.path` is the name property, not `File.name`.
 - Re-running the indexer with the host alive → DB lock error.
@@ -193,7 +195,7 @@ The repo's `docgraph.bat` resolves the venv via `%~dp0` so the shim works from a
 - `from __future__ import annotations` in `mcp_tools.py` / `server.py` → Pydantic can't resolve the closure-local `RootSlug` enum.
 - `str(enum_member)` on a `(str, Enum)` returns `'RootSlug.X'`, not `'x'`. Use `member.value`.
 - Walking with `Config.is_ignored()` at the file level for the document pass → universal `*.pdf` / `*.png` swallow every asset before tier 3 sees it. Use `is_user_ignored()` for files; `is_ignored()` only for directory pruning.
-- DirectML embeddings can `DXGI_ERROR_DEVICE_HUNG` mid-inference under VRAM contention. The session is poisoned afterward. `Embedder.embed()` catches it, drops the cache, retries on CPU. Don't remove the recovery wrapper.
+- DirectML embeddings used to `DXGI_ERROR_DEVICE_HUNG` mid-inference under VRAM contention (and worse: the NVIDIA `nvwgf2umx.dll` segfault path that crashed the whole host process on driver bumps). Why this matters today: that's the reason we moved off fastembed/ONNX to torch + sentence-transformers. `Embedder.embed()` still has a CPU-fallback recovery wrapper — now around torch CUDA errors (OOM / illegal memory / cuBLAS / cuDNN). Don't remove it.
 - Mounting FastMCP into FastAPI without `lifespan="on"` in uvicorn → `/mcp` 500s.
 - Reading `os.environ` for config — there are no `DOCGRAPH_*` env vars anymore. Take a kwarg or a CLI flag.
 

@@ -272,14 +272,14 @@ def index(
     ),
     gpu: bool = typer.Option(
         False, "--gpu",
-        help="Use GPU for embeddings via ONNX Runtime (CUDA / DirectML / CoreML). "
-             "Requires `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows) "
-             "to be installed; falls back to CPU if unavailable.",
+        help="Use NVIDIA CUDA for embeddings via torch (sentence-transformers). "
+             "Requires a `+cuXY` torch wheel installed; falls back to CPU "
+             "silently if `torch.cuda.is_available()` is False.",
     ),
     embed_batch_size: int | None = typer.Option(
         None, "--embed-batch-size",
-        help="Batch size for embedding (default: 256). Lower it (e.g. 32) if "
-             "you hit GPU device-hung errors with --gpu / DirectML.",
+        help="Batch size for embedding (default: 64). Lower it if you hit "
+             "CUDA out-of-memory with a larger embedding model.",
     ),
     workers: int = typer.Option(
         0, "--workers",
@@ -317,10 +317,12 @@ def index(
     Generated summaries are cached by body hash in
     `.docgraph/llm_docstrings.json` so incrementals don't re-call the model.
 
-    GPU (opt-in): with `--gpu`, embeddings run on the GPU via ONNX Runtime.
-    No torch dependency — install `onnxruntime-gpu` (NVIDIA / CUDA),
-    `onnxruntime-directml` (Windows / any GPU), or `onnxruntime-silicon`
-    (Apple Silicon) to light it up. Silently falls back to CPU otherwise.
+    GPU (opt-in): with `--gpu`, embeddings run on NVIDIA CUDA via torch.
+    Install the matching torch wheel from
+    `https://download.pytorch.org/whl/cu130` (or `cu124`); the `+cuXY`
+    wheels bundle their own CUDA + cuDNN runtime. Silently falls back to
+    CPU when `torch.cuda.is_available()` is False, and mid-run on
+    OOM / driver errors.
     """
     _setup_logging(verbose)
     cfg = load_config(
@@ -436,7 +438,15 @@ def host(
     # the host's per-slot Embedder + Retriever.
     gpu: bool = typer.Option(
         False, "--gpu",
-        help="Run embeddings on GPU (CUDA, DirectML, CoreML, ROCm, then CPU). ",
+        help="Run embeddings on NVIDIA CUDA via torch. Falls back to CPU "
+             "silently if torch.cuda.is_available() is False, and mid-run "
+             "on OOM / driver errors.",
+    ),
+    embed_torch_compile: bool = typer.Option(
+        False, "--embed-torch-compile",
+        help="Apply torch.compile(mode='reduce-overhead') to the embedder "
+             "model. ~10–30s extra cold-start; ~1.3–1.6× steady-state "
+             "speedup on GPU. Worth it for long-lived host processes.",
     ),
     embed_model: str | None = typer.Option(
         None, "--embed-model",
@@ -457,6 +467,11 @@ def host(
     rerank_gpu: bool = typer.Option(
         False, "--rerank-gpu",
         help="Run the cross-encoder reranker on GPU. Independent of --gpu. ",
+    ),
+    rerank_torch_compile: bool = typer.Option(
+        False, "--rerank-torch-compile",
+        help="Apply torch.compile to the cross-encoder reranker. Independent "
+             "of --embed-torch-compile.",
     ),
     workers: int = typer.Option(
         0, "--workers",
@@ -599,17 +614,17 @@ def host(
             from docgraph.wiki import set_wiki_prompt_tail
             set_wiki_prompt_tail(txt)
 
-    if gpu:
-        # DirectML can hang at 256; use 32 if we're on GPU.
-        if embed_batch_size == 0:
-            embed_batch_size = 32
+    if gpu and embed_batch_size == 0:
+        embed_batch_size = 32
 
     overrides: dict = {
         "host": bind_host,
         "port": bind_port,
         "gpu": gpu,
+        "embed_torch_compile": embed_torch_compile,
         "rerank_default": rerank_default,
         "rerank_gpu": rerank_gpu,
+        "rerank_torch_compile": rerank_torch_compile,
         "wiki_depth": wiki_depth,
     }
     if embed_model:                overrides["embedding_model"] = embed_model
@@ -985,8 +1000,9 @@ def daemon_start(
     ),
     gpu: bool = typer.Option(
         False, "--gpu",
-        help="Load the embedding model on GPU via ONNX Runtime providers (CUDA / DirectML / CoreML). "
-             "Requires `onnxruntime-gpu` / `onnxruntime-directml` / `onnxruntime-silicon` installed.",
+        help="Load the embedding model on NVIDIA CUDA via torch. Requires "
+             "a `+cuXY` torch wheel installed. Falls back to CPU silently "
+             "if `torch.cuda.is_available()` is False.",
     ),
     detach: bool = typer.Option(
         False, "--detach", "-d",

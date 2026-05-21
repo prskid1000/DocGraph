@@ -1,206 +1,219 @@
-"""Embedding wrapper around fastembed (ONNX runtime, no torch dep)."""
+"""Embedding wrapper around sentence-transformers (torch backend).
+
+Replaces the old fastembed/ONNX path. The fastembed path was retired
+after repeated DirectML driver crashes (`nvwgf2umx.dll`) on Windows,
+and because torch's `+cuXY` wheels ship a self-contained CUDA + cuDNN
+runtime so GPU just works without a separate CUDA Toolkit install.
+
+GPU is still opt-in: `cfg.gpu` → `device="cuda"` if `torch.cuda.is_available()`,
+else silent CPU fallback. The process-wide `_MODEL_CACHE` is preserved so
+a second `Embedder(...)` with matching config reuses one loaded model.
+"""
 from __future__ import annotations
 
 import gc
 import logging
 import threading
 import time
-from typing import Callable, Iterable, Iterator
+from typing import Any, Callable, Iterable, Iterator
 
 import numpy as np
-from fastembed import TextEmbedding
 
 log = logging.getLogger(__name__)
 
-# ONNX Runtime execution providers tried (in order) when GPU is requested.
-# ORT picks the first one that's actually installed; CPU is the final
-# fallback so an unsupported box still works. Adding `onnxruntime-gpu`
-# (CUDA / TensorRT) or `onnxruntime-directml` (Windows GPU) lights up the
-# corresponding entries — base `onnxruntime` only knows CPU.
-GPU_PROVIDERS: list[str] = [
-    "CUDAExecutionProvider",       # NVIDIA via onnxruntime-gpu
-    "DmlExecutionProvider",        # Windows DirectML via onnxruntime-directml
-    "CoreMLExecutionProvider",     # macOS via onnxruntime-silicon
-    "ROCMExecutionProvider",       # AMD Linux
-    "CPUExecutionProvider",        # always-available fallback
-]
-
-# Process-wide model cache. Keyed on (model_name, sorted providers tuple) so
-# every Embedder() instance with the same config shares one loaded ONNX
-# session. The model itself is ~100 MB resident; in multi-repo + watch + test
-# scenarios we used to pay that for each Embedder. fastembed's session is
-# thread-safe for the embed() call so sharing across asyncio handlers /
-# the watch loop / Indexer is fine.
-_MODEL_CACHE: dict[tuple, TextEmbedding] = {}
+# Process-wide model cache. Keyed on (model_name, device, dtype) so every
+# `Embedder()` with the same config shares one loaded `SentenceTransformer`.
+# A loaded BGE-small is ~130 MB resident; without the cache, multi-root +
+# watch + tests would pay that for each construction.
+_MODEL_CACHE: dict[tuple, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
-
-def _cache_key(model_name: str, providers: list | None) -> tuple:
-    """Cache key is hashable. ORT provider entries can be plain strings or
-    `(name, options_dict)` tuples; dicts aren't hashable, so freeze the
-    options-dict half into a sorted-items tuple before stuffing it into
-    the key."""
-    if not providers:
-        return (model_name, ())
-    frozen: list = []
-    for p in providers:
-        if isinstance(p, tuple) and len(p) == 2 and isinstance(p[1], dict):
-            frozen.append((p[0], tuple(sorted(p[1].items()))))
-        else:
-            frozen.append(p)
-    return (model_name, tuple(frozen))
-
-
-def clear_model_cache() -> None:
-    """Drop all cached embedding models. Tests may want this between
-    suites that flip GPU providers; production code should never need it."""
-    with _MODEL_CACHE_LOCK:
-        _MODEL_CACHE.clear()
-
-
-def dim_for_model(model_name: str, default: int = 384) -> int:
-    """Look up the output dim of a fastembed text-embedding model.
-
-    Used to size Kuzu's `embedding DOUBLE[N]` columns at schema-init time
-    so the on-disk array length matches whatever model the user picked.
-    Falls back to `default` if the model isn't in fastembed's catalog
-    (older fastembed, custom local model, mistyped name) — the indexer
-    will then either succeed by chance (matching dim) or fail loudly on
-    the first insert (mismatched dim). We prefer that to silent dim
-    drift across a session."""
-    if not model_name:
-        return default
-    try:
-        for m in TextEmbedding.list_supported_models():
-            if m.get("model") == model_name:
-                d = m.get("dim")
-                if isinstance(d, int) and d > 0:
-                    return d
-    except Exception:
-        log.debug("dim_for_model lookup failed for %s; using default=%d", model_name, default)
-    return default
+# Common embedding dims so schema-init doesn't have to load the model just
+# to size Kuzu's `embedding DOUBLE[N]` column. Unknown models fall through
+# to a one-time `SentenceTransformer.get_sentence_embedding_dimension()`
+# (cached back into this dict).
+_KNOWN_DIMS: dict[str, int] = {
+    "BAAI/bge-small-en-v1.5":                          384,
+    "BAAI/bge-base-en-v1.5":                           768,
+    "BAAI/bge-large-en-v1.5":                          1024,
+    "BAAI/bge-small-zh-v1.5":                          512,
+    "BAAI/bge-m3":                                     1024,
+    "sentence-transformers/all-MiniLM-L6-v2":          384,
+    "sentence-transformers/all-MiniLM-L12-v2":         384,
+    "sentence-transformers/all-mpnet-base-v2":         768,
+    "sentence-transformers/paraphrase-MiniLM-L6-v2":   384,
+    "sentence-transformers/multi-qa-MiniLM-L6-cos-v1": 384,
+    "intfloat/e5-small-v2":                            384,
+    "intfloat/e5-base-v2":                             768,
+    "intfloat/e5-large-v2":                            1024,
+    "thenlper/gte-small":                              384,
+    "thenlper/gte-base":                               768,
+    "thenlper/gte-large":                              1024,
+    "jinaai/jina-embeddings-v2-small-en":              512,
+    "jinaai/jina-embeddings-v2-base-en":               768,
+    "nomic-ai/nomic-embed-text-v1.5":                  768,
+    "mixedbread-ai/mxbai-embed-large-v1":              1024,
+}
 
 
-def resolve_providers(gpu: bool) -> list | None:
-    """ORT provider list when GPU is enabled, else None (= CPU). Filters
-    the requested providers against what's actually installed so ORT
-    doesn't waste time (and log warnings) trying unavailable providers.
-    Uses the same filtering logic as Embedder._available_providers()."""
+def resolve_device(gpu: bool) -> str | None:
+    """Return `"cuda"` if GPU is requested AND torch sees a usable CUDA
+    device, else `None` (= CPU). Importing torch is deferred so a CPU-only
+    install still works at module-import time."""
     if not gpu:
         return None
     try:
-        import onnxruntime as ort
-        available = set(ort.get_available_providers())
-        kept = [p for p in GPU_PROVIDERS if p in available]
-        # If only CPU remains, return [] so fastembed takes its default path
-        if kept == ["CPUExecutionProvider"]:
-            return []
-        return kept
+        import torch
+        if torch.cuda.is_available():
+            return "cuda"
     except Exception:
-        return list(GPU_PROVIDERS)
+        pass
+    return None
+
+
+def _cache_key(model_name: str, device: str | None, dtype: str) -> tuple:
+    return (model_name, device or "cpu", (dtype or "auto").lower())
+
+
+def clear_model_cache() -> None:
+    """Drop all cached embedding models. Tests that flip GPU between suites
+    want this; production code never needs to call it."""
+    with _MODEL_CACHE_LOCK:
+        _MODEL_CACHE.clear()
+    _empty_cuda_cache()
+    gc.collect()
+
+
+def dim_for_model(model_name: str, default: int = 384) -> int:
+    """Look up the output dim of an embedding model. Sizes Kuzu's
+    `embedding DOUBLE[N]` column at schema-init time so on-disk array
+    length matches the model. Falls back to `default` if the model
+    isn't in the static table and can't be probed."""
+    if not model_name:
+        return default
+    if model_name in _KNOWN_DIMS:
+        return _KNOWN_DIMS[model_name]
+    try:
+        from sentence_transformers import SentenceTransformer
+        m = SentenceTransformer(model_name, device="cpu")
+        d = int(m.get_sentence_embedding_dimension() or default)
+        _KNOWN_DIMS[model_name] = d
+        del m
+        gc.collect()
+        return d
+    except Exception:
+        log.debug("dim_for_model lookup failed for %s; using default=%d",
+                  model_name, default)
+    return default
+
+
+def _pick_dtype(pref: str, on_cuda: bool):
+    """Translate a dtype preference (`"auto" | "fp16" | "bf16" | "fp32"`)
+    to a torch dtype. Default: fp16 on CUDA (1.5–2× faster, negligible
+    quality loss for cosine retrieval), fp32 on CPU (Intel/AMD CPUs don't
+    accelerate fp16)."""
+    import torch
+    pref = (pref or "auto").lower()
+    if pref in ("auto", "fp16"):
+        return torch.float16 if on_cuda else torch.float32
+    if pref == "bf16":
+        return torch.bfloat16
+    return torch.float32
+
+
+def _empty_cuda_cache() -> None:
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 class Embedder:
+    """`sentence-transformers` wrapper with process-wide cache, idle-unload
+    bookkeeping, daemon routing, and CPU fallback on CUDA failure.
+
+    Public surface (preserved from the fastembed era):
+        embed(texts, batch_size=None, on_progress=None) -> np.ndarray
+        embed_iter(texts, batch_size=None) -> Iterator[np.ndarray]
+        unload() / is_loaded() / last_used() / dim
+    """
+
     def __init__(
         self,
         model_name: str = "BAAI/bge-small-en-v1.5",
-        providers: list | None = None,
+        device: str | None = None,
+        dtype: str = "auto",
+        torch_compile: bool = False,
     ):
         self.model_name = model_name
-        # When None, fastembed picks its default (CPU). When given, the list
-        # is passed straight through to the underlying onnxruntime session.
-        # Entries may be plain strings ("CPUExecutionProvider") or
-        # (name, options_dict) tuples for adapter-id selection.
-        self.providers = providers
-        self._model: TextEmbedding | None = None
-        # Monotonic timestamp of the last successful embed call. The idle
-        # unloader on the workspace polls this and evicts the model when
-        # it goes untouched for longer than `Config.unload_after` seconds.
+        # device: None or "cpu" = CPU; "cuda" = NVIDIA GPU. We re-check
+        # `torch.cuda.is_available()` at load time so a config asking for
+        # CUDA on a CPU-only box silently downgrades instead of erroring.
+        self.device = device
+        self.dtype = dtype
+        # torch.compile is opt-in: pays a one-time compile cost (~10-30s
+        # on first invocation) for ~1.3-1.6× steady-state speedup on
+        # GPU. Off by default so cold-start incrementals stay fast.
+        self.torch_compile = torch_compile
+        self._model: Any = None
+        self._resolved_device: str = "cpu"
+        # Monotonic timestamp of the last successful embed call. The
+        # workspace's idle unloader polls this and evicts when stale.
         self._last_used: float = 0.0
         self._lock = threading.Lock()
 
-    def _ensure(self) -> TextEmbedding:
+    def _ensure(self) -> Any:
         if self._model is not None:
             return self._model
-        # Reaching here means we'll load — mark touch so the idle unloader
-        # never sees a freshly-loaded session sitting at last_used=0.
+        # Mark a touch so a freshly-loaded session never sits at 0.0.
         self._last_used = time.monotonic()
-        # Process-wide cache: a second Embedder() with matching config skips
-        # the ~1s ONNX-session load and uses the existing in-memory model.
-        # We resolve providers up front so the cache key reflects what was
-        # actually selected, not what was requested (e.g. CUDA was requested
-        # but only CPU is installed → both keys end up as CPU).
-        providers = self._available_providers(self.providers) if self.providers else None
-        key = _cache_key(self.model_name, providers)
+        import torch
+        on_cuda = self.device == "cuda" and torch.cuda.is_available()
+        if self.device == "cuda" and not on_cuda:
+            log.warning(
+                "Embedder %s: cuda requested but unavailable — using CPU",
+                self.model_name,
+            )
+        self._resolved_device = "cuda" if on_cuda else "cpu"
+        torch_dtype = _pick_dtype(self.dtype, on_cuda)
+        key = _cache_key(self.model_name, self._resolved_device, self.dtype)
         with _MODEL_CACHE_LOCK:
             cached = _MODEL_CACHE.get(key)
             if cached is not None:
                 self._model = cached
                 return cached
-            if providers:
-                log.info(
-                    f"Loading embedding model {self.model_name} with providers={providers}..."
-                )
+            log.info(
+                "Loading embedding model %s on %s (%s)…",
+                self.model_name, self._resolved_device, str(torch_dtype),
+            )
+            from sentence_transformers import SentenceTransformer
+            # `model_kwargs={"torch_dtype": …}` is the supported way to
+            # load straight into fp16 / bf16 — avoids a fp32 → fp16
+            # round-trip.
+            model = SentenceTransformer(
+                self.model_name,
+                device=self._resolved_device,
+                model_kwargs={"torch_dtype": torch_dtype},
+            )
+            model.eval()
+            if self.torch_compile:
+                # `reduce-overhead` is the right mode for many small inference
+                # calls (our hot path). `default` would be safer but slower.
+                # Wrapping in try/except because compile fails on older
+                # GPUs / Windows + Triton combos — fall back silently.
                 try:
-                    model = TextEmbedding(
-                        model_name=self.model_name, providers=providers
-                    )
-                    self._model = model
-                    self._log_active_provider()
-                except Exception as e:  # pragma: no cover - depends on installed ORT
+                    model = torch.compile(model, mode="reduce-overhead")
+                    log.info("Embedder %s: torch.compile applied", self.model_name)
+                except Exception as exc:
                     log.warning(
-                        f"GPU init failed ({e}); falling back to CPU. "
-                        f"Install `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows) for GPU."
+                        "Embedder %s: torch.compile failed (%s); "
+                        "continuing without it", self.model_name, exc,
                     )
-                    model = TextEmbedding(model_name=self.model_name)
-                    self._model = model
-                    # Re-key under the CPU fallback so a second Embedder
-                    # asking for GPU also lands on the same loaded session.
-                    key = _cache_key(self.model_name, None)
-            else:
-                if self.providers:
-                    log.warning(
-                        f"GPU requested but no GPU provider is installed. "
-                        f"Install `onnxruntime-gpu` (NVIDIA) or `onnxruntime-directml` (Windows). "
-                        f"Falling back to CPU."
-                    )
-                else:
-                    log.info(f"Loading embedding model {self.model_name}...")
-                model = TextEmbedding(model_name=self.model_name)
-                self._model = model
-            _MODEL_CACHE[key] = self._model
+            self._model = model
+            _MODEL_CACHE[key] = model
         return self._model
-
-    @staticmethod
-    def _available_providers(requested: list) -> list:
-        """Filter requested ORT providers against what's actually installed.
-        ORT errors hard if you list an unavailable provider (e.g. CUDA without
-        onnxruntime-gpu) instead of skipping it, so we pre-filter. Entries
-        may be plain strings or `(name, options_dict)` tuples; we match on
-        the name half."""
-        try:
-            import onnxruntime as ort
-            available = set(ort.get_available_providers())
-        except Exception:
-            return []
-        kept = [p for p in requested if (p[0] if isinstance(p, tuple) else p) in available]
-        # Drop the all-CPU case so the caller takes the no-providers code path
-        # (which lets fastembed apply its own default session options).
-        if kept == ["CPUExecutionProvider"]:
-            return []
-        return kept
-
-    def _log_active_provider(self) -> None:
-        """Best-effort introspection of which ORT provider actually got selected.
-        fastembed doesn't expose this directly so we dig through the model."""
-        try:
-            inner = getattr(self._model, "model", None) or getattr(self._model, "_model", None)
-            sess = getattr(inner, "model", None) if inner is not None else None
-            if sess is not None and hasattr(sess, "get_providers"):
-                active = sess.get_providers()
-                log.info(f"ONNX Runtime active providers: {active}")
-        except Exception:
-            pass
 
     def embed(
         self,
@@ -209,23 +222,15 @@ class Embedder:
         on_progress: Callable[[int], None] | None = None,
     ) -> np.ndarray:
         """Embed a list of texts. Returns float32 ndarray of shape (N, dim).
-        Keeping vectors as numpy (~1.5 KB each) instead of Python list[float]
-        (~12 KB each) is an 8x memory cut, which matters when embedding
-        100k+ entities. If `on_progress` is given, it's called with the count
-        of items completed each time fastembed yields a vector.
 
-        Daemon path: if `docgraph daemon start` is running on this host, route
-        the embed call through it — the daemon holds a single warm ONNX session
-        across all CLI invocations, cutting cold-start to a TCP round trip. We
-        only use the daemon when no `on_progress` callback is set, since the
-        daemon returns one batch and progress hooks expect per-vector ticks.
-        Falls back transparently if the daemon is unreachable or replies
-        malformed; never fails the caller's request.
-        """
+        Daemon path: if `docgraph daemon start` is running on this host,
+        route the call through it — the daemon holds a single warm session
+        across CLI invocations. Daemon path skipped when `on_progress` is
+        set since the daemon returns one batch and progress hooks expect
+        per-vector ticks. Falls back transparently on any daemon failure."""
         texts_list = list(texts)
         if batch_size is None:
-            # DirectML can hang at 256; use 32 if we're on GPU.
-            batch_size = 32 if self.providers else 256
+            batch_size = 64
 
         if on_progress is None and texts_list:
             try:
@@ -235,22 +240,19 @@ class Embedder:
                     return via.astype(np.float32, copy=False)
             except Exception:
                 pass
+
         try:
             return self._run_embed(texts_list, batch_size, on_progress)
         except Exception as exc:
-            # ORT GPU sessions can fail mid-inference for reasons unrelated
-            # to docgraph: device hung (DXGI 0x887A0006 — common when
-            # another process like llama.cpp is saturating the GPU),
-            # OOM in shared VRAM, kernel cache eviction. The session is
-            # poisoned after such a failure; rebuilding it on the same
-            # provider just re-fails. Drop the cache entry, force CPU,
-            # retry once.
-            if not self._is_recoverable_ort_error(exc) or not self.providers:
+            # torch CUDA can fail mid-inference: OOM, illegal memory
+            # access, driver hang/crash. The session is poisoned afterwards;
+            # rebuilding on the same device just re-fails. Drop the cache
+            # entry, force CPU, retry once.
+            if not self._is_recoverable_gpu_error(exc) or self.device != "cuda":
                 raise
             log.warning(
-                "GPU embed failed (%s); dropping DirectML session and "
-                "retrying on CPU. Likely cause: another GPU process "
-                "(LLM) is contending for the device.", exc,
+                "GPU embed failed (%s); dropping CUDA session and "
+                "retrying on CPU. %s", exc, _diagnose_gpu_error(exc),
             )
             self._fallback_to_cpu()
             return self._run_embed(texts_list, batch_size, on_progress)
@@ -264,56 +266,75 @@ class Embedder:
         model = self._ensure()
         # Touch at start AND end so a long batch isn't evicted mid-flight.
         self._last_used = time.monotonic()
-        arrs: list[np.ndarray] = []
-        for vec in model.embed(texts_list, batch_size=batch_size):
-            arrs.append(np.asarray(vec, dtype=np.float32))
-            if on_progress is not None:
-                on_progress(1)
-        self._last_used = time.monotonic()
-        if not arrs:
+        if not texts_list:
             return np.zeros((0, self.dim), dtype=np.float32)
-        return np.stack(arrs)
+        import torch
+        # `no_grad` keeps the autograd graph from holding tensors for
+        # thousands of entities across a single index pass.
+        if on_progress is None:
+            with torch.no_grad():
+                vecs = model.encode(
+                    texts_list,
+                    batch_size=batch_size,
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+            self._last_used = time.monotonic()
+            return np.asarray(vecs, dtype=np.float32)
+        # Progress path: encode in our own batch loop so callers get
+        # per-item ticks rather than one big tick at the end.
+        out: list[np.ndarray] = []
+        with torch.no_grad():
+            for i in range(0, len(texts_list), batch_size):
+                batch = texts_list[i:i + batch_size]
+                vecs = model.encode(
+                    batch,
+                    batch_size=len(batch),
+                    convert_to_numpy=True,
+                    normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+                out.append(np.asarray(vecs, dtype=np.float32))
+                for _ in range(len(batch)):
+                    on_progress(1)
+        self._last_used = time.monotonic()
+        return np.vstack(out) if out else np.zeros((0, self.dim), dtype=np.float32)
 
     @staticmethod
-    def _is_recoverable_ort_error(exc: BaseException) -> bool:
-        """Heuristic: ORT's pybind11_state errors and DXGI device-hung
-        codes are the ones we want to recover from. Other failures (e.g.
-        a malformed model file) won't get better on CPU and should
-        propagate."""
-        try:
-            import onnxruntime as ort  # noqa: F401
-            from onnxruntime.capi.onnxruntime_pybind11_state import Fail as ORTFail
-            if isinstance(exc, ORTFail):
-                return True
-        except Exception:
-            pass
-        msg = str(exc)
-        return ("ONNXRuntimeError" in msg
-                or "DmlExecutionProvider" in msg
-                or "887A0006" in msg)
+    def _is_recoverable_gpu_error(exc: BaseException) -> bool:
+        """Heuristic: torch CUDA OOM, illegal-memory, cuBLAS / cuDNN /
+        driver errors are recoverable by falling back to CPU. Other failures
+        (model file missing, OOV tokenizer error, etc.) should propagate."""
+        msg = str(exc).lower()
+        return any(s in msg for s in (
+            "cuda out of memory", "out of memory",
+            "cuda error", "cublas", "cudnn",
+            "illegal memory access", "device-side assert",
+            "no kernel image", "no cuda gpus",
+        ))
 
     def _fallback_to_cpu(self) -> None:
-        """Drop GPU session + cache entry; re-init on CPU on next embed."""
+        """Drop CUDA session + cache entries; re-init on CPU on next embed."""
         with _MODEL_CACHE_LOCK:
-            old_providers = (
-                self._available_providers(self.providers) if self.providers else None
-            )
-            for key in (_cache_key(self.model_name, old_providers),
-                        _cache_key(self.model_name, self.providers)):
+            for key in (
+                _cache_key(self.model_name, "cuda", self.dtype),
+                _cache_key(self.model_name, self._resolved_device, self.dtype),
+            ):
                 _MODEL_CACHE.pop(key, None)
         self._model = None
-        self.providers = None
+        self.device = None
+        self._resolved_device = "cpu"
+        _empty_cuda_cache()
+        gc.collect()
 
-    def embed_iter(self, texts: Iterable[str], batch_size: int | None = None) -> Iterator[np.ndarray]:
-        """Streaming variant: yield one float32 ndarray at a time."""
-        if batch_size is None:
-            # DirectML can hang at 256; use 32 if we're on GPU.
-            batch_size = 32 if self.providers else 256
-        model = self._ensure()
-        self._last_used = time.monotonic()
-        for vec in model.embed(list(texts), batch_size=batch_size):
-            yield np.asarray(vec, dtype=np.float32)
-        self._last_used = time.monotonic()
+    def embed_iter(
+        self, texts: Iterable[str], batch_size: int | None = None,
+    ) -> Iterator[np.ndarray]:
+        """Streaming variant: yield one float32 ndarray per text."""
+        vecs = self.embed(texts, batch_size=batch_size)
+        for v in vecs:
+            yield np.asarray(v, dtype=np.float32)
 
     # ── Idle unload ─────────────────────────────────────────────────────
     def is_loaded(self) -> bool:
@@ -323,30 +344,42 @@ class Embedder:
         return self._last_used
 
     def unload(self) -> bool:
-        """Drop the in-memory ONNX session and its cache entries. Returns
-        True if something was actually evicted. Safe to call when already
-        unloaded — a no-op. Held under `self._lock` so a concurrent
-        `_ensure()` either reloads cleanly or completes before we drop."""
+        """Drop the in-memory model + cache entries. Returns True if
+        something was actually evicted. Idempotent. Held under `self._lock`
+        so a concurrent `_ensure()` either reloads cleanly or completes
+        before we drop."""
         with self._lock:
             if self._model is None:
                 return False
-            # Resolve provider list the same way _ensure does so we evict
-            # both possible cache keys (requested vs. CPU fallback).
-            providers = self._available_providers(self.providers) if self.providers else None
             with _MODEL_CACHE_LOCK:
-                for key in (_cache_key(self.model_name, providers),
-                            _cache_key(self.model_name, self.providers)):
+                for key in (
+                    _cache_key(self.model_name, self._resolved_device, self.dtype),
+                    _cache_key(self.model_name, self.device or "cpu", self.dtype),
+                ):
                     _MODEL_CACHE.pop(key, None)
             self._model = None
-        # Force a GC pass — ONNX Runtime session objects hold native
-        # buffers via pybind11; without an explicit collect the VRAM
-        # / RAM stays pinned until the next allocation pressure.
+        # Native CUDA buffers stick around via pybind until we explicitly
+        # ask torch to release them and run GC.
+        _empty_cuda_cache()
         gc.collect()
         log.info("Embedder %s: unloaded after idle", self.model_name)
         return True
 
     @property
     def dim(self) -> int:
-        """The embedding dimension of the loaded model.
-        BGE-small = 384, mpnet = 768, etc."""
+        """Output dim of the loaded model (BGE-small = 384, mpnet = 768, …)."""
         return dim_for_model(self.model_name, default=384)
+
+
+def _diagnose_gpu_error(exc: BaseException) -> str:
+    """One-line root-cause hint appended to the recovery warning. Useful
+    for triage when a recovery fires in a long-running host log: was it
+    OOM, a driver issue, or something else?"""
+    msg = str(exc).lower()
+    if "out of memory" in msg:
+        return "Likely cause: CUDA out of memory (model + batch too big for VRAM)."
+    if "illegal memory access" in msg or "device-side assert" in msg:
+        return "Likely cause: CUDA illegal memory access — driver or kernel bug."
+    if "cublas" in msg or "cudnn" in msg:
+        return "Likely cause: cuBLAS / cuDNN error — version mismatch or driver bug."
+    return "Cause unclear — see exception message above."

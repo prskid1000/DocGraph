@@ -172,12 +172,19 @@ def _serve_one(conn: socket.socket, ctx: dict) -> bool:
     if op == "embed":
         texts = req.get("texts") or []
         try:
-            # Bypass Embedder.embed() — that wrapper's daemon-detection path
-            # would route this call right back to us. Hit fastembed directly.
+            # Bypass Embedder.embed() — that wrapper's daemon-detection
+            # path would route this call right back to us. Hit the
+            # underlying SentenceTransformer directly.
             model = ctx["embedder"]._ensure()
-            # DirectML can hang at 256; use 32 if we're on GPU.
-            batch = 32 if ctx.get("gpu") else 256
-            vecs = [list(map(float, v)) for v in model.embed(list(texts), batch_size=batch)]
+            import torch
+            batch = 64
+            with torch.no_grad():
+                arr = model.encode(
+                    list(texts), batch_size=batch,
+                    convert_to_numpy=True, normalize_embeddings=True,
+                    show_progress_bar=False,
+                )
+            vecs = [list(map(float, v)) for v in arr]
             payload: dict[str, Any] = {"embeddings": vecs}
         except Exception as e:
             payload = {"error": str(e)}
@@ -203,11 +210,11 @@ def run_daemon(
 ) -> int:
     """Start the daemon in the calling process. Blocks until shutdown.
     Returns 0 on clean exit, non-zero on bind failure."""
-    from docgraph.embed import Embedder, resolve_providers
+    from docgraph.embed import Embedder, resolve_device
 
     embedder = Embedder(
         model_name=model_name,
-        providers=resolve_providers(gpu),
+        device=resolve_device(gpu),
     )
     embedder._ensure()  # warm up before we accept clients
 

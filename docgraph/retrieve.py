@@ -46,9 +46,12 @@ class Retriever:
             # cfg.rerank_model may be "" — Reranker falls back to its built-in
             # default (jinaai/jina-reranker-v1-tiny-en).
             model = getattr(self.cfg, "rerank_model", "") or None
-            from .embed import resolve_providers
-            providers = resolve_providers(getattr(self.cfg, "rerank_gpu", False))
-            self._reranker = Reranker(model_name=model, providers=providers)
+            from .embed import resolve_device
+            self._reranker = Reranker(
+                model_name=model,
+                device=resolve_device(getattr(self.cfg, "rerank_gpu", False)),
+                torch_compile=getattr(self.cfg, "rerank_torch_compile", False),
+            )
         return self._reranker
 
     def _ranker_(self) -> PersonalizedRanker:

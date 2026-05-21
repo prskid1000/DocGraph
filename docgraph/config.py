@@ -36,10 +36,16 @@ class Config:
     # users can keep embeddings on GPU and reranking on CPU (or vice versa).
     rerank_gpu: bool = False
     # GPU acceleration for embeddings (and reranker). Off by default; when
-    # True, the Embedder asks ONNX Runtime to use CUDA / DirectML / CoreML
-    # before falling back to CPU. Requires `onnxruntime-gpu` or
-    # `onnxruntime-directml` to be installed.
+    # True, the Embedder asks torch for CUDA and falls back to CPU silently
+    # if `torch.cuda.is_available()` is False. Requires a `+cuXY` torch
+    # wheel installed; the default PyPI wheel is CPU-only.
     gpu: bool = False
+    # `torch.compile` for the embedder / reranker. Off by default — costs
+    # 10–30 s on first invocation but yields ~1.3–1.6× steady-state speedup
+    # on GPU. Worth it for long-lived host processes; not worth it for
+    # one-shot `docgraph index` runs.
+    embed_torch_compile: bool = False
+    rerank_torch_compile: bool = False
     workers: int = field(default_factory=lambda: max(2, (os.cpu_count() or 4) - 1))
     host: str = "127.0.0.1"
     port: int = 5500
@@ -261,6 +267,8 @@ def load_config(
     rerank_model: str = "",
     rerank_gpu: bool = False,
     gpu: bool = False,
+    embed_torch_compile: bool = False,
+    rerank_torch_compile: bool = False,
     llm_docstrings: bool = False,
     llm_wiki: bool = True,
     llm_host: str = "localhost",
@@ -319,6 +327,8 @@ def load_config(
         rerank_model=rerank_model,
         rerank_gpu=rerank_gpu,
         gpu=gpu,
+        embed_torch_compile=embed_torch_compile,
+        rerank_torch_compile=rerank_torch_compile,
         llm_docstrings=llm_docstrings,
         llm_wiki=llm_wiki,
         llm_host=llm_host,

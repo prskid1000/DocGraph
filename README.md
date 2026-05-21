@@ -27,7 +27,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **165+ languages** out of the box via tree-sitter (just `pip install` more `tree-sitter-*` packages).
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
 - **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
-- **Optional GPU acceleration** — `docgraph index --gpu` runs embeddings via ONNX Runtime on CUDA / DirectML / CoreML. No torch dep — `pip install onnxruntime-gpu` / `-directml` / `-silicon`. Falls back to CPU silently if no GPU runtime is installed.
+- **Optional GPU acceleration** — `docgraph index --gpu` routes embeddings through torch via sentence-transformers. NVIDIA CUDA only; install with the matching torch wheel (`pip install --index-url https://download.pytorch.org/whl/cu130 torch`, or `cu124` / `cpu`). The CUDA wheels bundle their own CUDA + cuDNN runtime so no separate CUDA Toolkit install is needed. Falls back to CPU silently when no GPU is available, and falls back from CUDA to CPU mid-run on driver / OOM errors instead of crashing the host.
 - **Local-only by default** — no telemetry, no cloud round-trips. The only outbound calls are opt-in LLM requests via `--llm-model <name>` (you supply the local server).
 - **Configuration is flags-only.** No `DOCGRAPH_*` environment variables. Every knob is a CLI flag or a `load_config(...)` kwarg, so the spawn surface is fully visible in `ps` / Process Hacker.
 
@@ -37,7 +37,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). Answers "what else will my change break?".
 - **Differentiator MCP tools** — `explore` (multi-hop BFS), `impact_of` (blast radius), `test_impact` (which tests cover this?), `cypher` (raw read-only graph query — rejects writes server-side).
 - **Personalized PageRank** — `search` accepts `focus_file` / `focus_symbol` and ranks by proximity to what the agent is editing.
-- **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (still local, still ONNX).
+- **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (local, torch).
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
 - **Symbol-level imports + method overrides** — `IMPORTS_SYMBOL` (file → exact Class / Function imported by name) and `OVERRIDES` (child method → parent via the inheritance closure).
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
@@ -90,17 +90,17 @@ pipx install docgraph    # recommended; isolated install
 pip install docgraph
 ```
 
-Requires Python 3.10+. The first run downloads the embedding model (~30 MB BGE-small-en, ONNX).
+Requires Python 3.10+. The first run downloads the embedding model (~130 MB BGE-small-en).
 
-**Optional GPU acceleration** — install one of these alongside `docgraph` to enable `--gpu` (no torch dep, all ONNX):
+**Optional GPU acceleration** — install the torch wheel matching your CUDA version to enable `--gpu`. NVIDIA only; AMD / Intel GPU users stay on CPU.
 
 ```bash
-pip install onnxruntime-gpu          # NVIDIA / CUDA (Linux, Windows)
-pip install onnxruntime-directml     # Windows / any DirectX 12 GPU
-pip install onnxruntime-silicon      # Apple Silicon (CoreML)
+pip install --index-url https://download.pytorch.org/whl/cu130 torch   # NVIDIA + CUDA 13.x
+pip install --index-url https://download.pytorch.org/whl/cu124 torch   # NVIDIA + CUDA 12.4
+pip install --index-url https://download.pytorch.org/whl/cpu   torch   # CPU only (also default from PyPI)
 ```
 
-DocGraph picks whichever provider is installed automatically; without one it stays on CPU.
+The `+cuXY` wheels bundle their own CUDA + cuDNN runtime, so no separate CUDA Toolkit install is needed. DocGraph auto-detects with `torch.cuda.is_available()`; without a CUDA wheel it stays on CPU. CUDA OOM / driver errors mid-run are caught and the embedder falls back to CPU instead of crashing.
 
 ### Local dev install (Windows)
 
@@ -108,13 +108,14 @@ For working on docgraph itself rather than consuming it as a package:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\setup.ps1
-# .\setup.ps1 -Recreate   # wipe .venv and reinstall
-# .\setup.ps1 -Gpu none   # skip the directml install (default: directml)
-# .\setup.ps1 -Gpu cuda   # use onnxruntime-gpu instead
-# .\setup.ps1 -NoShim     # skip writing ~/.local/bin/docgraph.bat
+# .\setup.ps1 -Recreate                 # wipe .venv and reinstall
+# .\setup.ps1 -CudaVersion cu130        # NVIDIA + CUDA 13.x (default)
+# .\setup.ps1 -CudaVersion cu124        # NVIDIA + CUDA 12.4
+# .\setup.ps1 -CudaVersion cpu          # CPU-only install
+# .\setup.ps1 -NoShim                   # skip writing ~/.local/bin/docgraph.bat
 ```
 
-Creates `.venv` next to the script, `pip install -e .`, swaps the base `onnxruntime` for `onnxruntime-directml` so DML is available, and drops a `docgraph.bat` shim into `~/.local/bin` so the CLI is on PATH. The repo's own `docgraph.bat` resolves the venv via `%~dp0` and works from any clone location.
+Creates `.venv` next to the script, installs torch from PyTorch's per-CUDA index (whose `+cuXY` wheels bundle CUDA + cuDNN — no separate CUDA Toolkit install needed), runs `pip install -e .`, and drops a `docgraph.bat` shim into `~/.local/bin` so the CLI is on PATH. The repo's own `docgraph.bat` resolves the venv via `%~dp0` and works from any clone location.
 
 ## CLI reference
 
@@ -134,10 +135,10 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | `--llm-format STR` | `openai` | API format: `openai` (Chat Completions) or `anthropic` (Messages). |
 | `--llm-max-tokens INT` | `512` | Max tokens per LLM call. `reasoning_effort=none` lets reasoning models fit a one-sentence answer. |
 | `--llm-prompt-docstring-file PATH` | unset | Custom docstring template (must keep `{kind}` / `{name}` / `{language}` / `{body}`). |
-| `--gpu` | `false` | Use GPU for embeddings via ONNX Runtime. Requires `onnxruntime-gpu`/`-directml`/`-silicon`. Falls back to CPU silently if absent. |
+| `--gpu` | `false` | Use NVIDIA CUDA for embeddings via torch. Requires a `+cuXY` torch wheel installed (see Install). Falls back to CPU silently if `torch.cuda.is_available()` is False, and mid-run on CUDA OOM / driver errors. |
 | `--workers INT` | `0` (auto) | Override worker count. `0` = `max(2, cpu_count - 1)`. |
-| `--embed-batch-size INT` | `256` (`32` with `--gpu`) | Lower if you hit GPU device-hung errors with `--gpu` / DirectML. |
-| `--embed-model STR` | `BAAI/bge-small-en-v1.5` | Override the fastembed model. Schema dim auto-aligns. Switching dim on an existing DB requires `clear` + reindex. |
+| `--embed-batch-size INT` | `64` | Embedding batch size. Lower if you hit CUDA OOM with a larger model. |
+| `--embed-model STR` | `BAAI/bge-small-en-v1.5` | Override the embedding model (any HF sentence-transformers id). Schema dim auto-aligns. Switching dim on an existing DB requires `clear` + reindex. |
 | `--verbose`, `-v` | `false` | Verbose logs |
 
 ### `docgraph host [path]`
@@ -308,7 +309,7 @@ docgraph/
   parse.py           # tree-sitter universal parser (per-language tags queries)
   index.py           # parallel pipeline + per-file delta updates
   db.py              # Kuzu schema + bulk insert (COPY FROM arrow)
-  embed.py           # fastembed wrapper + GPU→CPU recovery on ORT Fail
+  embed.py           # sentence-transformers (torch) wrapper + CUDA→CPU recovery
   rank.py            # PageRank over call + reference + inheritance graph
   retrieve.py        # hybrid retrieval (vector cosine + name boost + PageRank)
   rerank.py          # lazy Jina cross-encoder (~33 MB), GPU-capable
