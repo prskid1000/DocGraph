@@ -436,7 +436,7 @@ class Workspace:
             }
 
         embed_entries: list[dict] = []
-        for (model, gpu), emb in embedders:
+        for (model, gpu, _torch_compile), emb in embedders:
             embed_entries.append(_one(
                 model_name=model, gpu=gpu,
                 loaded=emb.is_loaded(),
@@ -444,7 +444,7 @@ class Workspace:
                 threshold=self.embed_unload_after,
             ))
         rerank_entries: list[dict] = []
-        for (model, gpu), r in rerankers:
+        for (model, gpu, _torch_compile), r in rerankers:
             rerank_entries.append(_one(
                 model_name=model or "default", gpu=gpu,
                 loaded=r.is_loaded(),
