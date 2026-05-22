@@ -158,7 +158,18 @@ class Workspace:
             db_w = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
             db_w.init_schema()
             db_w.close()
-        db_ro = GraphDB(cfg.db_path, read_only=True)
+        try:
+            db_ro = GraphDB(cfg.db_path, read_only=True)
+        except RuntimeError as exc:
+            # A host killed mid-write leaves uncommitted shadow pages that
+            # Kuzu can only replay in read-write mode. Recover by opening RW
+            # once (replays + checkpoints), closing, then reopening RO.
+            if "shadow pages" not in str(exc).lower():
+                raise
+            log.warning("Replaying shadow pages for %s (recovering from unclean shutdown)", root)
+            db_rw = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
+            db_rw.close()
+            db_ro = GraphDB(cfg.db_path, read_only=True)
         embedder = self._embedder_for(cfg)
         retriever = Retriever(db_ro, embedder, cfg=cfg, workspace=self)
         slug = slug_for_root(root)
