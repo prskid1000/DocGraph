@@ -15,6 +15,7 @@ import subprocess
 from pathlib import Path
 
 from docgraph.config import Config
+from docgraph.proc_util import NO_WINDOW
 
 
 def _git(args: list[str], cwd: Path) -> str:
@@ -25,6 +26,7 @@ def _git(args: list[str], cwd: Path) -> str:
             text=True,
             stderr=subprocess.DEVNULL,
             errors="replace",
+            creationflags=NO_WINDOW,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return ""
@@ -219,6 +221,7 @@ def blame_lines(cfg: Config, file_path: str, line_start: int = 1, line_end: int 
             text=True,
             stderr=subprocess.DEVNULL,
             errors="replace",
+            creationflags=NO_WINDOW,
         )
     except (subprocess.CalledProcessError, FileNotFoundError):
         return []

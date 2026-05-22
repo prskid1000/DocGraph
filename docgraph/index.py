@@ -60,6 +60,7 @@ from docgraph.embed import Embedder, resolve_device
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
 from docgraph.summary import build_embedding_text, chunk_body
+from docgraph.proc_util import NO_WINDOW
 
 log = logging.getLogger(__name__)
 
@@ -1466,6 +1467,7 @@ class Indexer:
             return subprocess.check_output(
                 ["git", "rev-parse", "HEAD"],
                 cwd=root, text=True, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
             ).strip()
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
             return None
@@ -1639,6 +1641,7 @@ class Indexer:
                     cwd=root,
                     text=True,
                     stderr=subprocess.DEVNULL,
+                    creationflags=NO_WINDOW,
                 )
             except (subprocess.CalledProcessError, FileNotFoundError):
                 continue
@@ -1676,6 +1679,7 @@ class Indexer:
             out = subprocess.check_output(
                 ["git", "rev-list", "--count", f"-{self.cfg.co_change_window}", "HEAD"],
                 cwd=root, text=True, stderr=subprocess.DEVNULL,
+                creationflags=NO_WINDOW,
             ).strip()
             return int(out) if out.isdigit() else 0
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
