@@ -161,8 +161,31 @@ Accepts every `index`-time flag too (`--gpu`, `--embed-model`, `--llm-*`, `--rer
 | `--host STR` | `127.0.0.1` | Bind address |
 | `--port INT` | `5500` | Bind port |
 | `--debounce INT` | `500` | Watcher debounce (ms) |
+| `--embed-idle-unload-sec FLOAT` | `0` | Unload the embedder after N idle seconds (0 = never). Reloads lazily. |
+| `--rerank-idle-unload-sec FLOAT` | `0` | Unload the reranker after N idle seconds (0 = never). |
+| `--embed-daemon` / `--no-embed-daemon` | off | Route embed + rerank to a shared daemon (see below). |
+| `--daemon-port INT` | `5577` | Loopback port for the embedding daemon. |
+| `--daemon-idle-exit-sec FLOAT` | `0` | Daemon exits after N idle seconds with both models unloaded, to free the CUDA context (0 = never). |
 | `--llm-prompt-docstring-file PATH` | unset | Process-wide custom docstring template. |
 | `--llm-prompt-wiki-file PATH` | unset | Process-wide custom wiki output-format tail (no placeholders required). |
+
+### Embedding daemon (shared model, optional)
+
+`docgraph daemon` is a loopback TCP server holding **one** warm embedder + cross-encoder reranker for the whole host. Other docgraph processes (the host, the watcher's reindex, CLI runs) route their embed/rerank calls through it, so there's a single model and a single ~300 MB CUDA context — requests queue through one session instead of each process loading its own copy.
+
+```bash
+docgraph daemon start --gpu --idle-exit-sec 600   # foreground; Ctrl+C to stop
+docgraph daemon start -d --gpu                     # detached background
+docgraph daemon status
+docgraph daemon stop
+```
+
+Enable it for a host with `--embed-daemon` (the host spawns it lazily on first use). Two-stage idle management lives entirely in the daemon:
+
+- `--embed-idle-unload-sec` / `--rerank-idle-unload-sec` — drop a model's **weights** after idle; reload lazily on the next request. No restart.
+- `--idle-exit-sec` — once **both** models are unloaded and the daemon has been idle this long, it **exits** to release the CUDA context, and is respawned on the next embed/rerank. This is loop-safe: the daemon does no GPU work on boot and is only respawned on demand.
+
+Without `--embed-daemon`, embedding/reranking happen in-process (pooled per host) with the same `*-idle-unload-sec` weight-unloading; the CUDA context then lives in the host until it exits.
 
 ### `docgraph watch [path]`
 
