@@ -116,6 +116,9 @@ class Reranker:
         a transient driver hiccup."""
         if not documents:
             return []
+        daemon_scores = self._maybe_rerank_via_daemon(query, documents)
+        if daemon_scores is not None:
+            return daemon_scores
         try:
             return self._score_once(query, documents)
         except Exception as exc:
@@ -127,6 +130,29 @@ class Reranker:
             )
             self._fallback_to_cpu()
             return self._score_once(query, documents)
+
+    def _maybe_rerank_via_daemon(
+        self, query: str, documents: list[str],
+    ) -> list[float] | None:
+        """Route scoring to the shared daemon if daemon mode is on and the
+        daemon's reranker matches this model. Returns scores, or None to
+        signal in-process scoring. Never raises."""
+        try:
+            from docgraph import daemon as _daemon
+            if not _daemon.client_enabled():
+                return None
+            spec_rerank = _daemon.client_rerank_model() or DEFAULT_RERANK_MODEL
+            if spec_rerank != self.model_name:
+                return None
+            if _daemon.ensure_client_daemon() is None:
+                return None
+            scores = _daemon.rerank_via_daemon(query, documents)
+            if scores is None or len(scores) != len(documents):
+                return None
+            self._last_used = time.monotonic()
+            return scores
+        except Exception:
+            return None
 
     def _score_once(self, query: str, documents: list[str]) -> list[float]:
         import torch

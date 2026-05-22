@@ -86,6 +86,65 @@ def test_daemon_is_running_detects(running_daemon):
     assert int(info["port"]) == int(running_daemon["port"])
 
 
+def test_daemon_status_op(running_daemon):
+    info = running_daemon
+    resp = dmn._send_recv(
+        info["host"], int(info["port"]), {"op": "status"}, timeout=3.0
+    )
+    assert resp is not None and resp.get("ok") is True
+    assert resp.get("model") == "BAAI/bge-small-en-v1.5"
+    assert "rerank_model" in resp
+    # Per-model loaded flags present (embedder may already be warm from a
+    # prior embed test sharing the process cache, so don't assert the value).
+    assert "loaded" in resp["embed"]
+    assert "loaded" in resp["rerank"]
+
+
+def test_daemon_rerank_roundtrip(running_daemon):
+    info = running_daemon
+    docs = ["open and read a file", "unrelated banana text"]
+    # Hit the raw op so we can distinguish "wired but model can't load in
+    # this env" (some transformers versions reject the jina reranker's
+    # attn_implementation) from a real plumbing failure. Generous timeout:
+    # the first call triggers a one-time cross-encoder download + load.
+    resp = dmn._send_recv(
+        info["host"], int(info["port"]),
+        {"op": "rerank", "query": "how to read a file", "documents": docs},
+        timeout=300.0,
+    )
+    assert resp is not None, "daemon did not respond to rerank op"
+    if "error" in resp:
+        pytest.skip(f"reranker model unavailable in this env: {resp['error'][:80]}")
+    scores = resp["scores"]
+    assert len(scores) == 2
+    assert all(isinstance(s, float) for s in scores)
+    # The client helper should agree with the raw op.
+    assert dmn.rerank_via_daemon("how to read a file", docs, timeout=60.0) is not None
+
+
+def test_daemon_idle_exit(monkeypatch, tmp_path):
+    """With idle_exit_sec set, the daemon self-exits once idle — and the
+    lock file is cleared so the next caller can respawn it."""
+    port = _free_port()
+    monkeypatch.setattr(dmn, "LOCK_DIR", tmp_path)
+    monkeypatch.setattr(dmn, "LOCK_PATH", tmp_path / "daemon.lock")
+    t = threading.Thread(
+        target=dmn.run_daemon,
+        kwargs={"port": port, "model_name": "BAAI/bge-small-en-v1.5",
+                "gpu": False, "idle_exit_sec": 1.0},
+        daemon=True,
+    )
+    t.start()
+    deadline = time.time() + 30.0
+    while time.time() < deadline and not (tmp_path / "daemon.lock").exists():
+        time.sleep(0.05)
+    assert (tmp_path / "daemon.lock").exists()
+    # Never used + idle_exit_sec=1.0 → should exit within a few seconds.
+    t.join(timeout=10.0)
+    assert not t.is_alive()
+    assert not (tmp_path / "daemon.lock").exists()
+
+
 def test_daemon_clears_stale_lock(monkeypatch, tmp_path):
     """is_running() should clean up a lock file pointing at a dead port."""
     monkeypatch.setattr(dmn, "LOCK_DIR", tmp_path)

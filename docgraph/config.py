@@ -88,6 +88,14 @@ class Config:
     # convention but per-model-class on the docgraph side.
     embed_unload_after: float = 0.0
     rerank_unload_after: float = 0.0
+    # Embedding daemon (opt-in). When True, embed + rerank calls route to a
+    # shared `docgraph daemon` process over loopback (one warm model + one
+    # CUDA context for the whole host, requests queued). The host becomes
+    # GPU-stateless. `daemon_idle_exit_sec` lets the daemon self-exit after
+    # idle to release the CUDA context (respawned lazily on next demand).
+    embed_daemon: bool = False
+    daemon_port: int = 5577
+    daemon_idle_exit_sec: float = 0.0
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
 
@@ -286,6 +294,9 @@ def load_config(
     embed_batch_size: int = 256,
     embed_unload_after: float = 0.0,
     rerank_unload_after: float = 0.0,
+    embed_daemon: bool = False,
+    daemon_port: int = 5577,
+    daemon_idle_exit_sec: float = 0.0,
 ) -> Config:
     """Build a Config from explicit kwargs.
 
@@ -345,5 +356,8 @@ def load_config(
         embed_batch_size=embed_batch_size,
         embed_unload_after=embed_unload_after,
         rerank_unload_after=rerank_unload_after,
+        embed_daemon=embed_daemon,
+        daemon_port=daemon_port,
+        daemon_idle_exit_sec=daemon_idle_exit_sec,
         **({"workers": workers} if workers is not None else {}),
     )

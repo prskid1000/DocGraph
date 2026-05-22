@@ -245,8 +245,19 @@ def load_cache(cfg: Config) -> dict[str, dict]:
         return {}
 
 
+def _atomic_write_text(path: Path, text: str) -> None:
+    """Write `text` to `path` via a temp file + atomic rename, so a process
+    killed mid-write (reaper, crash, power loss) can never leave a truncated
+    file. A torn cache.json would make `load_cache` throw → return {} →
+    force a full reindex of everything. os.replace is atomic on Windows
+    and POSIX."""
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(text, encoding="utf-8")
+    os.replace(tmp, path)
+
+
 def save_cache(cfg: Config, cache: dict[str, dict]) -> None:
-    cfg.cache_path.write_text(json.dumps(cache))
+    _atomic_write_text(cfg.cache_path, json.dumps(cache))
 
 
 # --- Indexer --------------------------------------------------------------
@@ -453,7 +464,7 @@ class Indexer:
 
         log.info("LLM docstrings: augmentation complete (%d processed)", total)
         try:
-            cache_path.write_text(json.dumps(cache), encoding="utf-8")
+            _atomic_write_text(cache_path, json.dumps(cache))
         except Exception:
             pass
 
@@ -1296,7 +1307,7 @@ class Indexer:
 
     def _save_state(self, state: dict) -> None:
         try:
-            self._state_path().write_text(json.dumps(state))
+            _atomic_write_text(self._state_path(), json.dumps(state))
         except Exception:
             pass
 

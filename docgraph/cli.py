@@ -586,6 +586,23 @@ def host(
              "seconds of inactivity. 0 (default) = never unload. "
              "Reloads lazily on the next reranked search.",
     ),
+    embed_daemon: bool = typer.Option(
+        False, "--embed-daemon/--no-embed-daemon",
+        help="Route embed + rerank through a shared `docgraph daemon` "
+             "process (one warm model + one CUDA context for the whole "
+             "host, requests queued). The host stays GPU-stateless. "
+             "Spawned lazily on first use; off by default (in-process).",
+    ),
+    daemon_port: int = typer.Option(
+        5577, "--daemon-port",
+        help="Loopback port for the embedding daemon (with --embed-daemon).",
+    ),
+    daemon_idle_exit_sec: float = typer.Option(
+        0.0, "--daemon-idle-exit-sec",
+        help="With --embed-daemon: once both daemon models are unloaded and "
+             "it has been idle this long, the daemon exits to free the "
+             "~300 MB CUDA context (0 = never). Respawned on next demand.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Run the unified DocGraph host: web UI + JSON API + MCP HTTP, multi-root.
@@ -650,11 +667,32 @@ def host(
     if llm_timeout:                overrides["llm_timeout"] = llm_timeout
     if embed_idle_unload_sec > 0:  overrides["embed_unload_after"]  = embed_idle_unload_sec
     if rerank_idle_unload_sec > 0: overrides["rerank_unload_after"] = rerank_idle_unload_sec
+    overrides["embed_daemon"] = embed_daemon
+    overrides["daemon_port"] = daemon_port
+    overrides["daemon_idle_exit_sec"] = daemon_idle_exit_sec
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
     # Propagate to the workspace so the lifespan can start the unloader.
     workspace.embed_unload_after  = float(embed_idle_unload_sec  or 0.0)
     workspace.rerank_unload_after = float(rerank_idle_unload_sec or 0.0)
+    # Daemon mode: register the client spec so Embedder/Reranker route
+    # through (and lazily spawn) the shared daemon. When the daemon owns the
+    # models, the host's own idle-unload thresholds become moot — the daemon
+    # manages its own lifecycle — so leave the in-process unloader off here.
+    if embed_daemon:
+        from docgraph import daemon as _daemon
+        _daemon.configure_client({
+            "model_name": embed_model or "BAAI/bge-small-en-v1.5",
+            "rerank_model": rerank_model or "",
+            "gpu": bool(gpu or rerank_gpu),
+            "dtype": "auto",
+            "embed_torch_compile": bool(embed_torch_compile),
+            "rerank_torch_compile": bool(rerank_torch_compile),
+            "embed_idle_unload_sec": float(embed_idle_unload_sec or 0.0),
+            "rerank_idle_unload_sec": float(rerank_idle_unload_sec or 0.0),
+            "idle_exit_sec": float(daemon_idle_exit_sec or 0.0),
+            "port": int(daemon_port),
+        })
     # Apply lock-timeout overrides directly on the workspace's LockTimeouts
     # struct (workspace built before this point so it already has defaults
     # via LockTimeouts()).
@@ -1000,11 +1038,43 @@ def daemon_start(
         "BAAI/bge-small-en-v1.5", "--model",
         help="Embedding model name (must match what your repos were indexed with).",
     ),
+    rerank_model: str = typer.Option(
+        "", "--rerank-model",
+        help="Cross-encoder reranker model. Empty = Reranker's default "
+             "(jinaai/jina-reranker-v1-tiny-en). The daemon serves rerank "
+             "scoring alongside embeddings.",
+    ),
+    dtype: str = typer.Option(
+        "auto", "--dtype", help="Embedding dtype: auto | fp16 | bf16 | fp32.",
+    ),
     gpu: bool = typer.Option(
         False, "--gpu",
-        help="Load the embedding model on NVIDIA CUDA via torch. Requires "
+        help="Load the models on NVIDIA CUDA via torch. Requires "
              "a `+cuXY` torch wheel installed. Falls back to CPU silently "
              "if `torch.cuda.is_available()` is False.",
+    ),
+    embed_torch_compile: bool = typer.Option(
+        False, "--embed-torch-compile/--no-embed-torch-compile",
+        help="Apply torch.compile to the embedder (one-time compile cost).",
+    ),
+    rerank_torch_compile: bool = typer.Option(
+        False, "--rerank-torch-compile/--no-rerank-torch-compile",
+        help="Apply torch.compile to the reranker.",
+    ),
+    embed_idle_unload_sec: float = typer.Option(
+        0.0, "--embed-idle-unload-sec",
+        help="Unload the embedder after this many idle seconds (0 = never). "
+             "Reloads lazily on the next embed.",
+    ),
+    rerank_idle_unload_sec: float = typer.Option(
+        0.0, "--rerank-idle-unload-sec",
+        help="Unload the reranker after this many idle seconds (0 = never).",
+    ),
+    idle_exit_sec: float = typer.Option(
+        0.0, "--idle-exit-sec",
+        help="Once BOTH models are unloaded and the daemon has been idle "
+             "this long, exit the process to free the ~300 MB CUDA context "
+             "(0 = never exit). The next embed/rerank caller respawns it.",
     ),
     detach: bool = typer.Option(
         False, "--detach", "-d",
@@ -1012,8 +1082,9 @@ def daemon_start(
     ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
-    """Start the embedding daemon. Other docgraph processes on this host
-    will route their embed calls through it, sharing one warm torch session.
+    """Start the embedding + rerank daemon. Other docgraph processes on this
+    host route their embed/rerank calls through it, sharing one warm torch
+    session (one model, one CUDA context, requests queued).
 
     Foreground (default): blocks. Ctrl+C exits cleanly. Useful for tmux/screen.
     `--detach`: spawns a background process (Windows: DETACHED_PROCESS;
@@ -1032,9 +1103,18 @@ def daemon_start(
         # in the foreground; the parent returns immediately.
         import subprocess
         cmd = [sys.executable, "-m", "docgraph.cli", "daemon", "start",
-               "--port", str(port), "--model", model]
+               "--port", str(port), "--model", model, "--dtype", dtype,
+               "--embed-idle-unload-sec", str(embed_idle_unload_sec),
+               "--rerank-idle-unload-sec", str(rerank_idle_unload_sec),
+               "--idle-exit-sec", str(idle_exit_sec)]
+        if rerank_model:
+            cmd += ["--rerank-model", rerank_model]
         if gpu:
             cmd.append("--gpu")
+        if embed_torch_compile:
+            cmd.append("--embed-torch-compile")
+        if rerank_torch_compile:
+            cmd.append("--rerank-torch-compile")
         if sys.platform.startswith("win"):
             DETACHED = 0x00000008
             CREATE_NEW_GROUP = 0x00000200
@@ -1055,10 +1135,18 @@ def daemon_start(
             console.print("[yellow]Daemon launched but lock not visible yet — check `docgraph daemon status`[/]")
         return
 
-    console.print(f"[cyan]Starting daemon[/] on 127.0.0.1:{port} (model={model}, gpu={gpu})  [dim](Ctrl+C to stop)[/]")
+    console.print(f"[cyan]Starting daemon[/] on 127.0.0.1:{port} (model={model}, rerank={rerank_model or 'default'}, gpu={gpu})  [dim](Ctrl+C to stop)[/]")
     _install_hard_sigint()
     try:
-        rc = run_daemon(port=port, model_name=model, gpu=gpu)
+        rc = run_daemon(
+            port=port, model_name=model, gpu=gpu,
+            rerank_model=rerank_model, dtype=dtype,
+            embed_torch_compile=embed_torch_compile,
+            rerank_torch_compile=rerank_torch_compile,
+            embed_idle_unload_sec=embed_idle_unload_sec,
+            rerank_idle_unload_sec=rerank_idle_unload_sec,
+            idle_exit_sec=idle_exit_sec,
+        )
     except KeyboardInterrupt:
         rc = 0
     raise typer.Exit(rc)

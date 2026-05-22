@@ -232,14 +232,13 @@ class Embedder:
         if batch_size is None:
             batch_size = 64
 
-        if on_progress is None and texts_list:
-            try:
-                from docgraph import daemon as _daemon
-                via = _daemon.embed_via_daemon(texts_list)
-                if via is not None and via.shape[0] == len(texts_list):
-                    return via.astype(np.float32, copy=False)
-            except Exception:
-                pass
+        # Daemon routing: when the host enabled daemon mode, route embeds to
+        # the shared daemon (spawning it lazily). Chunked so `on_progress`
+        # still ticks per batch during indexing. Any failure falls through
+        # to in-process embedding — never fails the call.
+        daemon_vecs = self._maybe_embed_via_daemon(texts_list, batch_size, on_progress)
+        if daemon_vecs is not None:
+            return daemon_vecs
 
         try:
             return self._run_embed(texts_list, batch_size, on_progress)
@@ -256,6 +255,42 @@ class Embedder:
             )
             self._fallback_to_cpu()
             return self._run_embed(texts_list, batch_size, on_progress)
+
+    def _maybe_embed_via_daemon(
+        self,
+        texts_list: list[str],
+        batch_size: int,
+        on_progress: Callable[[int], None] | None,
+    ) -> np.ndarray | None:
+        """Route to the shared daemon if daemon mode is on and this
+        embedder's model matches the daemon's. Returns vectors, or None to
+        signal the caller to embed in-process. Never raises."""
+        if not texts_list:
+            return None
+        try:
+            from docgraph import daemon as _daemon
+            if not _daemon.client_enabled():
+                return None
+            # Only route if the daemon serves the same model — otherwise the
+            # vectors would be from the wrong embedding space.
+            if _daemon.client_model() not in (None, self.model_name):
+                return None
+            if _daemon.ensure_client_daemon() is None:
+                return None
+            out: list[np.ndarray] = []
+            for i in range(0, len(texts_list), batch_size):
+                chunk = texts_list[i:i + batch_size]
+                via = _daemon.embed_via_daemon(chunk)
+                if via is None or via.shape[0] != len(chunk):
+                    return None  # fall back to in-process for the whole call
+                out.append(via.astype(np.float32, copy=False))
+                if on_progress is not None:
+                    for _ in range(len(chunk)):
+                        on_progress(1)
+            self._last_used = time.monotonic()
+            return np.vstack(out) if out else np.zeros((0, self.dim), dtype=np.float32)
+        except Exception:
+            return None
 
     def _run_embed(
         self,

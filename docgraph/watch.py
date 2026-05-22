@@ -28,7 +28,7 @@ from rich.console import Console
 from watchfiles import Change, awatch
 
 from docgraph.config import Config, MAX_FILE_BYTES
-from docgraph.embed import Embedder, resolve_device
+# (embedder is sourced from the workspace pool, not constructed here)
 from docgraph.index import Indexer
 from docgraph.parse import detect_language
 from docgraph.workspace import Workspace, slug_for_root
@@ -147,11 +147,10 @@ def _baseline_reindex(workspace: Workspace, root: Path) -> None:
     slot = workspace.resolve(root)
     writer = workspace.take_writer(root)
     try:
-        embedder = Embedder(
-            slot.cfg.embedding_model,
-            device=resolve_device(slot.cfg.gpu),
-            torch_compile=slot.cfg.embed_torch_compile,
-        )
+        # Use the workspace-pooled embedder (not a fresh standalone one) so
+        # in-process mode shares a single model + idle-unload is single-source,
+        # and so daemon routing (Embedder.embed → daemon) applies uniformly.
+        embedder = workspace.embedder_for(slot.cfg)
         indexer = Indexer(slot.cfg, writer, embedder=embedder)
         indexer.index_all(incremental=True)
     finally:

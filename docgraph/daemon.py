@@ -145,11 +145,153 @@ def embed_via_daemon(texts: list[str], timeout: float = 60.0) -> np.ndarray | No
         return None
 
 
+def rerank_via_daemon(
+    query: str, documents: list[str], timeout: float = 60.0,
+) -> list[float] | None:
+    """Try to score (query, doc) pairs via the daemon's cross-encoder.
+    Returns one float per document, or None if the daemon isn't reachable
+    or lacks a reranker — caller should fall back to in-process."""
+    info = is_running()
+    if not info:
+        return None
+    resp = _send_recv(
+        info.get("host", DEFAULT_HOST),
+        int(info.get("port", DEFAULT_PORT)),
+        {"op": "rerank", "query": query, "documents": list(documents)},
+        timeout=timeout,
+    )
+    if not resp or "scores" not in resp:
+        return None
+    try:
+        return [float(s) for s in resp["scores"]]
+    except Exception:
+        return None
+
+
+def daemon_status(timeout: float = 2.0) -> dict | None:
+    """Return the daemon's rich status (per-model loaded state, models,
+    idle thresholds) via the `status` op, or None if unreachable."""
+    info = _read_lock()
+    if not info:
+        return None
+    return _send_recv(
+        info.get("host", DEFAULT_HOST),
+        int(info.get("port", DEFAULT_PORT)),
+        {"op": "status"},
+        timeout=timeout,
+    )
+
+
+def ensure_daemon(
+    *,
+    model_name: str,
+    rerank_model: str = "",
+    gpu: bool = False,
+    dtype: str = "auto",
+    embed_torch_compile: bool = False,
+    rerank_torch_compile: bool = False,
+    embed_idle_unload_sec: float = 0.0,
+    rerank_idle_unload_sec: float = 0.0,
+    idle_exit_sec: float = 0.0,
+    port: int = DEFAULT_PORT,
+    wait_sec: float = 30.0,
+) -> dict | None:
+    """Return the running daemon's lock info, spawning one (detached) with
+    this config if none is up. Used for lazy respawn: when the daemon
+    self-exits on idle to free the CUDA context, the next embed/rerank
+    caller brings it back. Returns None if spawn fails (caller falls back
+    to in-process). Never raises."""
+    if _IN_DAEMON:
+        return None  # never route/spawn from within the daemon itself
+    info = is_running()
+    if info:
+        return info
+    try:
+        cmd = [
+            sys.executable, "-m", "docgraph.cli", "daemon", "start", "--detach",
+            "--port", str(port), "--model", model_name, "--dtype", dtype,
+            "--embed-idle-unload-sec", str(embed_idle_unload_sec),
+            "--rerank-idle-unload-sec", str(rerank_idle_unload_sec),
+            "--idle-exit-sec", str(idle_exit_sec),
+        ]
+        if rerank_model:
+            cmd += ["--rerank-model", rerank_model]
+        if gpu:
+            cmd.append("--gpu")
+        if embed_torch_compile:
+            cmd.append("--embed-torch-compile")
+        if rerank_torch_compile:
+            cmd.append("--rerank-torch-compile")
+        import subprocess
+        if sys.platform.startswith("win"):
+            DETACHED = 0x00000008
+            CREATE_NEW_GROUP = 0x00000200
+            subprocess.Popen(cmd, creationflags=DETACHED | CREATE_NEW_GROUP, close_fds=True)
+        else:
+            subprocess.Popen(cmd, start_new_session=True, close_fds=True)
+    except Exception as exc:
+        log.warning("ensure_daemon: spawn failed: %s", exc)
+        return None
+    deadline = time.time() + wait_sec
+    while time.time() < deadline:
+        info = is_running()
+        if info:
+            return info
+        time.sleep(0.2)
+    log.warning("ensure_daemon: daemon did not come up within %.0fs", wait_sec)
+    return None
+
+
+# ----- Client routing config --------------------------------------------
+
+# Set True inside `run_daemon` so the embed/rerank client paths in
+# embed.py / rerank.py never try to route a call back into this very
+# process (which would recurse / deadlock).
+_IN_DAEMON = False
+
+# Full daemon spec registered by the host at startup when `--embed-daemon`
+# is on. None = daemon-client mode disabled (in-process embedding). Holds
+# everything `ensure_daemon` needs so whichever caller (embed or rerank)
+# first needs a model spawns a fully-configured daemon.
+_CLIENT_SPEC: dict | None = None
+
+
+def configure_client(spec: dict | None) -> None:
+    """Register (or clear) the daemon client spec. Called once by the host."""
+    global _CLIENT_SPEC
+    _CLIENT_SPEC = spec
+
+
+def client_enabled() -> bool:
+    """True when this process should route embed/rerank to a daemon."""
+    return _CLIENT_SPEC is not None and not _IN_DAEMON
+
+
+def ensure_client_daemon() -> dict | None:
+    """Ensure the configured daemon is up (spawning lazily). Returns lock
+    info or None. No-op when client mode is disabled."""
+    if not client_enabled():
+        return None
+    return ensure_daemon(**_CLIENT_SPEC)
+
+
+def client_model() -> str | None:
+    return (_CLIENT_SPEC or {}).get("model_name")
+
+
+def client_rerank_model() -> str | None:
+    return (_CLIENT_SPEC or {}).get("rerank_model")
+
+
 # ----- Server side -------------------------------------------------------
 
 
 def _serve_one(conn: socket.socket, ctx: dict) -> bool:
-    """Handle one request on `conn`. Returns False if the daemon should exit."""
+    """Handle one request on `conn`. Returns False if the daemon should exit.
+
+    All model inference (embed + rerank) runs under `ctx["lock"]` so
+    concurrent clients — e.g. a watcher reindex and an interactive search —
+    queue through the one warm session instead of racing on the GPU."""
     try:
         header = _recv_exact(conn, 4)
         if not header:
@@ -167,26 +309,61 @@ def _serve_one(conn: socket.socket, ctx: dict) -> bool:
     if op == "ping":
         _send(conn, {"ok": True, "model": ctx["model"], "dim": ctx["dim"]})
         return True
+    if op == "status":
+        embedder = ctx["embedder"]
+        reranker = ctx["reranker"]
+        _send(conn, {
+            "ok": True,
+            "model": ctx["model"],
+            "rerank_model": ctx["rerank_model"],
+            "dim": ctx["dim"],
+            "gpu": ctx["gpu"],
+            "embed": {
+                "loaded": embedder.is_loaded(),
+                "idle_unload_sec": ctx["embed_idle_unload_sec"],
+            },
+            "rerank": {
+                "loaded": reranker.is_loaded(),
+                "idle_unload_sec": ctx["rerank_idle_unload_sec"],
+            },
+            "idle_exit_sec": ctx["idle_exit_sec"],
+        })
+        return True
     if op == "shutdown":
         _send(conn, {"ok": True})
         return False
     if op == "embed":
         texts = req.get("texts") or []
         try:
-            # Bypass Embedder.embed() — that wrapper's daemon-detection
-            # path would route this call right back to us. Hit the
-            # underlying SentenceTransformer directly.
-            model = ctx["embedder"]._ensure()
+            ctx["last_embed"] = time.monotonic()
             import torch
-            batch = 64
-            with torch.no_grad():
-                arr = model.encode(
-                    list(texts), batch_size=batch,
-                    convert_to_numpy=True, normalize_embeddings=True,
-                    show_progress_bar=False,
-                )
+            with ctx["lock"]:
+                # Bypass Embedder.embed() — that wrapper's daemon-detection
+                # path would route this call right back to us. Hit the
+                # underlying SentenceTransformer directly.
+                model = ctx["embedder"]._ensure()
+                with torch.no_grad():
+                    arr = model.encode(
+                        list(texts), batch_size=64,
+                        convert_to_numpy=True, normalize_embeddings=True,
+                        show_progress_bar=False,
+                    )
             vecs = [list(map(float, v)) for v in arr]
             payload: dict[str, Any] = {"embeddings": vecs}
+        except Exception as e:
+            payload = {"error": str(e)}
+        _send(conn, payload)
+        return True
+    if op == "rerank":
+        query = req.get("query") or ""
+        documents = req.get("documents") or []
+        try:
+            ctx["last_rerank"] = time.monotonic()
+            with ctx["lock"]:
+                # Reranker.score() owns its own _ensure + CPU-fallback
+                # recovery; the lock just serializes GPU work across ops.
+                scores = ctx["reranker"].score(query, list(documents))
+            payload = {"scores": [float(s) for s in scores]}
         except Exception as e:
             payload = {"error": str(e)}
         _send(conn, payload)
@@ -208,16 +385,44 @@ def run_daemon(
     port: int = DEFAULT_PORT,
     model_name: str = "BAAI/bge-small-en-v1.5",
     gpu: bool = False,
+    rerank_model: str = "",
+    dtype: str = "auto",
+    embed_torch_compile: bool = False,
+    rerank_torch_compile: bool = False,
+    embed_idle_unload_sec: float = 0.0,
+    rerank_idle_unload_sec: float = 0.0,
+    idle_exit_sec: float = 0.0,
 ) -> int:
     """Start the daemon in the calling process. Blocks until shutdown.
-    Returns 0 on clean exit, non-zero on bind failure."""
-    from docgraph.embed import Embedder, resolve_device
+    Returns 0 on clean exit (incl. idle-exit), non-zero on bind failure.
 
+    Owns one embedder + one reranker for the whole host. Both load
+    **lazily** on first request — a freshly (re)spawned daemon does no GPU
+    work until something actually needs it, which is what makes idle-exit
+    loop-safe. Two-stage idle (when the thresholds are set):
+      1. `*_idle_unload_sec`  → unload that model's weights (frees VRAM),
+                                reload lazily on the next request.
+      2. `idle_exit_sec`      → once both models are unloaded and the daemon
+                                has been idle this long, exit the process to
+                                release the ~300 MB CUDA context. The next
+                                embed/rerank caller respawns it via
+                                `ensure_daemon`.
+    """
+    global _IN_DAEMON
+    _IN_DAEMON = True
+    from docgraph.embed import Embedder, resolve_device, dim_for_model
+    from docgraph.rerank import Reranker, DEFAULT_RERANK_MODEL
+
+    device = resolve_device(gpu)
     embedder = Embedder(
-        model_name=model_name,
-        device=resolve_device(gpu),
+        model_name=model_name, device=device, dtype=dtype,
+        torch_compile=embed_torch_compile,
     )
-    embedder._ensure()  # warm up before we accept clients
+    reranker = Reranker(
+        model_name=rerank_model or None, device=device, dtype=dtype,
+        torch_compile=rerank_torch_compile,
+    )
+    # Lazy: do NOT warm up here — load on first request.
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -229,17 +434,56 @@ def run_daemon(
     srv.listen(8)
     srv.settimeout(0.5)  # so the accept loop can poll the shutdown flag
 
+    resolved_rerank = rerank_model or DEFAULT_RERANK_MODEL
     _write_lock({
         "host": host,
         "port": port,
         "pid": os.getpid(),
         "model": model_name,
+        "rerank_model": resolved_rerank,
         "gpu": bool(gpu),
         "started": time.time(),
     })
 
-    ctx = {"embedder": embedder, "model": model_name, "dim": embedder.dim}
+    now0 = time.monotonic()
+    ctx: dict[str, Any] = {
+        "embedder": embedder,
+        "reranker": reranker,
+        "model": model_name,
+        "rerank_model": resolved_rerank,
+        "dim": dim_for_model(model_name),
+        "gpu": bool(gpu),
+        "lock": threading.Lock(),   # serializes all inference (the queue)
+        "embed_idle_unload_sec": embed_idle_unload_sec,
+        "rerank_idle_unload_sec": rerank_idle_unload_sec,
+        "idle_exit_sec": idle_exit_sec,
+        "last_embed": now0,
+        "last_rerank": now0,
+    }
     shutdown = threading.Event()
+
+    def idle_monitor() -> None:
+        """Two-stage idle: unload weights, then exit to free the context."""
+        while not shutdown.wait(2.0):
+            now = time.monotonic()
+            if (embed_idle_unload_sec > 0 and embedder.is_loaded()
+                    and now - ctx["last_embed"] >= embed_idle_unload_sec):
+                embedder.unload()
+            if (rerank_idle_unload_sec > 0 and reranker.is_loaded()
+                    and now - ctx["last_rerank"] >= rerank_idle_unload_sec):
+                reranker.unload()
+            if (idle_exit_sec > 0
+                    and not embedder.is_loaded() and not reranker.is_loaded()):
+                idle_for = now - max(ctx["last_embed"], ctx["last_rerank"])
+                if idle_for >= idle_exit_sec:
+                    log.info(
+                        "docgraph daemon: idle %.0fs with models unloaded — "
+                        "exiting to free CUDA context", idle_for,
+                    )
+                    shutdown.set()
+
+    monitor = threading.Thread(target=idle_monitor, daemon=True)
+    monitor.start()
 
     def serve(conn: socket.socket) -> None:
         try:
@@ -252,7 +496,10 @@ def run_daemon(
             except Exception:
                 pass
 
-    log.info(f"docgraph daemon listening on {host}:{port} (model={model_name}, gpu={gpu})")
+    log.info(
+        "docgraph daemon listening on %s:%s (model=%s, rerank=%s, gpu=%s)",
+        host, port, model_name, resolved_rerank, gpu,
+    )
     try:
         while not shutdown.is_set():
             try:

@@ -23,7 +23,10 @@ def _help_text(*args: str) -> str:
     proc = subprocess.run(
         [DOCGRAPH, *args, "--help"],
         capture_output=True, text=True, timeout=20,
-        env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1"},
+        # Wide terminal so rich doesn't wrap long option names like
+        # --embed-idle-unload-sec across lines (which would break substring
+        # matching below).
+        env={**os.environ, "FORCE_COLOR": "0", "NO_COLOR": "1", "COLUMNS": "240"},
     )
     return proc.stdout + proc.stderr
 
@@ -58,9 +61,39 @@ def host_help() -> str:
     return _help_text("host")
 
 
-@pytest.mark.parametrize("flag", ["--root", "--watch", "--host", "--port", "--gpu", "--embed-batch-size", "--llm-model"])
+@pytest.mark.parametrize("flag", [
+    "--root", "--watch", "--host", "--port", "--gpu", "--embed-batch-size",
+    "--llm-model", "--embed-idle-unload-sec", "--rerank-idle-unload-sec",
+    "--embed-daemon", "--daemon-port", "--daemon-idle-exit-sec",
+])
 def test_host_accepts_telecode_flag(host_help: str, flag: str) -> None:
     assert flag in host_help, f"docgraph host missing {flag}"
+
+
+@pytest.mark.parametrize("flag", [
+    "--model", "--rerank-model", "--gpu", "--embed-idle-unload-sec",
+    "--rerank-idle-unload-sec", "--idle-exit-sec", "--detach",
+])
+def test_daemon_start_accepts_flag(flag: str) -> None:
+    """The daemon-client `ensure_daemon` spawns `docgraph daemon start` with
+    these flags — lock the contract so they can't silently drift."""
+    help_text = _help_text("daemon", "start")
+    assert flag in help_text, f"docgraph daemon start missing {flag}"
+
+
+@pytest.mark.parametrize("kwarg,attr,expected", [
+    ("embed_daemon", "embed_daemon", True),
+    ("daemon_port", "daemon_port", 5599),
+    ("daemon_idle_exit_sec", "daemon_idle_exit_sec", 120.0),
+])
+def test_daemon_kwargs_propagate(tmp_path: Path, kwarg, attr, expected) -> None:
+    from docgraph.config import load_config
+    cfg = load_config(tmp_path, **{kwarg: expected})
+    actual = getattr(cfg, attr)
+    if isinstance(expected, bool):
+        assert bool(actual) is expected
+    else:
+        assert actual == expected
 
 
 def test_embed_batch_size_auto_tuning(monkeypatch):
