@@ -1118,7 +1118,8 @@ def daemon_start(
         if sys.platform.startswith("win"):
             DETACHED = 0x00000008
             CREATE_NEW_GROUP = 0x00000200
-            subprocess.Popen(cmd, creationflags=DETACHED | CREATE_NEW_GROUP, close_fds=True)
+            CREATE_NO_WINDOW = 0x08000000
+            subprocess.Popen(cmd, creationflags=DETACHED | CREATE_NEW_GROUP | CREATE_NO_WINDOW, close_fds=True)
         else:
             subprocess.Popen(cmd, start_new_session=True, close_fds=True)
         # Wait briefly for the lock file to appear so users see status
