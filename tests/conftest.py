@@ -208,3 +208,36 @@ def indexed(repo_dir: Path):
 def retriever(indexed) -> Retriever:
     _cfg, db, embedder, _stats = indexed
     return Retriever(db, embedder)
+
+
+# --- Framework / resolution fixture (schema v3 features) -------------------
+
+@pytest.fixture(scope="session")
+def fw_repo(tmp_path_factory: pytest.TempPathFactory) -> Path:
+    from tests.fw_fixture import materialize
+    root = tmp_path_factory.mktemp("docgraph_fw")
+    materialize(root)
+    return root
+
+
+@pytest.fixture(scope="session")
+def fw_indexed(fw_repo: Path):
+    """Full index of the framework fixture, with a synthetic SCIP index
+    ingested. Yields (cfg, read-only db, retriever-with-cfg, stats)."""
+    import gc
+    from tests.fw_fixture import write_scip
+
+    scip_path = write_scip(fw_repo)
+    cfg = load_config(fw_repo, scip_index=str(scip_path))
+    writer = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
+    writer.init_schema()
+    embedder = Embedder(cfg.embedding_model)
+    indexer = Indexer(cfg, writer, embedder=embedder)
+    stats = indexer.index_all(incremental=False)
+    assert stats["errors"] == 0, stats
+    indexer.db.close()
+    writer.close()
+    del writer, indexer
+    gc.collect()
+    reader = GraphDB(cfg.db_path, read_only=True)
+    yield cfg, reader, Retriever(reader, embedder, cfg=cfg), stats

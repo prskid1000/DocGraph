@@ -22,6 +22,9 @@ EXPECTED_TOOLS = {
     "git_changes", "git_blame", "git_recent",
     "rules_for",
     "list_roots",
+    # analysis tools (schema v3)
+    "context", "detect_changes", "repo_map", "list_clusters", "cluster",
+    "route_map", "api_impact", "trace", "health", "symbol_history", "rename",
 }
 
 
@@ -67,8 +70,8 @@ def test_all_tools_registered(mcp):
 
 def test_tool_count(mcp):
     tools = _run(mcp.list_tools())
-    # 14 retriever-backed tools + list_roots
-    assert len(tools) == 15
+    # 14 retriever-backed tools + list_roots + 11 analysis tools
+    assert len(tools) == 26
 
 
 def test_list_roots_tool(mcp):
