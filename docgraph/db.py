@@ -297,7 +297,20 @@ class GraphDB:
         return props
 
     def has_table(self, table: str) -> bool:
-        return bool(self.table_props(table))
+        if self.table_props(table):
+            return True
+        # Rel tables without properties report no columns in table_info.
+        return table in self.table_names()
+
+    def table_names(self) -> set[str]:
+        names = self._props_cache.get("#tables")
+        if names is None:
+            try:
+                names = {str(r.get("name")) for r in self.fetch_all("CALL show_tables() RETURN *")}
+            except Exception:
+                names = set()
+            self._props_cache["#tables"] = names
+        return names
 
     # ---- index-time helpers for the newer tables -------------------------
 
@@ -537,6 +550,288 @@ class GraphDB:
             f"RETURN node.id AS id, score AS s ORDER BY s DESC LIMIT {int(k)}", {"q": query})
         return [(int(r["id"]), float(r["s"])) for r in rows]
 
+    # ---- columnar reads / bulk updates for the graph analytics ------------
+    # Everything below returns numpy arrays through Arrow, so a 1M-edge graph
+    # never becomes a million Python dicts.
+
+    SYMBOL_LABELS = ("File", "Class", "Function", "Variable")
+
+    def _np(self, cypher: str, params: dict | None = None) -> dict[str, "np.ndarray"]:
+        import numpy as np
+        t = self.fetch_arrow(cypher, params)
+        out: dict[str, np.ndarray] = {}
+        for name in t.column_names:
+            col = t.column(name)
+            try:
+                out[name] = col.to_numpy()
+            except Exception:
+                out[name] = np.asarray(col.to_pylist(), dtype=object)
+        return out
+
+    def edge_endpoints(self, rels, with_conf: bool = False, from_label: str | None = None,
+                       to_label: str | None = None):
+        """(src_ids, dst_ids, conf|None, rel_index) over the given rel tables."""
+        import numpy as np
+        srcs, dsts, confs, kinds = [], [], [], []
+        fl = f":{from_label}" if from_label else ""
+        tl = f":{to_label}" if to_label else ""
+        for k, rel in enumerate(rels):
+            if not self.has_table(rel):
+                continue
+            conf = "coalesce(r.confidence, 1.0)" if (with_conf and "confidence" in self.table_props(rel)) else "1.0"
+            try:
+                d = self._np(f"MATCH (a{fl})-[r:{rel}]->(b{tl}) RETURN a.id AS a, b.id AS b, "
+                             f"CAST({conf} AS DOUBLE) AS c")
+            except Exception:
+                continue
+            if "a" not in d or len(d["a"]) == 0:
+                continue
+            srcs.append(d["a"].astype(np.int64))
+            dsts.append(d["b"].astype(np.int64))
+            confs.append(d["c"].astype(np.float32))
+            kinds.append(np.full(len(d["a"]), k, dtype=np.int16))
+        if not srcs:
+            e = np.zeros(0, np.int64)
+            return e, e, (np.zeros(0, np.float32) if with_conf else None), np.zeros(0, np.int16)
+        return (np.concatenate(srcs), np.concatenate(dsts),
+                np.concatenate(confs) if with_conf else None, np.concatenate(kinds))
+
+    def node_columns(self, label: str, cols: dict[str, str], where: str = "",
+                     params: dict | None = None) -> dict[str, "np.ndarray"]:
+        """{alias: array} for `RETURN <expr> AS <alias>` over one label."""
+        ret = ", ".join(f"{expr} AS {alias}" for alias, expr in cols.items())
+        w = f" WHERE {where}" if where else ""
+        return self._np(f"MATCH (n:{label}){w} RETURN {ret}", params)
+
+    def embedding_matrix(self, label: str):
+        """(ids int64, float32 matrix) of every row that has an embedding."""
+        import numpy as np
+        t = self.fetch_arrow(f"MATCH (n:{label}) WHERE n.embedding IS NOT NULL "
+                             f"RETURN n.id AS id, n.embedding AS e")
+        ids = t.column("id").to_numpy().astype(np.int64)
+        if len(ids) == 0:
+            return ids, np.zeros((0, self.embedding_dim), np.float32)
+        col = t.column("e").combine_chunks()
+        mat = np.asarray(col.values.to_numpy(zero_copy_only=False), dtype=np.float32)
+        return ids, mat.reshape(len(ids), -1)
+
+    def embeddings_for(self, label: str, ids: list[int]):
+        """(ids, matrix) for specific rows."""
+        import numpy as np
+        if not ids:
+            return np.zeros(0, np.int64), np.zeros((0, self.embedding_dim), np.float32)
+        t = self.fetch_arrow(f"MATCH (n:{label}) WHERE n.id IN $ids AND n.embedding IS NOT NULL "
+                             f"RETURN n.id AS id, n.embedding AS e", {"ids": [int(i) for i in ids]})
+        got = t.column("id").to_numpy().astype(np.int64)
+        if len(got) == 0:
+            return got, np.zeros((0, self.embedding_dim), np.float32)
+        col = t.column("e").combine_chunks()
+        mat = np.asarray(col.values.to_numpy(zero_copy_only=False), dtype=np.float32)
+        return got, mat.reshape(len(got), -1)
+
+    def set_node_values(self, label: str, ids, cols: dict[str, "np.ndarray"],
+                        batch: int = 50_000) -> int:
+        """Bulk `SET n.<col> = value` by primary key, batched UNWINDs."""
+        import numpy as np
+        ids = np.asarray(ids, dtype=np.int64)
+        if len(ids) == 0:
+            return 0
+        names = list(cols)
+        sets = ", ".join(f"n.{c} = row.{c}" for c in names)
+        q = f"UNWIND $rows AS row MATCH (n:{label} {{id: row.id}}) SET {sets}"
+        vals = {c: np.asarray(v) for c, v in cols.items()}
+        for s in range(0, len(ids), batch):
+            sl = slice(s, s + batch)
+            cols_py = {c: vals[c][sl].tolist() for c in names}
+            rows = [{"id": int(i), **{c: cols_py[c][j] for c in names}}
+                    for j, i in enumerate(ids[sl].tolist())]
+            self.execute(q, {"rows": rows})
+        return len(ids)
+
+    def memberships(self):
+        """(node_ids, community_ids) of every MEMBER_OF edge."""
+        import numpy as np
+        if not self.has_table("Community"):
+            e = np.zeros(0, np.int64)
+            return e, e
+        try:
+            d = self._np("MATCH (n)-[:MEMBER_OF]->(c:Community) RETURN n.id AS n, c.id AS c")
+        except Exception:
+            e = np.zeros(0, np.int64)
+            return e, e
+        if "n" not in d:
+            e = np.zeros(0, np.int64)
+            return e, e
+        return d["n"].astype(np.int64), d["c"].astype(np.int64)
+
+    def community_rows(self) -> list[dict]:
+        if not self.has_table("Community"):
+            return []
+        cols = "c.id AS id, c.name AS name, c.size AS size"
+        if "x" in self.table_props("Community"):
+            cols += ", c.x AS x, c.y AS y, c.r AS r"
+        return self.fetch_all(f"MATCH (c:Community) RETURN {cols}")
+
+    def positions_in_files(self, files: list[str]) -> tuple[dict, dict]:
+        """Pre-delete harvest of layout positions: ({qname: (x, y, pagerank)},
+        {path: (x, y)}) for the nodes of `files`."""
+        by_q: dict[str, tuple] = {}
+        by_p: dict[str, tuple] = {}
+        if not files or "x" not in self.table_props("File"):
+            return by_q, by_p
+        for r in self.fetch_all("MATCH (f:File) WHERE f.path IN $f AND f.x IS NOT NULL "
+                                "RETURN f.path AS p, f.x AS x, f.y AS y", {"f": files}):
+            by_p[r["p"]] = (float(r["x"]), float(r["y"]))
+        for label in ("Function", "Class"):
+            for r in self.fetch_all(
+                    f"MATCH (n:{label}) WHERE n.file IN $f AND n.x IS NOT NULL "
+                    f"RETURN n.qname AS q, n.x AS x, n.y AS y, coalesce(n.pagerank, 0.0) AS pr",
+                    {"f": files}):
+                by_q[r["q"]] = (float(r["x"]), float(r["y"]), float(r["pr"] or 0.0))
+        for r in self.fetch_all(
+                "MATCH (n:Variable) WHERE n.file IN $f AND n.x IS NOT NULL "
+                "RETURN n.qname AS q, n.x AS x, n.y AS y", {"f": files}):
+            by_q[r["q"]] = (float(r["x"]), float(r["y"]), 0.0)
+        return by_q, by_p
+
+    def layout_source(self):
+        """Arrays for layout / tiles: every File/Class/Function/Variable with
+        kind, file path, line, pagerank, position, name, test flag."""
+        import numpy as np
+        parts = []
+        kind_of = {"File": 0, "Class": 1, "Function": 2, "Variable": 3}
+        for label in self.SYMBOL_LABELS:
+            has_xy = "x" in self.table_props(label)
+            xy = "n.x AS x, n.y AS y" if has_xy else "CAST(NULL AS DOUBLE) AS x, CAST(NULL AS DOUBLE) AS y"
+            if label == "File":
+                cols = (f"n.id AS id, n.path AS file, n.path AS name, 0 AS line, "
+                        f"coalesce(n.pagerank, 0.0) AS pr, false AS t, {xy}")
+            elif label == "Variable":
+                cols = (f"n.id AS id, n.file AS file, n.name AS name, coalesce(n.line, 0) AS line, "
+                        f"0.0 AS pr, false AS t, {xy}")
+            else:
+                t = "coalesce(n.is_test, false)" if label == "Function" else "false"
+                cols = (f"n.id AS id, n.file AS file, n.name AS name, coalesce(n.line_start, 0) AS line, "
+                        f"coalesce(n.pagerank, 0.0) AS pr, {t} AS t, {xy}")
+            tb = self.fetch_arrow(f"MATCH (n:{label}) RETURN {cols}")
+            if tb.num_rows == 0:
+                continue
+            parts.append((kind_of[label], tb))
+        if not parts:
+            e = np.zeros(0)
+            return {"ids": e.astype(np.int64), "kinds": e.astype(np.uint8), "files": [],
+                    "names": [], "line": e, "pr": e, "test": e.astype(bool), "x": e, "y": e}
+        ids = np.concatenate([p[1].column("id").to_numpy().astype(np.int64) for p in parts])
+        kinds = np.concatenate([np.full(p[1].num_rows, p[0], np.uint8) for p in parts])
+        files: list[str] = []
+        names: list[str] = []
+        for _k, tb in parts:
+            files.extend(str(v or "") for v in tb.column("file").to_pylist())
+            names.extend(str(v or "") for v in tb.column("name").to_pylist())
+
+        def num(col: str, dtype) -> np.ndarray:
+            out = []
+            for _k, tb in parts:
+                c = tb.column(col).combine_chunks()
+                if c.null_count:
+                    c = c.fill_null(float("nan")) if str(c.type) != "bool" else c.fill_null(False)
+                out.append(np.asarray(c.to_numpy(zero_copy_only=False), dtype=np.float64))
+            return np.concatenate(out).astype(dtype)
+        return {"ids": ids, "kinds": kinds, "files": files, "names": names,
+                "line": num("line", np.float64), "pr": num("pr", np.float64),
+                "test": num("t", np.float64) > 0, "x": num("x", np.float64), "y": num("y", np.float64)}
+
+    # ---- small targeted helpers for the incremental analytics path ------
+
+    def count_symbols(self, files: list[str] | None = None) -> int:
+        """File + Class + Function + Variable nodes (optionally in `files`)."""
+        total = 0
+        for label in self.SYMBOL_LABELS:
+            prop = "path" if label == "File" else "file"
+            where = f" WHERE n.{prop} IN $f" if files is not None else ""
+            try:
+                r = self.fetch_all(f"MATCH (n:{label}){where} RETURN count(n) AS c",
+                                   {"f": files} if files is not None else None)
+                total += int(r[0]["c"]) if r else 0
+            except Exception:
+                pass
+        return total
+
+    def missing_positions(self) -> int:
+        """Files without a layout position (0 when the column is missing
+        counts as 'all missing')."""
+        if "x" not in self.table_props("File"):
+            return 1 << 30
+        r = self.fetch_all("MATCH (f:File) WHERE f.x IS NULL RETURN count(f) AS c")
+        return int(r[0]["c"]) if r else 0
+
+    def file_communities(self, paths: list[str]) -> dict[str, int]:
+        if not paths or not self.has_table("Community"):
+            return {}
+        rows = self.fetch_all("MATCH (f:File)-[:MEMBER_OF]->(c:Community) WHERE f.path IN $p "
+                              "RETURN f.path AS p, c.id AS c", {"p": paths})
+        return {r["p"]: int(r["c"]) for r in rows}
+
+    def nodes_in_files(self, files: list[str]) -> list[tuple[str, int, str]]:
+        out: list[tuple[str, int, str]] = []
+        if not files:
+            return out
+        for label in self.SYMBOL_LABELS:
+            prop = "path" if label == "File" else "file"
+            for r in self.fetch_all(f"MATCH (n:{label}) WHERE n.{prop} IN $f "
+                                    f"RETURN n.id AS id, n.{prop} AS f", {"f": files}):
+                out.append((label, int(r["id"]), r["f"]))
+        return out
+
+    _NEIGHBOR_RELS = "CALLS|CONTAINS|IMPORTS|IMPORTS_SYMBOL|INHERITS|INSTANTIATES"
+
+    def neighbor_communities(self, ids: list[int]) -> list[tuple[int, int]]:
+        if not ids or not self.has_table("Community"):
+            return []
+        rows = self.fetch_all(
+            f"MATCH (a)-[:{self._NEIGHBOR_RELS}]-(b)-[:MEMBER_OF]->(c:Community) "
+            f"WHERE a.id IN $ids RETURN a.id AS a, c.id AS c", {"ids": [int(i) for i in ids]})
+        return [(int(r["a"]), int(r["c"])) for r in rows]
+
+    def neighbor_center(self, ids: list[int]) -> tuple[float, float] | None:
+        """Mean position of already-placed neighbours of `ids` outside them."""
+        if not ids:
+            return None
+        rows = self.fetch_all(
+            f"MATCH (a)-[:{self._NEIGHBOR_RELS}]-(b) WHERE a.id IN $ids AND NOT b.id IN $ids "
+            f"AND b.x IS NOT NULL RETURN avg(b.x) AS x, avg(b.y) AS y, count(b) AS n",
+            {"ids": [int(i) for i in ids]})
+        if rows and rows[0].get("n") and rows[0].get("x") is not None:
+            return float(rows[0]["x"]), float(rows[0]["y"])
+        return None
+
+    def community_center_of(self, file_id: int) -> tuple[float, float] | None:
+        if not self.has_table("Community") or "x" not in self.table_props("Community"):
+            return None
+        rows = self.fetch_all("MATCH (f:File)-[:MEMBER_OF]->(c:Community) WHERE f.id = $id "
+                              "AND c.x IS NOT NULL RETURN c.x AS x, c.y AS y", {"id": int(file_id)})
+        return (float(rows[0]["x"]), float(rows[0]["y"])) if rows else None
+
+    def layout_extent(self) -> float:
+        if "x" not in self.table_props("File"):
+            return 0.0
+        rows = self.fetch_all("MATCH (f:File) WHERE f.x IS NOT NULL "
+                              "RETURN max(abs(f.x)) AS a, max(abs(f.y)) AS b")
+        if not rows or rows[0].get("a") is None:
+            return 0.0
+        return float(max(rows[0]["a"], rows[0]["b"]))
+
+    def file_layout_rows(self, path: str) -> dict | None:
+        r = self.fetch_all("MATCH (f:File) WHERE f.path = $p RETURN f.id AS id", {"p": path})
+        if not r:
+            return None
+        syms: list[tuple[str, int, int]] = []
+        for label, line in (("Class", "line_start"), ("Function", "line_start"), ("Variable", "line")):
+            for row in self.fetch_all(f"MATCH (n:{label}) WHERE n.file = $p "
+                                      f"RETURN n.id AS id, coalesce(n.{line}, 0) AS l", {"p": path}):
+                syms.append((label, int(row["id"]), int(row["l"] or 0)))
+        return {"file_id": int(r[0]["id"]), "symbols": syms}
+
     def fetch_arrow(self, cypher: str, params: dict | None = None, chunk: int = 1_000_000):
         """Query result as one pyarrow Table (columnar; embeddings come back
         as a fixed-size-list column that converts to numpy without Python
@@ -615,12 +910,32 @@ class GraphDB:
         Cached on the instance; mutated by `insert_nodes` after first load."""
         ids = self._known_ids.get(table)
         if ids is None:
-            ids = set()
-            for r in self.fetch_all(f"MATCH (n:{table}) RETURN n.id AS id"):
-                ids.add(r["id"])
+            try:
+                col = self.fetch_arrow(f"MATCH (n:{table}) RETURN n.id AS id").column("id")
+                ids = set(col.to_numpy().tolist())
+            except Exception:
+                ids = {r["id"] for r in self.fetch_all(f"MATCH (n:{table}) RETURN n.id AS id")}
             self._known_ids[table] = ids
         return ids
 
+    # Up to this many distinct endpoint ids, existence is checked with a
+    # targeted `id IN $ids` query instead of loading the table's whole id
+    # set -- keeps small incremental inserts O(changed).
+    TARGETED_ID_CHECK = 20_000
+
+    def _existing_ids(self, table: str, want: set[int]) -> set[int]:
+        cached = self._known_ids.get(table)
+        if cached is not None:
+            return cached
+        if len(want) > self.TARGETED_ID_CHECK:
+            return self._ensure_known_ids(table)
+        found: set[int] = set()
+        lst = list(want)
+        for s in range(0, len(lst), 5000):
+            for r in self.fetch_all(f"MATCH (n:{table}) WHERE n.id IN $ids RETURN n.id AS id",
+                                    {"ids": lst[s:s + 5000]}):
+                found.add(r["id"])
+        return found
     def insert_edges(
         self,
         edge: str,
@@ -656,8 +971,8 @@ class GraphDB:
         if not rows:
             return 0
 
-        from_ids = self._ensure_known_ids(from_table)
-        to_ids = self._ensure_known_ids(to_table)
+        from_ids = self._existing_ids(from_table, {r["from_id"] for r in rows})
+        to_ids = self._existing_ids(to_table, {r["to_id"] for r in rows})
         valid = [
             r for r in rows
             if r["from_id"] in from_ids and r["to_id"] in to_ids

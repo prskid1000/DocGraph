@@ -867,6 +867,9 @@ class Indexer:
             if ents:
                 old_entities[rel] = [(e.get("qname", ""), e.get("name", ""), e.get("kind", ""))
                                      for e in ents]
+        # Layout / rank / community harvest (stable keys) for the incremental
+        # analytics patch -- read before the nodes disappear.
+        harvest = self._harvest_layout(affected + deleted_rels) if incremental else {}
         self._delete_files_from_db(affected + deleted_rels)
         for rel in deleted_rels:
             cache.pop(rel, None)
@@ -1506,13 +1509,17 @@ class Indexer:
                 full=full_recompute,
                 state=state,
             )
-            if getattr(self.cfg, "communities", True):
-                _ck()
-                _emit("communities")
-                try:
-                    n_communities = self._recompute_communities()
-                except Exception as exc:  # noqa: BLE001
-                    log.warning("community detection failed: %s", exc)
+            _ck()
+            _emit("analytics")
+            try:
+                info = self._graph_analytics(
+                    full=full_recompute, changed=changed_set, deleted=set(deleted_rels),
+                    n_files=len(on_disk_rel), state=state, harvest=harvest or {},
+                    emit=lambda ph: _emit(ph))
+                n_communities = info.get("communities")
+            except Exception as exc:  # noqa: BLE001 - never fail the index over analytics
+                log.warning("graph analytics failed: %s", exc, exc_info=True)
+                state["analytics_error"] = str(exc)
 
         # History: files blamed while they had uncommitted lines get
         # re-blamed once HEAD has moved (a commit does not change their hash).
@@ -1655,13 +1662,234 @@ class Indexer:
         state["history_head"] = head_now
         return True
 
-    # ---- Communities ----
-    def _recompute_communities(self) -> int:
-        from docgraph.communities import detect
-        nodes, edges = self.db.community_graph()
-        comms = detect(nodes, edges)
+    # ---- Graph analytics: PageRank, communities, layout, tiles ----
+    #
+    # One global pass reads every node and edge ONCE as numpy arrays (Arrow)
+    # and derives PageRank (sparse power iteration), communities (Louvain on
+    # a folded graph when big), the world layout and the LOD tile sidecar.
+    #
+    # Small graphs (<= full_recompute_max_nodes) recompute PageRank and
+    # communities on every dirty pass, as before. Bigger graphs patch them
+    # for the changed files only (new nodes inherit their previous rank /
+    # their file's community) until the files changed since the last global
+    # pass exceed recompute_drift of all files. The layout is incremental for
+    # every size: surviving nodes keep their stored position, changed files
+    # re-spiral their symbols around the file's previous centre, and a full
+    # relayout happens only on a full reindex or once the drift threshold is
+    # crossed -- so tiles outside the changed files stay byte-identical.
+
+    ANALYTICS_VERSION = 1
+
+    def _harvest_layout(self, files: list[str]) -> dict:
+        """Before the delete step: positions / ranks / communities of the
+        nodes about to be recreated, keyed by stable names."""
+        out: dict = {"by_q": {}, "by_p": {}, "file_comm": {}}
+        if not files:
+            return out
+        try:
+            out["by_q"], out["by_p"] = self.db.positions_in_files(files)
+        except Exception:
+            log.debug("layout harvest failed", exc_info=True)
+        try:
+            out["file_comm"] = self.db.file_communities(files)
+        except Exception:
+            log.debug("community harvest failed", exc_info=True)
+        return out
+
+    def _graph_analytics(self, full: bool, changed: set[str], deleted: set[str],
+                         n_files: int, state: dict, harvest: dict,
+                         emit: Callable[[str], None] | None = None) -> dict:
+        t0 = time.perf_counter()
+        n_nodes = self.db.count_symbols()
+        big = n_nodes > int(getattr(self.cfg, "full_recompute_max_nodes", 50_000) or 0)
+        drift = int(state.get("analytics_drift", 0) or 0) + len(changed) + len(deleted)
+        limit = max(1.0, float(getattr(self.cfg, "recompute_drift", 0.05) or 0.0) * max(1, n_files))
+        stale = state.get("analytics_version") != self.ANALYTICS_VERSION
+        over = drift > limit
+        stats = full or stale or over or not big
+        want_tiles = bool(getattr(self.cfg, "tiles", True))
+        missing_layout = want_tiles and self.db.missing_positions() > len(changed)
+        relayout = want_tiles and (full or stale or over or missing_layout)
+        info: dict = {"nodes": n_nodes, "big": big, "stats": "global" if stats else "patched",
+                      "layout": ("global" if relayout else "incremental") if want_tiles else "off",
+                      "drift_files": 0 if relayout or (stats and big) else drift}
+        if want_tiles and not relayout:
+            if emit:
+                emit("layout")
+            self._place_new(changed, harvest)
+        if not stats:
+            if emit:
+                emit("pagerank")
+            self._patch_pagerank(changed, harvest)
+            if getattr(self.cfg, "communities", True):
+                self._assign_new_communities(changed, harvest)
+        n_comm = self._global_pass(stats=stats, relayout=relayout, tiles=want_tiles,
+                                   state=state, emit=emit)
+        if n_comm is not None:
+            info["communities"] = n_comm
+        if relayout or (stats and big) or (stats and not want_tiles):
+            state["analytics_drift"] = 0
+        else:
+            state["analytics_drift"] = drift
+        state["analytics_version"] = self.ANALYTICS_VERSION
+        info["seconds"] = round(time.perf_counter() - t0, 3)
+        state["analytics"] = info
+        _console.print(f"[cyan]Analytics[/]: stats {info['stats']}, layout {info['layout']} "
+                       f"({info['seconds']:.1f}s)")
+        return info
+
+    def _global_pass(self, stats: bool, relayout: bool, tiles: bool, state: dict,
+                     emit: Callable[[str], None] | None = None) -> int | None:
+        """Arrays in once; PageRank / communities (stats), layout (relayout),
+        writes, then the tile sidecar."""
+        import numpy as np
+        from docgraph import tiles as _tiles
+        from docgraph.rank import RANK_RELS, _Graph
+        if not (stats or relayout or tiles):
+            return None
+        db = self.db
+        src = db.layout_source()
+        ids = src["ids"]
+        n = len(ids)
+        if n == 0:
+            if tiles:
+                self._write_tiles(src, np.zeros(0, np.int64), np.zeros(0, np.int64),
+                                  np.zeros(0, np.float32), np.zeros(0, np.uint8), None, state)
+            return 0 if stats else None
+        kinds = src["kinds"]
+        order = np.argsort(ids, kind="stable")
+        sid = ids[order]
+
+        def rows_of(q: np.ndarray) -> np.ndarray:
+            p = np.searchsorted(sid, q)
+            p = np.clip(p, 0, n - 1)
+            r = order[p]
+            return np.where(sid[p] == q, r, -1)
+
+        e_a, e_b, e_c, e_k = db.edge_endpoints(_tiles.EDGE_KINDS, with_conf=True)
+        ra, rb = rows_of(e_a), rows_of(e_b)
+        path_row = {src["files"][i]: i for i in np.nonzero(kinds == 0)[0].tolist()}
+        file_row = np.array([path_row.get(f, -1) for f in src["files"]], dtype=np.int64)
+        pr = src["pr"].astype(np.float64)
+        n_comm: int | None = None
+        comm_of = None
+        if stats:
+            if emit:
+                emit("pagerank")
+            rank_k = [_tiles.EDGE_KIND_ID[r] for r in RANK_RELS]
+            m = np.isin(e_k, rank_k)
+            g = _Graph(e_a[m], e_b[m])
+            scores = g.pagerank()
+            pr = np.zeros(n)
+            if g.n:
+                rr = rows_of(g.nodes)
+                ok = rr >= 0
+                pr[rr[ok]] = scores[ok]
+            pr[kinds == 0] = 0.0
+            sym = (kinds != 0) & (file_row >= 0)
+            np.add.at(pr, file_row[sym], pr[sym])
+            if getattr(self.cfg, "communities", True):
+                if emit:
+                    emit("communities")
+                comm_of, n_comm = self._communities_from_arrays(src, pr, ra, rb, e_k, e_c,
+                                                                sid, order)
+        if comm_of is None:
+            mn, mc = db.memberships()
+            comm_of = np.full(n, -1, dtype=np.int64)
+            if len(mn):
+                r = rows_of(mn)
+                ok = r >= 0
+                comm_of[r[ok]] = mc[ok]
+        x, y = src["x"].astype(np.float64), src["y"].astype(np.float64)
+        comm_xy: dict[int, tuple[float, float, float]] = {}
+        if relayout:
+            if emit:
+                emit("layout")
+            from docgraph import layout as _layout
+            ok = (ra >= 0) & (rb >= 0)
+            fa, fb = file_row[ra[ok]], file_row[rb[ok]]
+            ok2 = (fa >= 0) & (fb >= 0) & (fa != fb)
+            fa, fb = np.minimum(fa[ok2], fb[ok2]), np.maximum(fa[ok2], fb[ok2])
+            if len(fa):
+                key, inv = np.unique(fa * n + fb, return_inverse=True)
+                fw = np.bincount(inv).astype(np.float64)
+                fa, fb = key // n, key % n
+            else:
+                fw = np.zeros(0)
+            files_idx = np.nonzero(kinds == 0)[0]
+            fcomm = {int(i): int(comm_of[i]) for i in files_idx.tolist() if comm_of[i] >= 0}
+            res = _layout.compute_layout(
+                kinds, file_row, src["line"], {int(i): src["files"][i] for i in files_idx.tolist()},
+                fcomm, fa, fb, fw, pagerank=pr,
+                progress=lambda s: _console.print(f"[dim]{s}[/]"))
+            x, y = res.x, res.y
+            for k_i, key in enumerate(res.cluster_keys):
+                if key[0] == "c":
+                    comm_xy[int(key[1])] = (float(res.cluster_x[k_i]), float(res.cluster_y[k_i]),
+                                            float(res.cluster_r[k_i]))
+        # ---- writes ----
+        if stats or relayout:
+            label_of = {0: "File", 1: "Class", 2: "Function", 3: "Variable"}
+            for k, label in label_of.items():
+                rows = np.nonzero(kinds == k)[0]
+                if not len(rows):
+                    continue
+                cols: dict = {}
+                if stats and label != "Variable":
+                    cols["pagerank"] = pr[rows]
+                if relayout:
+                    cols["x"] = x[rows]
+                    cols["y"] = y[rows]
+                if cols:
+                    db.set_node_values(label, ids[rows], cols)
+            if comm_xy:
+                cids = np.array(sorted(comm_xy), dtype=np.int64)
+                db.set_node_values("Community", cids, {
+                    "x": np.array([comm_xy[c][0] for c in cids.tolist()]),
+                    "y": np.array([comm_xy[c][1] for c in cids.tolist()]),
+                    "r": np.array([comm_xy[c][2] for c in cids.tolist()])})
+        if tiles:
+            if emit:
+                emit("tiles")
+            src["x"], src["y"], src["pr"] = x, y, pr
+            self._write_tiles(src, ra, rb, e_c, e_k.astype(np.uint8), comm_of, state,
+                              file_row=file_row)
+        return n_comm
+
+    def _communities_from_arrays(self, src: dict, pr, ra, rb, e_k, e_c, sid, order):
+        """Louvain over CALLS / INSTANTIATES / INHERITS (weight = confidence),
+        CONTAINS (0.5) and File->File IMPORTS (0.3); writes Community +
+        MEMBER_OF. Returns (community id per node row, count)."""
+        import numpy as np
+        from docgraph import tiles as _tiles
+        from docgraph.communities import detect_arrays
+        n = len(src["ids"])
+        kid = _tiles.EDGE_KIND_ID
+        w = np.zeros(len(e_k), dtype=np.float64)
+        for rel in ("CALLS", "INSTANTIATES", "INHERITS"):
+            m = e_k == kid[rel]
+            w[m] = e_c[m]
+        w[e_k == kid["CONTAINS"]] = 0.5
+        imp = e_k == kid["IMPORTS"]
+        both_files = (ra >= 0) & (rb >= 0)
+        imp &= both_files
+        if imp.any():
+            imp[imp] = (src["kinds"][ra[imp]] == 0) & (src["kinds"][rb[imp]] == 0)
+        w[imp] = 0.3
+        use = (w > 0) & both_files
+        # Variables are not community members (MEMBER_OF has no Variable pair).
+        if use.any():
+            use[use] = (src["kinds"][ra[use]] != 3) & (src["kinds"][rb[use]] != 3)
+        labels_by_kind = ["File", "Class", "Function", "Variable"]
+        lab_sorted = [labels_by_kind[int(src["kinds"][i])] for i in order.tolist()]
+        names_sorted = [src["names"][i] for i in order.tolist()]
+        files_sorted = [src["files"][i] for i in order.tolist()]
+        comms = detect_arrays(sid, lab_sorted, names_sorted, files_sorted, pr[order],
+                              src["ids"][ra[use]], src["ids"][rb[use]], w[use],
+                              progress=lambda s: _console.print(f"[dim]{s}[/]"))
         rows: list[dict] = []
         members: dict[str, list[dict]] = defaultdict(list)
+        comm_of = np.full(n, -1, dtype=np.int64)
         for c in comms:
             cid = self._new_id()
             rows.append({
@@ -1669,12 +1897,148 @@ class Indexer:
                 "top_members": json.dumps(c.top_members), "files": json.dumps(c.files),
                 "pagerank": float(c.pagerank),
             })
-            for m in c.members:
-                lab = nodes[m]["label"]
-                members[lab].append({"from_id": m, "to_id": cid})
+            mem = np.asarray(c.members, dtype=np.int64)
+            p = order[np.searchsorted(sid, mem)]
+            comm_of[p] = cid
+            for i, r in zip(mem.tolist(), p.tolist()):
+                members[labels_by_kind[int(src["kinds"][r])]].append({"from_id": i, "to_id": cid})
         self.db.replace_communities(rows, members)
         _console.print(f"[cyan]Communities[/]: {len(rows)} detected")
-        return len(rows)
+        return comm_of, len(rows)
+
+    def _recompute_communities(self) -> int:
+        """Stand-alone community pass (kept for callers outside index_all)."""
+        n = self._global_pass(stats=True, relayout=False, tiles=False, state={})
+        return int(n or 0)
+
+    def _write_tiles(self, src: dict, ra, rb, conf, kind, comm_of, state: dict,
+                     file_row=None) -> None:
+        import numpy as np
+        from docgraph import tiles as _tiles
+        n = len(src["ids"])
+        if file_row is None:
+            path_row = {src["files"][i]: i for i in np.nonzero(src["kinds"] == 0)[0].tolist()}
+            file_row = np.array([path_row.get(f, -1) for f in src["files"]], dtype=np.int64)
+        x, y = np.asarray(src["x"], dtype=np.float64), np.asarray(src["y"], dtype=np.float64)
+        miss = ~(np.isfinite(x) & np.isfinite(y))
+        if miss.any():
+            # nodes without a stored position (layout off at some point):
+            # around their file, else on a far spiral -- never dropped
+            from docgraph.layout import spiral_offsets
+            fr = file_row[miss]
+            base_x = np.where((fr >= 0) & np.isfinite(x[np.clip(fr, 0, None)]), x[np.clip(fr, 0, None)], np.nan)
+            base_y = np.where((fr >= 0) & np.isfinite(y[np.clip(fr, 0, None)]), y[np.clip(fr, 0, None)], np.nan)
+            off = spiral_offsets(int(miss.sum()))
+            ext = float(np.nanmax(np.abs(np.concatenate([x[~miss], y[~miss]])))) if (~miss).any() else 0.0
+            x[miss] = np.where(np.isfinite(base_x), base_x + off[:, 0] * 0.3, off[:, 0] + ext * 1.2)
+            y[miss] = np.where(np.isfinite(base_y), base_y + off[:, 1] * 0.3, off[:, 1])
+        if comm_of is None:
+            comm_of = np.full(n, -1, dtype=np.int64)
+        ok = (ra >= 0) & (rb >= 0)
+        clusters = {}
+        for r in self.db.community_rows():
+            clusters[int(r["id"])] = {"name": r.get("name") or "", "x": r.get("x"), "y": r.get("y"),
+                                      "r": r.get("r")}
+        flags = np.where(src["test"], _tiles.FLAG_TEST, 0).astype(np.uint8)
+        ts = _tiles.TileSource(
+            ids=src["ids"], kinds=src["kinds"].astype(np.uint8), x=x, y=y,
+            pagerank=np.asarray(src["pr"], dtype=np.float32), file_row=file_row,
+            community=comm_of, names=[
+                (nm if k != 0 else f) for nm, f, k in zip(src["names"], src["files"], src["kinds"].tolist())],
+            flags=flags, edge_a=src["ids"][ra[ok]], edge_b=src["ids"][rb[ok]],
+            edge_kind=np.asarray(kind)[ok], edge_conf=np.asarray(conf, dtype=np.float32)[ok],
+            clusters=clusters)
+        gen = int(state.get("tiles_generation", 0) or 0) + 1
+        man = _tiles.build(ts, self.cfg.data_dir / "tiles", gen,
+                           progress=lambda s: _console.print(f"[dim]{s}[/]"))
+        state["tiles_generation"] = gen
+        state["tiles"] = {"generation": gen, "counts": man.get("counts"),
+                          "seconds": man.get("build_seconds")}
+
+    def _patch_pagerank(self, changed: set[str], harvest: dict) -> None:
+        """Big-graph incremental: nodes of changed files take the rank their
+        qname had before (0 for new symbols); their files re-sum."""
+        import numpy as np
+        if not changed:
+            return
+        by_q = harvest.get("by_q") or {}
+        files = list(changed)
+        per_file: dict[str, float] = {}
+        for label in ("Function", "Class"):
+            d = self.db.node_columns(label, {"id": "n.id", "q": "n.qname", "f": "n.file"},
+                                     where="n.file IN $f", params={"f": files})
+            if d.get("id") is None or not len(d["id"]):
+                continue
+            vals = np.array([float((by_q.get(q) or (0, 0, 0.0))[2]) for q in d["q"].tolist()])
+            self.db.set_node_values(label, d["id"].astype(np.int64), {"pagerank": vals})
+            for f, v in zip(d["f"].tolist(), vals.tolist()):
+                per_file[f] = per_file.get(f, 0.0) + v
+        fd = self.db.node_columns("File", {"id": "n.id", "p": "n.path"}, where="n.path IN $f",
+                                  params={"f": files})
+        if fd.get("id") is not None and len(fd["id"]):
+            self.db.set_node_values("File", fd["id"].astype(np.int64),
+                                    {"pagerank": np.array([per_file.get(p, 0.0) for p in fd["p"].tolist()])})
+
+    def _assign_new_communities(self, changed: set[str], harvest: dict) -> None:
+        """Big-graph incremental: nodes of changed files join their file's
+        previous community, or the majority community of their neighbours."""
+        from collections import Counter as _Counter
+        if not changed or not self.db.has_table("Community"):
+            return
+        files = list(changed)
+        file_comm = dict(harvest.get("file_comm") or {})
+        nodes = self.db.nodes_in_files(files)       # [(label, id, file)]
+        if not nodes:
+            return
+        unknown = [i for lab, i, f in nodes if f not in file_comm]
+        if unknown:
+            votes: dict[str, _Counter] = defaultdict(_Counter)
+            f_of = {i: f for _lab, i, f in nodes}
+            for a, c in self.db.neighbor_communities(unknown):
+                votes[f_of.get(a, "")][c] += 1
+            for f, cnt in votes.items():
+                if f and f not in file_comm and cnt:
+                    file_comm[f] = cnt.most_common(1)[0][0]
+        members: dict[str, list[dict]] = defaultdict(list)
+        for lab, i, f in nodes:
+            c = file_comm.get(f)
+            if c is not None:
+                members[lab].append({"from_id": i, "to_id": int(c)})
+        for lab, rows in members.items():
+            self.db.insert_edges("MEMBER_OF", lab, "Community", rows)
+
+    def _place_new(self, changed: set[str], harvest: dict) -> None:
+        """Incremental layout: a changed file keeps its previous centre (a new
+        file is placed next to its neighbours / community) and its symbols
+        re-spiral around it in line order. Nothing else moves."""
+        import numpy as np
+        from docgraph import layout as _layout
+        if not changed:
+            return
+        by_p = harvest.get("by_p") or {}
+        extent = self.db.layout_extent()
+        for f in sorted(changed):
+            rows = self.db.file_layout_rows(f)       # {file_id, symbols: [(label, id, line)]}
+            if rows is None:
+                continue
+            center = by_p.get(f)
+            if center is None:
+                ids = [i for _lab, i, _l in rows["symbols"]] + [rows["file_id"]]
+                anchor = self.db.neighbor_center(ids)
+                if anchor is None:
+                    anchor = self.db.community_center_of(rows["file_id"])
+                center = _layout.place_file(anchor, f, extent)
+            syms = sorted(rows["symbols"], key=lambda t: (t[2], t[1]))
+            off = _layout.spiral_offsets(len(syms))
+            self.db.set_node_values("File", np.array([rows["file_id"]], np.int64),
+                                    {"x": np.array([center[0]]), "y": np.array([center[1]])})
+            by_label: dict[str, list[tuple[int, float, float]]] = defaultdict(list)
+            for (lab, i, _l), (dx, dy) in zip(syms, off.tolist()):
+                by_label[lab].append((i, center[0] + dx, center[1] + dy))
+            for lab, vals in by_label.items():
+                self.db.set_node_values(lab, np.array([v[0] for v in vals], np.int64),
+                                        {"x": np.array([v[1] for v in vals]),
+                                         "y": np.array([v[2] for v in vals])})
 
     # ---- Persistent state (separate from cache: smaller, global) ----
     def _state_path(self) -> Path:
@@ -1721,19 +2085,18 @@ class Indexer:
             except Exception:
                 pass
             for label, desc in (("Function", "functions"), ("Class", "classes")):
-                rows = self.db.fetch_all(
-                    f"MATCH (n:{label}) RETURN n.id AS id, n.embedding AS embedding"
-                )
-                if len(rows) < 2:
+                ids, mat = self.db.embedding_matrix(label)
+                if len(ids) < 2:
                     continue
                 with _bar() as prog:
                     task = prog.add_task(
-                        f"SIMILAR_TO ({desc})", total=len(rows)
+                        f"SIMILAR_TO ({desc})", total=len(ids)
                     )
                     self._write_similar_edges(
-                        rows, label,
+                        ids, mat, label,
                         on_progress=lambda n: prog.advance(task, n),
                     )
+                del ids, mat
         else:
             # Partial: only entities in dirty_files have changed embeddings.
             # Delete SIMILAR_TO incident to those entities, then recompute
@@ -1805,7 +2168,7 @@ class Indexer:
         # TESTS: full or partial-by-changed-files
         if full:
             function_rows_db = self.db.fetch_all(
-                "MATCH (n:Function) RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
+                "MATCH (n:Function) WHERE n.is_test RETURN n.id AS id, n.name AS name, n.is_test AS is_test"
             )
             if function_rows_db:
                 with _bar() as prog:
@@ -1813,7 +2176,7 @@ class Indexer:
                         "TESTS edges", total=len(function_rows_db)
                     )
                     self._write_tests_edges(
-                        function_rows_db, self._build_name_index(),
+                        function_rows_db, self._name_index_for(function_rows_db),
                         on_progress=lambda n: prog.advance(task, n),
                     )
         else:
@@ -1833,17 +2196,7 @@ class Indexer:
                             on_progress=lambda n: prog.advance(task, n),
                         )
 
-        # PageRank: gated by graph_dirty at the caller, so always run here.
-        # Inherently global — every node's rank depends on the whole graph
-        # topology, so partial recompute would be approximate. Keep full.
-        # NetworkX exposes no per-iteration hook so the bar fills in two
-        # steps: 0% before compute_pagerank, 50% after, 100% after write.
-        with _bar() as prog:
-            task = prog.add_task("PageRank", total=2)
-            scores = compute_pagerank(self.db)
-            prog.advance(task)
-            write_pagerank(self.db, scores)
-            prog.advance(task)
+        # PageRank / communities / layout / tiles: _graph_analytics().
 
     def _git_head(self, root: Path) -> str | None:
         try:
@@ -1855,12 +2208,38 @@ class Indexer:
         except (subprocess.CalledProcessError, FileNotFoundError, OSError):
             return None
 
+    def _name_index_for(self, test_rows: list[dict]) -> dict[str, list[tuple[str, int]]]:
+        """name -> [(label, id)] for just the names test functions point at
+        (`test_foo` -> `foo`), via targeted queries instead of the whole
+        symbol table."""
+        names: set[str] = set()
+        for fr in test_rows:
+            stripped = fr.get("name") or ""
+            for prefix in ("test_", "test"):
+                if stripped.lower().startswith(prefix):
+                    stripped = stripped[len(prefix):].lstrip("_")
+                    break
+            if stripped:
+                names.add(stripped)
+        idx: dict[str, list[tuple[str, int]]] = defaultdict(list)
+        lst = sorted(names)
+        for s in range(0, len(lst), 5000):
+            part = lst[s:s + 5000]
+            for label in ("Function", "Class"):
+                for r in self.db.fetch_all(
+                        f"MATCH (n:{label}) WHERE n.name IN $n RETURN n.id AS id, n.name AS name",
+                        {"n": part}):
+                    idx[r["name"]].append((label, r["id"]))
+        return idx
+
     def _build_name_index(self) -> dict[str, list[tuple[str, int]]]:
         idx: dict[str, list[tuple[str, int]]] = defaultdict(list)
-        for r in self.db.fetch_all("MATCH (n:Function) RETURN n.id AS id, n.name AS name"):
-            idx[r["name"]].append(("Function", r["id"]))
-        for r in self.db.fetch_all("MATCH (n:Class) RETURN n.id AS id, n.name AS name"):
-            idx[r["name"]].append(("Class", r["id"]))
+        for label in ("Function", "Class"):
+            d = self.db.node_columns(label, {"id": "n.id", "name": "n.name"})
+            if d.get("id") is None:
+                continue
+            for i, nm in zip(d["id"].tolist(), d["name"].tolist()):
+                idx[nm].append((label, i))
         return idx
 
     def _recompute_similar_partial(
@@ -1869,10 +2248,13 @@ class Indexer:
         dirty_files: set[str],
         on_progress: Callable[[int], None] | None = None,
     ) -> None:
+        """Top-k neighbours for the entities of the dirty files only: one
+        HNSW query each (O(changed)); an exact blocked scan when the vector
+        index is missing."""
+        import numpy as np
         if not dirty_files:
             return
         files_list = list(dirty_files)
-        # Edges to delete: any SIMILAR_TO touching an entity in a dirty file
         try:
             self.db.execute(
                 f"MATCH (a:{label})-[r:SIMILAR_TO]->(b:{label}) "
@@ -1881,54 +2263,47 @@ class Indexer:
             )
         except Exception:
             pass
-        # Get the dirty entity IDs to recompute outgoing top-K for
-        dirty_id_rows = self.db.fetch_all(
-            f"MATCH (n:{label}) WHERE n.file IN $files RETURN n.id AS id",
-            {"files": files_list},
-        )
-        dirty_ids = {r["id"] for r in dirty_id_rows}
-        if not dirty_ids:
+        d = self.db.node_columns(label, {"id": "n.id"}, where="n.file IN $files",
+                                 params={"files": files_list})
+        dirty = d.get("id")
+        if dirty is None or not len(dirty):
             return
-        rows = self.db.fetch_all(
-            f"MATCH (n:{label}) RETURN n.id AS id, n.embedding AS embedding"
-        )
-        if len(rows) < 2:
+        ids, mat = self.db.embeddings_for(label, [int(i) for i in dirty.tolist()])
+        if not len(ids):
             return
-        import numpy as np
-        ids = [r["id"] for r in rows]
-        id_to_idx = {eid: i for i, eid in enumerate(ids)}
-        try:
-            mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
-        except Exception:
-            return
-        norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
-        mat = mat / norms
-        update_idxs = [id_to_idx[i] for i in dirty_ids if i in id_to_idx]
-        if not update_idxs:
-            return
-        sub = mat[update_idxs]
-        sims = sub @ mat.T
+        k = int(self.cfg.similar_top_k)
         sim_edges: list[dict] = []
-        k = self.cfg.similar_top_k
-        n = len(ids)
-        top_k = min(k, n - 1)
-        if top_k <= 0:
-            return
-        for row_i, idx in enumerate(update_idxs):
-            row = sims[row_i].copy()
-            row[idx] = -1.0
-            top = np.argpartition(-row, top_k)[:top_k]
-            for j in top:
-                score = float(row[int(j)])
-                if score < 0.5:
-                    continue
-                sim_edges.append({
-                    "from_id": ids[idx],
-                    "to_id": ids[int(j)],
-                    "score": score,
-                })
-            if on_progress is not None:
-                on_progress(1)
+        if self.db.VECTOR_INDEXES[label] in self.db.list_indexes():
+            for i, v in zip(ids.tolist(), mat):
+                try:
+                    hits = self.db.vector_topk(label, v, k + 1)
+                except Exception:
+                    hits = []
+                for j, score in hits:
+                    if j != i and score >= 0.5:
+                        sim_edges.append({"from_id": i, "to_id": j, "score": float(score)})
+                if on_progress is not None:
+                    on_progress(1)
+        else:
+            from docgraph.similar import unit_rows
+            all_ids, all_mat = self.db.embedding_matrix(label)
+            if len(all_ids) < 2:
+                return
+            x = unit_rows(all_mat)
+            q = unit_rows(mat)
+            for s in range(0, len(q), 512):
+                sims = q[s:s + 512] @ x.T
+                for r_i in range(sims.shape[0]):
+                    row = sims[r_i]
+                    me = int(ids[s + r_i])
+                    row[all_ids == me] = -2.0
+                    top = np.argpartition(-row, min(k, len(row) - 1))[:k]
+                    for j in top.tolist():
+                        if row[j] >= 0.5:
+                            sim_edges.append({"from_id": me, "to_id": int(all_ids[j]),
+                                              "score": float(row[j])})
+                if on_progress is not None:
+                    on_progress(sims.shape[0])
         if sim_edges:
             self.db.insert_edges("SIMILAR_TO", label, label, sim_edges)
 
@@ -1962,54 +2337,29 @@ class Indexer:
         if not test_rows:
             return
         self._write_tests_edges(
-            test_rows, self._build_name_index(),
+            test_rows, self._name_index_for(test_rows),
             on_progress=on_progress,
         )
 
     # ---- Tier 4 helpers ----
     def _write_similar_edges(
         self,
-        rows: list[dict],
+        ids,
+        mat,
         label: str,
         on_progress: Callable[[int], None] | None = None,
     ) -> None:
-        if len(rows) < 2:
+        """Full pass: bounded-memory top-k (docgraph.similar -- exact blocks
+        for small tables, IVF lists for big ones; never an n x n matrix)."""
+        from docgraph.similar import top_similar
+        if len(ids) < 2:
             return
-        import numpy as np
-        ids = [r["id"] for r in rows]
-        try:
-            mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
-        except Exception:
+        src, dst, score = top_similar(mat, int(self.cfg.similar_top_k), 0.5, on_progress=on_progress)
+        if not len(src):
             return
-        norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
-        mat = mat / norms
-        sim_edges: list[dict] = []
-        k = self.cfg.similar_top_k
-        n = len(ids)
-        chunk = 512
-        for start in range(0, n, chunk):
-            end = min(start + chunk, n)
-            sims = mat[start:end] @ mat.T
-            for i in range(end - start):
-                row = sims[i]
-                row[start + i] = -1
-                top_k = min(k, n - 1)
-                if top_k <= 0:
-                    continue
-                top = np.argpartition(-row, top_k)[:top_k]
-                for j in top:
-                    score = float(row[j])
-                    if score < 0.5:
-                        continue
-                    sim_edges.append({
-                        "from_id": ids[start + i],
-                        "to_id": ids[int(j)],
-                        "score": score,
-                    })
-            if on_progress is not None:
-                on_progress(end - start)
-        if sim_edges:
-            self.db.insert_edges("SIMILAR_TO", label, label, sim_edges)
+        rows = [{"from_id": int(ids[a]), "to_id": int(ids[b]), "score": float(v)}
+                for a, b, v in zip(src.tolist(), dst.tolist(), score.tolist())]
+        self.db.insert_edges("SIMILAR_TO", label, label, rows)
 
     def _write_co_changed(
         self,

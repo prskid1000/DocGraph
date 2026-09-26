@@ -147,7 +147,7 @@ def make_app(workspace: Workspace) -> FastAPI:
     _GATE_SKIP_PREFIXES = (
         "/api/jobs", "/api/admin/cancel", "/api/admin/models_status",
         "/api/locks", "/api/roots", "/api/llm_config", "/api/events",
-        "/api/chat", "/api/file_content",
+        "/api/chat", "/api/file_content", "/api/tiles",
     )
 
     # Read gate. Every GET /api/* request that targets a specific root
@@ -504,7 +504,112 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.get("/api/node_neighbors")
     async def api_node_neighbors(id: int, hops: int = 1, root: RootSlug = DEFAULT):
-        return _r(root).node_neighbors(int(id), hops=hops)
+        out = _r(root).node_neighbors(int(id), hops=hops)
+        # World positions for neighbours that sit in tiles the UI has not
+        # loaded (drawn as ghost nodes).
+        store = _tile_store(_slot(root))
+        if store.ready() and out.get("nodes"):
+            pos = {p["id"]: p for p in store.locate([n["id"] for n in out["nodes"]])}
+            for n in out["nodes"]:
+                p = pos.get(n["id"])
+                if p:
+                    n["x"], n["y"] = p["x"], p["y"]
+        return out
+
+    # --- Streamed graph tiles (see docgraph/tiles.py) ---
+    # Served from the .docgraph/tiles sidecar, never from Kuzu, so they skip
+    # the read gate and keep working while a writer holds the DB.
+    app.state.tile_stores = {}
+
+    def _tile_store(slot: RootSlot):
+        from docgraph.tiles import TileStore
+        st = app.state.tile_stores.get(slot.slug)
+        if st is None:
+            st = TileStore(slot.cfg.data_dir / "tiles")
+            app.state.tile_stores[slot.slug] = st
+        return st
+
+    def _parse_kinds(spec: str | None, names: list[str]) -> set[int] | None:
+        if not spec:
+            return None
+        want = {s.strip() for s in spec.split(",") if s.strip()}
+        return {i for i, n in enumerate(names) if n in want}
+
+    @app.get("/api/tiles/manifest")
+    async def api_tiles_manifest(root: RootSlug = DEFAULT):
+        slot = _slot(root)
+        man = _tile_store(slot).get_manifest()
+        if man is None:
+            return {"ready": False, "reason": "no tile sidecar yet -- run a (full) index "
+                                              "(schema v4 builds it at index time)"}
+        return {"ready": True, **man}
+
+    @app.get("/api/tiles")
+    async def api_tiles(request: Request, level: int, x: int, y: int, lod: str | None = None,
+                        edges: str | None = None, kinds: str | None = None,
+                        min_conf: float = 0.0, budget: int = 0, root: RootSlug = DEFAULT):
+        from fastapi.responses import Response
+        from docgraph import tiles as T
+        store = _tile_store(_slot(root))
+        if not store.ready():
+            raise HTTPException(404, "no tiles")
+        body, etag = await asyncio.to_thread(
+            store.tile, level, x, y, lod=lod, budget=budget or T.TILE_BUDGET,
+            edge_kinds=_parse_kinds(edges, T.EDGE_KINDS),
+            node_kinds=_parse_kinds(kinds, T.NODE_KINDS), min_conf=float(min_conf))
+        tag = f'"{etag}"'
+        headers = {"ETag": tag, "Cache-Control": "no-cache"}
+        if request.headers.get("if-none-match") == tag:
+            return Response(status_code=304, headers=headers)
+        return Response(content=body, media_type="application/octet-stream", headers=headers)
+
+    @app.get("/api/tiles/batch")
+    async def api_tiles_batch(keys: str, lod: str | None = None, edges: str | None = None,
+                              kinds: str | None = None, min_conf: float = 0.0, budget: int = 0,
+                              root: RootSlug = DEFAULT):
+        """keys = "level/x/y,level/x/y,..." (at most 256) -> framed binary."""
+        from fastapi.responses import Response
+        from docgraph import tiles as T
+        store = _tile_store(_slot(root))
+        if not store.ready():
+            raise HTTPException(404, "no tiles")
+        ek = _parse_kinds(edges, T.EDGE_KINDS)
+        nk = _parse_kinds(kinds, T.NODE_KINDS)
+        want: list[tuple[int, int, int]] = []
+        for part in keys.split(",")[:256]:
+            bits = part.strip().split("/")
+            if len(bits) == 3:
+                try:
+                    want.append((int(bits[0]), int(bits[1]), int(bits[2])))
+                except ValueError:
+                    continue
+
+        def _build() -> bytes:
+            items = []
+            for lv, tx, ty in want:
+                body, etag = store.tile(lv, tx, ty, lod=lod, budget=budget or T.TILE_BUDGET,
+                                        edge_kinds=ek, node_kinds=nk, min_conf=float(min_conf))
+                items.append((lv, tx, ty, body, etag))
+            return T.frame_batch(items)
+
+        payload = await asyncio.to_thread(_build)
+        return Response(content=payload, media_type="application/octet-stream",
+                        headers={"Cache-Control": "no-store"})
+
+    @app.get("/api/tiles/locate")
+    async def api_tiles_locate(ids: str, root: RootSlug = DEFAULT):
+        """World position (+ kind / cluster / name) of nodes by id -- the UI
+        uses it to jump to a search hit and to draw ghost neighbours."""
+        store = _tile_store(_slot(root))
+        if not store.ready():
+            return {"ready": False, "nodes": []}
+        want = []
+        for s_ in ids.split(",")[:2000]:
+            try:
+                want.append(int(s_))
+            except ValueError:
+                continue
+        return {"ready": True, "nodes": store.locate(want)}
 
     @app.get("/api/stats")
     async def api_stats(root: RootSlug = DEFAULT):
@@ -836,6 +941,13 @@ def make_app(workspace: Workspace) -> FastAPI:
             raise HTTPException(404)
         if cfg.ai_blocked_logical(file):
             return {"file": file, "content": "[redacted by .cursorignore]", "redacted": True}
+        if full.suffix.lower() == ".ipynb":
+            # Same virtual text the indexer parsed (cells in order), so the
+            # line numbers of a notebook's symbols / chunks line up.
+            from docgraph.parse import notebook_text
+            nt = notebook_text(full.read_bytes())
+            if nt is not None:
+                return {"file": file, "content": nt[0], "notebook": True, "language": nt[1]}
         return {"file": file, "content": full.read_text(encoding="utf-8", errors="replace")}
 
     # Admin: wipe a root's index. rmtrees the entire .docgraph/ — same as
