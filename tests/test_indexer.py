@@ -334,7 +334,7 @@ def test_overrides_edge_extracted(tmp_path: Path):
 
 def test_variable_incremental_delete(var_repo: Path):
     """Removing a variable from a file → its Variable node is gone after reindex.
-    Exercises _delete_files_from_db's Variable cascade."""
+    Exercises the by-id delete of the changed file's Variable nodes."""
     cfg, db, embedder, _ = _index_and_reopen_readonly(var_repo)
     db.close()
     gc.collect()

@@ -38,11 +38,74 @@ def _git(args: list[str], cwd: Path, timeout: float = 60.0) -> str | None:
 
 
 def is_git_repo(root: Path) -> bool:
+    if git_dir(root) is not None:
+        return True
     out = _git(["rev-parse", "--is-inside-work-tree"], root, timeout=10)
     return bool(out and out.strip() == "true")
 
 
+def git_dir(root: Path) -> Path | None:
+    """The .git directory of the work tree containing `root` (a `.git`
+    file of a worktree / submodule is followed), or None."""
+    p = Path(root).resolve()
+    for d in (p, *p.parents):
+        g = d / ".git"
+        try:
+            if g.is_dir():
+                return g
+            if g.is_file():
+                txt = g.read_text(encoding="utf-8", errors="replace").strip()
+                if txt.startswith("gitdir:"):
+                    q = Path(txt[7:].strip())
+                    return q if q.is_absolute() else (d / q).resolve()
+        except OSError:
+            return None
+    return None
+
+
+def head_fast(root: Path) -> str | None:
+    """HEAD's commit read from the .git files (no subprocess): HEAD ->
+    loose ref -> packed-refs. None when it cannot tell (the caller falls
+    back to `git rev-parse`)."""
+    gd = git_dir(root)
+    if gd is None:
+        return None
+    try:
+        h = (gd / "HEAD").read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    if not h.startswith("ref:"):
+        return h if len(h) >= 40 else None
+    ref = h[4:].strip()
+    common = gd
+    try:
+        cd = gd / "commondir"
+        if cd.exists():
+            c = Path(cd.read_text(encoding="utf-8").strip())
+            common = c if c.is_absolute() else (gd / c).resolve()
+    except OSError:
+        pass
+    for base in (gd, common):
+        f = base / ref
+        try:
+            if f.is_file():
+                v = f.read_text(encoding="utf-8").strip()
+                return v or None
+        except OSError:
+            continue
+    try:
+        for line in (common / "packed-refs").read_text(encoding="utf-8").splitlines():
+            if line.endswith(" " + ref) and not line.startswith(("#", "^")):
+                return line.split(" ", 1)[0]
+    except OSError:
+        pass
+    return None
+
+
 def head(root: Path) -> str | None:
+    fast = head_fast(root)
+    if fast:
+        return fast
     out = _git(["rev-parse", "HEAD"], root, timeout=10)
     return out.strip() if out and out.strip() else None
 

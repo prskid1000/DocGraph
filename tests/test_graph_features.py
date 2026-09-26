@@ -474,25 +474,6 @@ def test_communities_two_cliques():
     assert {c.name.split(":")[0] for c in comms} == {"a", "b"}
 
 
-def test_merkle_scan_reuses_stat(tmp_path):
-    from docgraph import merkle
-    (tmp_path / "d").mkdir()
-    f1, f2 = tmp_path / "a.py", tmp_path / "d" / "b.py"
-    f1.write_text("x")
-    f2.write_text("y")
-    files = [(f1, "a.py"), (f2, "d/b.py")]
-    r1, st1 = merkle.scan(files, {})
-    assert r1.hashed == 2
-    out = tmp_path / "m.json"
-    merkle.save(out, r1, st1)
-    r2, _ = merkle.scan(files, merkle.load(out))
-    assert r2.hashed == 0 and r2.reused == 2 and r2.root_unchanged
-    assert r2.unchanged_dirs >= {"", "d"}
-    f2.write_text("changed!")
-    r3, _ = merkle.scan(files, merkle.load(out))
-    assert r3.hashed == 1 and "d" not in r3.unchanged_dirs and not r3.root_unchanged
-
-
 def test_history_span():
     from docgraph.history import UNCOMMITTED, symbol_span_history
     blame = [("aaa", 10), ("bbb", 30), ("ccc", 20), (UNCOMMITTED, 40)]

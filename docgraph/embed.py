@@ -222,6 +222,7 @@ class Embedder:
                 "Embedder %s: cuda requested but unavailable — using CPU",
                 self.model_name,
             )
+            self.device = None
         self._resolved_device = "cuda" if on_cuda else "cpu"
         torch_dtype = _pick_dtype(self.dtype, on_cuda)
         key = _cache_key(self.model_name, self._resolved_device, self.dtype)
@@ -239,12 +240,15 @@ class Embedder:
             # load straight into fp16 / bf16 — avoids a fp32 → fp16
             # round-trip.
             prof = model_profile(self.model_name)
-            model = SentenceTransformer(
-                self.model_name,
-                device=self._resolved_device,
-                model_kwargs={"torch_dtype": torch_dtype},
-                trust_remote_code=bool(prof.get("trust_remote_code")),
-            )
+            kw = dict(device=self._resolved_device, model_kwargs={"torch_dtype": torch_dtype},
+                      trust_remote_code=bool(prof.get("trust_remote_code")))
+            try:
+                # A cached model loads without the ~15 HTTP HEAD requests the
+                # hub client makes to check for updates (seconds on a slow
+                # or offline network); only a missing model goes online.
+                model = SentenceTransformer(self.model_name, local_files_only=True, **kw)
+            except Exception:
+                model = SentenceTransformer(self.model_name, **kw)
             if prof.get("max_seq"):
                 try:
                     cur = int(getattr(model, "max_seq_length", 0) or 0)

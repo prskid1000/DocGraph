@@ -199,11 +199,27 @@ def edges_from_documents(docs: list[Document], prefix: str,
 
 # ---- driver ----------------------------------------------------------------
 
+_WHICH: dict[str, tuple[float, str]] = {}
+
+
+def _which(name: str) -> str:
+    """shutil.which, remembered for a minute (a PATH scan per index pass
+    costs ~10 ms on Windows)."""
+    import time as _t
+    hit = _WHICH.get(name)
+    now = _t.monotonic()
+    if hit is not None and now - hit[0] < 60.0:
+        return hit[1]
+    path = shutil.which(name) or ""
+    _WHICH[name] = (now, path)
+    return path
+
+
 def _binaries(cfg) -> list[tuple[str, str]]:
     out = []
     for name, attr in (("scip-python", "scip_python"), ("scip-typescript", "scip_typescript")):
         explicit = (getattr(cfg, attr, "") or "").strip()
-        path = explicit or shutil.which(name) or ""
+        path = explicit or _which(name)
         if path:
             out.append((name, path))
     return out
