@@ -110,7 +110,211 @@ class Retriever:
             return "[redacted by .cursorignore]", "[redacted]"
         return body, snippet
 
+    # ---- search ----------------------------------------------------------
+    #
+    # Indexed path (schema v4): candidates come from Kuzu's HNSW vector index
+    # and FTS index per label (+ an exact-name probe and the parents of the
+    # best-matching sub-chunks), so a query touches O(k) rows, never the whole
+    # table. Scoring (cosine + RRF of the vector / keyword ranks + name +
+    # PageRank / PPR boosts, optional cross-encoder rerank) runs on that
+    # candidate set only. Pre-v4 databases (no indexes) use the brute-force
+    # path (`_search_brute`) unchanged.
+
+    SEARCH_K = 60
+
+    def search_backend(self) -> str:
+        """"index" when every vector + FTS index exists, else "brute"."""
+        cached = getattr(self, "_search_backend_cache", None)
+        if cached is None:
+            have = self.db.list_indexes()
+            need = list(self.db.VECTOR_INDEXES.values()) + [v[0] for v in self.db.FTS_INDEXES.values()]
+            cached = "index" if all(n in have for n in need) else "brute"
+            self._search_backend_cache = cached
+        return cached
+
     def search(
+        self,
+        query: str,
+        kind: str | None = None,
+        limit: int = 10,
+        focus_file: str | None = None,
+        focus_symbol: str | None = None,
+        rerank: bool = False,
+    ) -> list[dict]:
+        """Hybrid search. If focus_file or focus_symbol is provided, ranks
+        results by personalized PageRank biased toward that focus point --
+        the model sees results most relevant to where the agent is working.
+
+        rerank=True runs a cross-encoder over the top candidates for
+        token-level precision (downloads a small ~33 MB model on first use).
+        Plain-text / symbol-less files come back as `label: "File"` hits
+        carrying their best chunk's line + snippet. kind: function | class |
+        file (files only) | None (everything).
+        """
+        if self.search_backend() != "index":
+            return self._search_brute(query, kind=kind, limit=limit, focus_file=focus_file,
+                                      focus_symbol=focus_symbol, rerank=rerank)
+        eq = getattr(self.embedder, "embed_query", None)
+        qvec = eq(query) if callable(eq) else self.embedder.embed([query])[0]
+        qv = self._unit(qvec)
+        k = max(self.SEARCH_K, int(limit) * 5)
+        want_files = kind in (None, "", "file", "text")
+        if kind in ("file", "text"):
+            labels: tuple[str, ...] = ()
+        elif kind == "function":
+            labels = ("Function",)
+        elif kind == "class":
+            labels = ("Class",)
+        else:
+            labels = ("Function", "Class")
+        ppr = self._maybe_ppr(focus_file, focus_symbol)
+        q_tokens = tokenize(query)
+        words = re.findall(r"[A-Za-z0-9_]+", query)
+        fts_q = " ".join(dict.fromkeys(q_tokens + [w.lower() for w in words]))
+        qlow = query.lower().strip()
+        results: list[dict] = []
+
+        # -- sub-chunk leg: best chunk similarity per parent --------------
+        chunk_vec = self._safe(lambda: self.db.vector_topk("Chunk", qv, k * 2), [])
+        chunk_kw = self._safe(lambda: self.db.fts_topk("Chunk", fts_q, k), []) if fts_q else []
+        cids = list({i for i, _ in chunk_vec} | {i for i, _ in chunk_kw})
+        crow: dict[int, dict] = {}
+        if cids:
+            for r in self.db.fetch_all(
+                "MATCH (c:Chunk) WHERE c.id IN $ids RETURN c.id AS id, c.parent_qname AS pq, "
+                "c.parent_label AS pl, c.file AS file, c.line_start AS line, "
+                "substring(c.body, 1, 400) AS body, c.embedding AS e", {"ids": cids}):
+                crow[r["id"]] = r
+        chunk_sim: dict[int, float] = {}
+        for cid, r in crow.items():
+            e = r.get("e")
+            chunk_sim[cid] = float(np.dot(self._unit(e), qv)) if e is not None else 0.0
+        chunk_max: dict[str, float] = {}
+        for cid, r in crow.items():
+            if r.get("pl") in ("Function", "Class"):
+                q = r.get("pq")
+                if q and chunk_sim[cid] > chunk_max.get(q, -1.0):
+                    chunk_max[q] = chunk_sim[cid]
+        chunk_kw_rank = {cid: i for i, (cid, _s) in enumerate(chunk_kw)}
+
+        for label in labels:
+            vec = self._safe(lambda: self.db.vector_topk(label, qv, k), [])
+            kw = self._safe(lambda: self.db.fts_topk(label, fts_q, k), []) if fts_q else []
+            ids = {i for i, _ in vec} | {i for i, _ in kw}
+            if qlow:
+                ids |= {r["id"] for r in self._safe(lambda: self.db.fetch_all(
+                    f"MATCH (n:{label}) WHERE lower(n.name) = $q RETURN n.id AS id LIMIT 50",
+                    {"q": qlow}), [])}
+            parents = [q for q in chunk_max if q]
+            if parents:
+                ids |= {r["id"] for r in self._safe(lambda: self.db.fetch_all(
+                    f"MATCH (n:{label}) WHERE n.qname IN $qs RETURN n.id AS id",
+                    {"qs": parents}), [])}
+            if not ids:
+                continue
+            rows = self.db.fetch_all(
+                f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name, "
+                f"n.qname AS qname, n.file AS file, n.line_start AS line_start, "
+                f"substring(n.body, 1, 400) AS body, n.embedding AS embedding, "
+                f"n.pagerank AS pagerank, n.llm_doc AS llm_doc", {"ids": list(ids)})
+            if not rows:
+                continue
+            sims = [float(np.dot(self._unit(r["embedding"]), qv)) if r.get("embedding") is not None
+                    else 0.0 for r in rows]
+            best = [max(s_, chunk_max.get(r["qname"], -1.0)) for r, s_ in zip(rows, sims)]
+            idx_of = {r["id"]: i for i, r in enumerate(rows)}
+            vec_order = sorted(range(len(rows)), key=lambda i: best[i], reverse=True)
+            kw_order = [idx_of[i] for i, _s in kw if i in idx_of]
+            fused = rrf_fuse(vec_order, kw_order)
+            for i, r in enumerate(rows):
+                name_boost = 0.3 if qlow and qlow in (r["name"] or "").lower() else 0.0
+                pr = r.get("pagerank") or 0.0
+                ppr_boost = ppr.get(r["id"], 0.0) if ppr else 0.0
+                rank_term = (ppr_boost * 0.5) if ppr else (pr * 0.1)
+                score = best[i] + name_boost + rank_term + float(fused.get(i, 0.0)) * 8.0
+                _, snippet = self._redact(r["file"], None, (r["body"] or "")[:300])
+                results.append({
+                    "label": label, "id": r["id"], "name": r["name"], "qname": r["qname"],
+                    "file": r["file"], "line": r["line_start"], "snippet": snippet,
+                    "llm_doc": r.get("llm_doc"), "score": float(score), "pagerank": float(pr),
+                    "ppr": float(ppr_boost),
+                })
+
+        # -- file-level hits (plain text, docs, configs, notebook markdown) --
+        if want_files:
+            results.extend(self._file_hits(crow, chunk_sim, chunk_kw, chunk_kw_rank, qlow, ppr))
+
+        results.sort(key=lambda x: x["score"], reverse=True)
+        if rerank and results:
+            try:
+                results = self._reranker_().rerank(query, results[:max(50, limit)],
+                                                   text_key="snippet", top_k=50)
+            except Exception as e:  # noqa: BLE001
+                import logging
+                logging.getLogger(__name__).warning(f"Rerank failed, falling back: {e}")
+        return results[:limit]
+
+    def _file_hits(self, crow: dict[int, dict], chunk_sim: dict[int, float],
+                   chunk_kw: list[tuple[int, float]], chunk_kw_rank: dict[int, int],
+                   qlow: str, ppr: dict | None) -> list[dict]:
+        best_chunk: dict[str, int] = {}
+        for cid, r in crow.items():
+            if r.get("pl") != "File" or not r.get("file"):
+                continue
+            f = r["file"]
+            if f not in best_chunk or chunk_sim[cid] > chunk_sim[best_chunk[f]]:
+                best_chunk[f] = cid
+        if not best_chunk:
+            return []
+        files = list(best_chunk)
+        frows = {r["path"]: r for r in self.db.fetch_all(
+            "MATCH (f:File) WHERE f.path IN $p RETURN f.id AS id, f.path AS path, "
+            "coalesce(f.pagerank, 0.0) AS pr", {"p": files})}
+        order = sorted(files, key=lambda f: chunk_sim[best_chunk[f]], reverse=True)
+        kw_files: list[str] = []
+        kw_best: dict[str, int] = {}
+        for cid, _s in chunk_kw:
+            r = crow.get(cid) or {}
+            f = r.get("file")
+            if r.get("pl") == "File" and f in best_chunk:
+                if f not in kw_best:
+                    kw_best[f] = cid
+                    kw_files.append(f)
+        fused = rrf_fuse(order, kw_files)
+        out: list[dict] = []
+        for f in files:
+            fr = frows.get(f)
+            if fr is None:
+                continue
+            cid = best_chunk[f]
+            show = kw_best.get(f, cid)
+            base = f.rsplit("/", 1)[-1].lower()
+            name_boost = 0.3 if qlow and qlow in base else 0.0
+            pr = float(fr.get("pr") or 0.0)
+            ppr_boost = ppr.get(fr["id"], 0.0) if ppr else 0.0
+            rank_term = (ppr_boost * 0.5) if ppr else (pr * 0.1)
+            score = chunk_sim[cid] + name_boost + rank_term + float(fused.get(f, 0.0)) * 8.0
+            _, snippet = self._redact(f, None, (crow[show].get("body") or "")[:300])
+            out.append({
+                "label": "File", "id": fr["id"], "name": f, "qname": f, "file": f,
+                "line": crow[show].get("line") or 1, "snippet": snippet, "llm_doc": None,
+                "score": float(score), "pagerank": pr, "ppr": float(ppr_boost),
+            })
+        return out
+
+    @staticmethod
+    def _unit(v) -> np.ndarray:
+        a = np.asarray(v, dtype=np.float32)
+        return a / (np.linalg.norm(a) + 1e-9)
+
+    @staticmethod
+    def _safe(fn, default):
+        try:
+            return fn()
+        except Exception:  # noqa: BLE001 - an index hiccup degrades one leg only
+            return default
+
+    def _search_brute(
         self,
         query: str,
         kind: str | None = None,
