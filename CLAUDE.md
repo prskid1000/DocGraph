@@ -53,6 +53,7 @@ GPU off by default; `--gpu` flips embedder to CUDA. `resolve_device(gpu)` return
 - `File` nodes use `path`; every other entity uses `name`. `REFERENCES_` has a trailing underscore (`REFERENCES` is reserved).
 - Bulk: `UNWIND $rows … CREATE` for nodes; `COPY <Edge> FROM arrow (from=,to=)` for edges (`_known_ids` filters dangling endpoints first — COPY hard-errors on missing PKs).
 - A reader holds a lock that blocks writers — kill the host before `docgraph index`. Always `db.close()` before reopening RO; GC alone won't release the lock on Windows after COPY.
+- **`UNWIND nodes(path)` on a backward var-length match with a bound end (`(caller)-[:CALLS*1..N]->(t {name: $x})`) segfaults Kuzu 0.11** on real graphs (N >= 2) and takes the whole host down — no exception to catch. Return the far endpoint instead (every intermediate node is itself an endpoint at a shorter depth). Forward matches from a bound start are fine. The tiny test fixture does not reproduce it.
 
 ## Per-file delta (the trickiest part — read `index.py::index_all`)
 
@@ -69,9 +70,18 @@ GPU off by default; `--gpu` flips embedder to CUDA. `resolve_device(gpu)` return
 - The "restart the host on idle to free the CUDA context" reaper **looped**: the indexer used a non-pooled embedder invisible to `models_status`, so it fired mid-index, hard-killed before the cache write, stranded a Kuzu WAL → every boot re-indexed the same files. Fixed by the daemon (idle-exit there, never the host) + pooled indexer + atomic cache writes. Don't reintroduce a host-restart-for-VRAM path.
 - Non-cp1252 chars in MCP docstrings crash the call on Windows. `type(r)` in Cypher → error (use `label(r)`). `File.path` not `File.name`. Reading a Kuzu writer right after writing → empty (reopen RO). `del db; gc.collect()` won't release the Windows lock after COPY — call `db.close()`. Reasoning LLM endpoint without `reasoning_effort:"none"` → empty content. `str(enum_member)` on a `(str,Enum)` gives `'RootSlug.X'` — use `.value`. Use `is_user_ignored()` for files, `is_ignored()` only for dir pruning.
 
+## Web UI (`docgraph/ui/index.html`)
+
+One self-contained file, read fresh on every `GET /` (edit + reload, no restart). No CDN, no build. Hash routes `#/graph #/search #/wiki #/flows #/changes #/ask #/index`; Ctrl K palette; tokens on `:root` with light/dark; breakpoints 1180 (detail pane → drawer) and 820 (bottom tab bar, explorer drawer, detail bottom sheet).
+- **Every call goes through `request()` / `withRoot()`**, which appends `?root=<slug>` for the active root. Exception: `/api/jobs` — its `root` filter is a repo *path*, so the UI passes `{root:false}` and maps `job.root` back to a slug via `/api/roots`.
+- **The graph page DOM is persistent** (built once; other pages render into `#pg-other`), so the canvas, worker layout and selection survive page switches. Engine: the Web Worker (`WORKER_SRC`, FA2-style + label propagation) is the same as the pre-redesign UI; render batches by colour, culls to the viewport and labels only the top-N by PageRank for the zoom level. Keep it that way — real roots have thousands of nodes.
+- Graph load: `/api/graph?limit_nodes=50000` (all) or `/api/files` (level-of-detail "files first"); a click lazily merges `/api/node_neighbors` (1..3 hops). Colours come from CSS tokens via `readTheme()` — re-read on theme change.
+- Controls the API cannot back are hidden or disabled with a reason (e.g. "Add root": roots are fixed for the host's lifetime). Never render placeholder data.
+- Per-viewer state only in `localStorage` (theme, active root, pane widths, Ask threads, last Cypher query), always in try/catch.
+
 ## Testing
 
-`.venv/Scripts/python -m pytest` (~90s, ~250 tests). Notable: `test_cli_flags` locks every flag telecode passes + the env-free contract; `test_daemon` exercises the daemon (ping/embed/rerank/status/idle-exit); `test_embed_fallback` the CUDA→CPU recovery; `test_workspace` the pool + shadow-page recovery. Kuzu writer-visibility: close the writer + reopen RO or test reads come back empty.
+`.venv/Scripts/python -m pytest` (~90s, ~250 tests). `test_index_html` only smoke-checks the UI; exercise UI changes in a real browser against a host on a spare port. Notable: `test_cli_flags` locks every flag telecode passes + the env-free contract; `test_daemon` exercises the daemon (ping/embed/rerank/status/idle-exit); `test_embed_fallback` the CUDA→CPU recovery; `test_workspace` the pool + shadow-page recovery. Kuzu writer-visibility: close the writer + reopen RO or test reads come back empty.
 
 ## Telecode integration
 

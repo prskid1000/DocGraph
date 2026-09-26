@@ -150,3 +150,31 @@ def test_search_with_focus_symbol(retriever):
     assert out  # Should not crash; results returned
     # ppr field present on each result when focus is given
     assert "ppr" in out[0]
+
+
+# --- backward var-length paths (Kuzu nodes(path) segfault regression) ----
+
+
+def test_impact_of_transitive_callers(retriever):
+    # _check_password <- login <- {handle, test_login, ...}: depth 2 must reach
+    # the second ring. The old `UNWIND nodes(path)` form of this backward
+    # match segfaulted Kuzu 0.11 on real graphs and took the host down.
+    out = retriever.impact_of("_check_password", depth=3, limit=50)
+    names = {c.get("name") for c in out["callers"]}
+    assert "login" in names
+    assert names & {"handle", "test_login", "test_login_failure"}
+    for c in out["callers"]:
+        assert {"qname", "name", "file", "line", "pagerank"} <= set(c)
+
+
+def test_impact_of_file_transitive_callers(retriever):
+    out = retriever.impact_of("src/auth.py", depth=3, limit=50)
+    names = {c.get("name") for c in out["callers"]}
+    assert names & {"handle", "test_login", "make_handler"}
+
+
+def test_call_graph_called_by_transitive(retriever):
+    g = retriever.call_graph("_check_password", depth=2)
+    names = {c.get("name") for c in g["called_by"]}
+    assert "login" in names
+    assert names & {"handle", "test_login", "test_login_failure"}

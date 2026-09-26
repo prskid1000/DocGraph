@@ -41,6 +41,11 @@ def test_index_html(client: TestClient):
     r = client.get("/")
     assert r.status_code == 200
     assert "<html" in r.text.lower() or "<!doctype" in r.text.lower()
+    # Single self-contained page: every route + the root-aware api helper, no CDN assets.
+    for route in ("#/graph", "#/search", "#/wiki", "#/flows", "#/changes", "#/ask", "#/index"):
+        assert route in r.text
+    assert "function withRoot(" in r.text
+    assert "<script src=" not in r.text and "<link rel=\"stylesheet\"" not in r.text
 
 
 def test_search(client: TestClient):

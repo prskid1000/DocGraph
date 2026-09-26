@@ -166,9 +166,10 @@ def test_watch_filter_accepts_python(tmp_path: Path):
 def test_watch_filter_rejects_unsupported_extension(tmp_path: Path):
     from docgraph.watch import _is_relevant
     cfg = load_config(tmp_path)
-    p = tmp_path / "notes.md"
+    # Markdown is indexed by the document pass now, so use an extension no
+    # pass recognises.
+    p = tmp_path / "notes.zzunknown"
     p.write_text("hi")
-    # Markdown isn't in EXT_TO_LANG
     assert _is_relevant(cfg, p) is False
 
 
@@ -409,7 +410,7 @@ def test_embedder_cache_isolates_different_models():
     from docgraph.embed import _MODEL_CACHE, _cache_key, clear_model_cache
 
     clear_model_cache()
-    k1 = _cache_key("model-a", None)
-    k2 = _cache_key("model-b", None)
-    k3 = _cache_key("model-a", ["CUDAExecutionProvider"])
+    k1 = _cache_key("model-a", None, "auto")
+    k2 = _cache_key("model-b", None, "auto")
+    k3 = _cache_key("model-a", "cuda", "auto")
     assert k1 != k2 and k1 != k3 and k2 != k3

@@ -145,7 +145,7 @@ def make_app(workspace: Workspace) -> FastAPI:
     # SSE (would deadlock — consumer waits for events emitted AFTER the
     # write completes) and the chat endpoint (LLM-only, no DB).
     _GATE_SKIP_PREFIXES = (
-        "/api/jobs/", "/api/admin/cancel", "/api/admin/models_status",
+        "/api/jobs", "/api/admin/cancel", "/api/admin/models_status",
         "/api/locks", "/api/roots", "/api/llm_config", "/api/events",
         "/api/chat", "/api/file_content",
     )

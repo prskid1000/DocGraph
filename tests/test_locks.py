@@ -288,3 +288,24 @@ def test_read_gate_skips_jobs_endpoint(tmp_path: Path):
             _t.sleep(0.2)
         else:
             pytest.fail("index never finished")
+
+
+def test_read_gate_skips_jobs_list_endpoint(tmp_path: Path):
+    """GET /api/jobs (the list, no trailing id) is in-memory state too: the
+    web UI polls it while an index holds the writer, so it must not wait on
+    the read gate (which would 503 after read_wait)."""
+    import time as _t
+    cfg = _setup_repo(tmp_path)
+    ws = Workspace([cfg])
+    app = make_app(ws)
+    with TestClient(app) as client:
+        ws.take_writer(cfg.repo_root)
+        try:
+            t0 = _t.monotonic()
+            r = client.get("/api/jobs")
+            elapsed = _t.monotonic() - t0
+        finally:
+            ws.release_writer(cfg.repo_root)
+        assert r.status_code == 200
+        assert isinstance(r.json(), list)
+        assert elapsed < ws.lock_timeouts.read_wait

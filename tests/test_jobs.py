@@ -164,7 +164,8 @@ def test_wiki_job_params(tmp_path: Path, monkeypatch):
     
     captured_params = {}
     from docgraph.wiki import WikiPage
-    def mock_build_wiki(cfg, db, model, only, llm_cfg, force, depth, token, progress_cb):
+    def mock_build_wiki(cfg, db, model, only, llm_cfg, force, depth, token, progress_cb,
+                        fetch_links=True, force_fetch=False):
         captured_params.update({
             "force": force,
             "depth": depth,

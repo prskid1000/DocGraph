@@ -45,11 +45,18 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 ### Watcher + UI
 
-- **Live graph UI** — single HTML file, no build step. ForceAtlas2-lite + label-propagation community detection runs in a **Web Worker**; render is Canvas 2D, batched and viewport-culled — comfortable up to ~10k nodes.
+- **Web UI** — one self-contained HTML file (`docgraph/ui/index.html`), no build step, no CDN. Seven pages on hash routes, a root picker, a `Ctrl K` / `/` jump palette, light/dark, and a layout that works on desktop (three panes with drag handles), tablet (detail drawer) and phone (bottom tab bar, explorer drawer, detail bottom sheet):
+  - **Graph** (`#/graph`) — ForceAtlas2-lite layout + label-propagation communities in a **Web Worker**; Canvas 2D render batched by colour, viewport-culled, labels capped by PageRank — comfortable up to ~10k nodes. Explore (filter loaded nodes, Enter = semantic search), Filters (node/edge types, focus depth, colour by kind or community, level of detail), Files. The detail pane has Overview (definition, AI summary, references, related, community, matching rules), Code (source with Preview for Markdown/HTML), Calls (call graph, depth 1–3), Impact (`impact_of` + `test_impact`, copyable pytest command) and History (`git_recent` + `git_blame`).
+  - **Search** (`#/search`) — hybrid search with kind chips, optional rerank and "near the selection" boost, with a source preview; or a read-only **Cypher** console.
+  - **Wiki** (`#/wiki`) — module pages with a table of contents and sources; build missing pages, rebuild all, or rebuild one page, with live progress.
+  - **Flows** (`#/flows`) — detected entry points and their call chains.
+  - **Changes** (`#/changes`) — `git_changes` for the working tree, the last commit, `main` or any ref/commit: changed symbols, their callers, the file's blast radius, tests to run, and the diff.
+  - **Ask** (`#/ask`) — chat with the configured LLM, with a symbol's source attached as context; threads are kept in the viewer's browser.
+  - **Index** (`#/index`) — roots with counts and status, index/wiki/fetch jobs with live phase progress and cancel, model load state, sibling repos and external links, locks, a Cypher console, and a confirmed "clear index".
 - **Detail Level / progressive reveal** — start with all `File` nodes; click any node to reveal 1-hop neighbors. Skim a 10k-node graph as a hub-and-spoke first, drill in only where you care.
 - **Color modes** — by **kind** (Function / Class / File / …) or by **community** (auto-clustered, no LLM).
-- **Process detection** — entry-point → leaf call chains, surfaced in the **Processes** tab.
-- **LLM-grounded wiki** — the **Wiki** tab generates one Markdown page per top-level module from a Kuzu fact sheet (top classes / functions by PageRank, importers, tests). CLI: `docgraph wiki`. Falls back to a plain rendering when the LLM is unreachable.
+- **Process detection** — entry-point → leaf call chains, surfaced on the **Flows** page.
+- **LLM-grounded wiki** — the **Wiki** page generates one Markdown page per top-level module from a Kuzu fact sheet (top classes / functions by PageRank, importers, tests). CLI: `docgraph wiki`. Falls back to a plain rendering when the LLM is unreachable.
 - **Watcher** — `docgraph host --watch <root>` auto-reindexes on file changes (Rust `notify`, debounced). The browser refreshes itself via SSE at `/api/events` — no F5, no polling.
 - **Phase progress bars** — every index phase (parse, embed entities, embed chunks, write nodes, build symbol table, resolve edges, `SIMILAR_TO`, `CO_CHANGED_WITH`, `TESTS`, PageRank, persist) reports `% | M/N | elapsed | ETA`.
 
@@ -67,7 +74,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 - **LLM-augmented docstrings (opt-in)** — `--llm-model <name>` enables it; talks to any OpenAI- or Anthropic-compatible local server (LM Studio, llama.cpp, vLLM, Ollama). DocGraph sends `reasoning_effort=none` so reasoning models (Qwen3, DeepSeek-R1) skip thinking and one-sentence summaries fit in a 150-token budget. Cached by body hash.
 - **LLM-grounded wiki (opt-in)** — `docgraph wiki` walks every top-level module, builds a fact sheet from Kuzu, and asks the same local LLM to write a 200-300 word Markdown page per module. Saved to `.docgraph/wiki/<slug>.md` and shown in the Web UI.
-- **Right-panel Chat tab (opt-in)** — when `--llm-model` is set, the Web UI's right panel adds a **Chat** tab next to **Detail**. It POSTs `/api/chat` against the same configured local LLM, renders Markdown + JSON in replies, and — when an entity is selected in the graph — automatically attaches that entity's snippet/file/language as a system-message preamble so the model has the source without any copy-paste. Chat output isn't capped on OpenAI-compatible servers (the model writes until done); the meta line tracks the active root and re-pulls config when you switch the root selector. The tab stays hidden when no LLM is configured.
+- **Ask page (chat)** — the Web UI's **Ask** page POSTs `/api/chat` against the same configured local LLM and renders Markdown + JSON in replies. **Ask about this** on a graph node (or **+ Context** on the page) attaches that entity's snippet/file/language as a system-message preamble, so the model has the source without any copy-paste; inline `code` that names an indexed symbol links back to the graph. Chat output isn't capped on OpenAI-compatible servers (the model writes until done); the meta line shows the model and the active root. Threads live in the viewer's browser (`localStorage`), not on the host.
 
 ## Performance
 
@@ -342,7 +349,7 @@ docgraph/
   server.py          # FastAPI host: web UI + JSON API + SSE + FastMCP at /mcp
   watch.py           # per-root async awatch; one workspace-wide reindex semaphore
   wiki.py            # LLM-grounded module wiki + set_wiki_prompt_tail(text) override
-  ui/index.html      # single-page force-directed canvas viewer (zero deps)
+  ui/index.html      # the whole web UI: 7 hash-routed pages + Web Worker graph (zero deps)
 ```
 
 Data lives at `<repo>/.docgraph/`:
@@ -383,9 +390,12 @@ Every retriever route accepts a `root=<slug>` query parameter. The slug is one o
 | `GET /api/file_content?file=...` | Source text for inspection (sandboxed; redacts `.cursorignore`'d files) |
 | `GET /api/processes?limit=&max_chain_len=` | Detected entry-point → call chains |
 | `GET /api/wiki/list`, `?slug=`, `POST /api/wiki/build` | Wiki pages (resumable; `force=true` rebuilds) |
-| `GET /api/llm_config` | Reports the active root's LLM augmentation knobs — `{configured, host, port, model, format, max_tokens, has_key}`. The web UI uses this to gate the right-panel **Chat** tab. |
+| `GET /api/llm_config` | Reports the active root's LLM augmentation knobs — `{configured, host, port, model, format, max_tokens, has_key}`. The web UI's Ask page and Index page show it. |
 | `POST /api/chat` (`{messages, context?, max_tokens?}`) | Multi-turn chat through the configured LLM. `messages` is an OpenAI-shaped `[{role, content}, …]` list. `context` (optional) is `{name, file, language, snippet}` and is injected as a system-message preamble so the model sees the entity's source. `max_tokens` is optional — omitted by default for OpenAI-compatible servers (model writes until done); Anthropic format forces a generous default since the API requires one. Returns `{content, model}`. |
-| `GET /api/events` | SSE stream. Emits `reindex_done` after every reindex; the bundled UI uses it to auto-refresh. Keepalive every 15 s. |
+| `GET /api/events` | SSE stream. Emits `reindex_done` after every reindex (the bundled UI reloads the graph), plus `index_progress` / `wiki_progress` `{job_id, repo_slug, phase, current, total}` during jobs (the UI's progress bars). Keepalive every 15 s. |
+| `GET /api/jobs`, `GET /api/jobs/{id}`, `POST /api/jobs/{id}/cancel` | Index / wiki / fetch jobs of this host process (`?root=` filters by repo **path**). In-memory, so they skip the read gate. |
+| `GET/POST/DELETE /api/repos`, `GET/POST/DELETE /api/links`, `POST /api/links/fetch` | Sibling repo paths and external links of a root (the Index page's Sources card). |
+| `GET /api/locks`, `GET /api/admin/models_status` | Writer-lock state per root and pooled embedder/reranker load state. |
 
 ## Comparison
 

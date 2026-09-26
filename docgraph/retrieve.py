@@ -306,10 +306,14 @@ class Retriever:
         # Backward callers
         try:
             backward_rows = self.db.fetch_all(
-                f"MATCH path = (caller)-[:CALLS*1..{depth}]->(start:Function) "
+                # Endpoint form, not `UNWIND nodes(path)`: Kuzu 0.11 segfaults
+                # (kills the host) on nodes(path) of a backward var-length
+                # match with a bound end. Every intermediate node is itself a
+                # caller at a shorter depth, so the endpoints cover them.
+                f"MATCH (caller)-[:CALLS*1..{depth}]->(start:Function) "
                 f"WHERE start.name = $name "
-                f"UNWIND nodes(path) AS n RETURN DISTINCT n.qname AS qname, n.name AS name, "
-                f"n.file AS file, n.line_start AS line",
+                f"RETURN DISTINCT caller.qname AS qname, caller.name AS name, "
+                f"caller.file AS file, caller.line_start AS line",
                 {"name": name},
             )
         except Exception:
@@ -569,11 +573,12 @@ class Retriever:
             # Transitive callers of any function in this file
             try:
                 rows = self.db.fetch_all(
-                    f"MATCH path = (caller:Function)-[:CALLS*1..{depth}]->(callee:Function) "
+                    # Endpoint form -- see call_graph (Kuzu nodes(path) segfault).
+                    f"MATCH (caller:Function)-[:CALLS*1..{depth}]->(callee:Function) "
                     f"WHERE callee.file = $t "
-                    f"UNWIND nodes(path) AS n "
-                    f"RETURN DISTINCT n.qname AS qname, n.name AS name, n.file AS file, "
-                    f"n.line_start AS line, coalesce(n.pagerank,0.0) AS pagerank "
+                    f"RETURN DISTINCT caller.qname AS qname, caller.name AS name, "
+                    f"caller.file AS file, caller.line_start AS line, "
+                    f"coalesce(caller.pagerank,0.0) AS pagerank "
                     f"ORDER BY pagerank DESC LIMIT $lim",
                     {"t": target, "lim": limit},
                 )
@@ -594,11 +599,12 @@ class Retriever:
             # Symbol path
             try:
                 out["callers"] = self.db.fetch_all(
-                    f"MATCH path = (caller)-[:CALLS*1..{depth}]->(target:Function) "
+                    # Endpoint form -- see call_graph (Kuzu nodes(path) segfault).
+                    f"MATCH (caller)-[:CALLS*1..{depth}]->(target:Function) "
                     f"WHERE target.name = $t "
-                    f"UNWIND nodes(path) AS n RETURN DISTINCT n.qname AS qname, n.name AS name, "
-                    f"n.file AS file, n.line_start AS line, "
-                    f"coalesce(n.pagerank,0.0) AS pagerank "
+                    f"RETURN DISTINCT caller.qname AS qname, caller.name AS name, "
+                    f"caller.file AS file, caller.line_start AS line, "
+                    f"coalesce(caller.pagerank,0.0) AS pagerank "
                     f"ORDER BY pagerank DESC LIMIT $lim",
                     {"t": target, "lim": limit},
                 )
