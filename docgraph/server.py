@@ -26,7 +26,8 @@ from pathlib import Path
 from typing import AsyncIterator, Any
 
 from fastapi import FastAPI, HTTPException, Query, Request
-from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, ORJSONResponse, StreamingResponse
+from starlette.middleware.gzip import GZipMiddleware
 
 from docgraph.cancel import OperationCancelled
 from docgraph.db import DatabaseBusy
@@ -109,14 +110,27 @@ def make_app(workspace: Workspace) -> FastAPI:
         # runs the API/MCP handlers — the task is cancelled in
         # `workspace.close()` on shutdown.
         workspace.start_idle_unloader_async()
+        # Warm the embedding model, keyword index, vector index pages and
+        # tile arrays in the background, so the first search / graph view
+        # does not pay model load + cold pages (honours idle-unload: an idle
+        # model is still evicted after its window).
+        workspace.start_warmup()
         async with mcp_http.lifespan(_app):
             yield
 
-    app = FastAPI(title="DocGraph", version="2.2.0", lifespan=_lifespan)
+    app = FastAPI(title="DocGraph", version="2.2.0", lifespan=_lifespan,
+                  default_response_class=ORJSONResponse)
     RootSlug = _root_enum(workspace)
     DEFAULT = RootSlug(workspace.default_slug())
 
+    # Big JSON bodies (files / processes / graph dumps) are gzip'd for
+    # clients that accept it; SSE is never buffered (Starlette excludes
+    # text/event-stream) and tiles opt out (already dense binary).
+    app.add_middleware(GZipMiddleware, minimum_size=16_384, compresslevel=5)
     app.state.workspace = workspace
+    # a tile generation patched / rebuilt in the background -> the UI reloads
+    workspace.on_tiles_ready = lambda slug, gen: broadcast(app, "tiles_ready", {
+        "repo_slug": slug, "generation": int(gen)})
     app.state.subscribers = []  # list[asyncio.Queue]
     app.state.mcp = mcp_server
 
@@ -138,6 +152,42 @@ def make_app(workspace: Workspace) -> FastAPI:
             content={"error": "lock_timeout", "detail": str(exc)},
             headers={"Retry-After": "2"},
         )
+
+    # Responses of these GET routes depend only on the indexed graph (and the
+    # query string): they carry an ETag derived from the root's index
+    # generation, and a matching If-None-Match is answered 304 without
+    # recomputing anything. Routes reading the working tree / git / live
+    # status are excluded.
+    _ETAG_SKIP = (
+        "/api/events", "/api/jobs", "/api/locks", "/api/roots", "/api/admin", "/api/tiles",
+        "/api/file_content", "/api/detect_changes", "/api/health", "/api/symbol_history",
+        "/api/llm_config", "/api/chat", "/api/git_", "/api/index_info", "/api/repos",
+        "/api/links", "/api/wiki", "/api/rules_for", "/api/maintenance",
+    )
+
+    @app.middleware("http")
+    async def _gen_etag(request: Request, call_next):
+        path = request.url.path
+        if request.method != "GET" or not path.startswith("/api/") or \
+                any(path.startswith(p) for p in _ETAG_SKIP):
+            return await call_next(request)
+        slug = request.query_params.get("root")
+        try:
+            slot = workspace.resolve(slug) if slug else workspace.default()
+        except KeyError:
+            return await call_next(request)
+        import hashlib as _hl
+        stamp = f"{slot.last_indexed_at}|{getattr(slot.live, 'generation', 0)}|{id(slot.retriever)}"
+        q = "&".join(sorted(f"{k}={v}" for k, v in request.query_params.multi_items()))
+        tag = '"g' + _hl.blake2b(f"{stamp}|{path}?{q}".encode(), digest_size=10).hexdigest() + '"'
+        if request.headers.get("if-none-match") == tag:
+            from fastapi.responses import Response as _R
+            return _R(status_code=304, headers={"ETag": tag, "Cache-Control": "no-cache"})
+        resp = await call_next(request)
+        if resp.status_code == 200 and "etag" not in resp.headers:
+            resp.headers["ETag"] = tag
+            resp.headers.setdefault("Cache-Control", "no-cache")
+        return resp
 
     # Paths that don't touch the graph DB — skip the read gate so a
     # status poll (e.g. /api/jobs/<id> while an index is running) doesn't
@@ -251,8 +301,8 @@ def make_app(workspace: Workspace) -> FastAPI:
         # Per-call ?rerank= wins; otherwise fall back to cfg.rerank_default
         # (set via DOCGRAPH_RERANK_DEFAULT env var or telecode tray toggle).
         use_rerank = rerank if rerank is not None else bool(getattr(slot.cfg, "rerank_default", False))
-        results = slot.retriever.search(
-            q, kind=kind, limit=limit,
+        results = await asyncio.to_thread(
+            slot.retriever.search, q, kind=kind, limit=limit,
             focus_file=focus_file, focus_symbol=focus_symbol, rerank=use_rerank,
         )
         log.info(
@@ -264,53 +314,53 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.get("/api/definition")
     async def api_definition(name: str, file: str | None = None,
                               root: RootSlug = DEFAULT):
-        return _r(root).definition(name, file=file)
+        return await asyncio.to_thread(_r(root).definition, name, file=file)
 
     @app.get("/api/references")
     async def api_references(name: str, root: RootSlug = DEFAULT):
-        return _r(root).references(name)
+        return await asyncio.to_thread(_r(root).references, name)
 
     @app.get("/api/call_graph")
     async def api_call_graph(name: str, depth: int = 2, min_confidence: float = 0.0,
                              root: RootSlug = DEFAULT):
-        return _r(root).call_graph(name, depth=depth, min_confidence=min_confidence)
+        return await asyncio.to_thread(_r(root).call_graph, name, depth=depth, min_confidence=min_confidence)
 
     @app.get("/api/file_map")
     async def api_file_map(file: str, root: RootSlug = DEFAULT):
-        return _r(root).file_map(file)
+        return await asyncio.to_thread(_r(root).file_map, file)
 
     @app.get("/api/neighborhood")
     async def api_neighborhood(name: str, limit: int = 10, root: RootSlug = DEFAULT):
-        return _r(root).neighborhood(name, limit=limit)
+        return await asyncio.to_thread(_r(root).neighborhood, name, limit=limit)
 
     @app.get("/api/explore")
     async def api_explore(seeds: str, hops: int = 3, limit: int = 25,
                            min_confidence: float = 0.0, root: RootSlug = DEFAULT):
         seed_list = [s.strip() for s in seeds.split(",") if s.strip()]
-        return _r(root).explore(seeds=seed_list, hops=hops, limit=limit,
+        return await asyncio.to_thread(_r(root).explore, seeds=seed_list, hops=hops, limit=limit,
                                 min_confidence=min_confidence)
 
     @app.get("/api/impact_of")
     async def api_impact_of(target: str, depth: int = 3, limit: int = 50,
                              min_confidence: float = 0.0, root: RootSlug = DEFAULT):
-        return _r(root).impact_of(target, depth=depth, limit=limit,
+        return await asyncio.to_thread(_r(root).impact_of, target, depth=depth, limit=limit,
                                   min_confidence=min_confidence)
 
     @app.get("/api/test_impact")
     async def api_test_impact(target: str, limit: int = 25, min_confidence: float = 0.0,
                               root: RootSlug = DEFAULT):
-        return _r(root).test_impact(target, limit=limit, min_confidence=min_confidence)
+        return await asyncio.to_thread(_r(root).test_impact, target, limit=limit, min_confidence=min_confidence)
 
     @app.get("/api/processes")
     async def api_processes(limit: int = 25, max_chain_len: int = 8,
                              min_confidence: float = 0.0, root: RootSlug = DEFAULT):
-        return _r(root).processes(limit=limit, max_chain_len=max_chain_len,
+        return await asyncio.to_thread(_r(root).processes, limit=limit, max_chain_len=max_chain_len,
                                   min_confidence=min_confidence)
 
     @app.get("/api/flow")
     async def api_flow(id: int, max_chain_len: int = 8, min_confidence: float = 0.0,
                        root: RootSlug = DEFAULT):
-        out = _r(root).flow(int(id), max_chain_len=max_chain_len, min_confidence=min_confidence)
+        out = await asyncio.to_thread(_r(root).flow, int(id), max_chain_len=max_chain_len, min_confidence=min_confidence)
         if not out:
             raise HTTPException(404, "flow not found")
         return out
@@ -341,12 +391,12 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.get("/api/clusters")
     async def api_clusters(limit: int = 100, root: RootSlug = DEFAULT):
-        return _r(root).list_clusters(limit=limit)
+        return await asyncio.to_thread(_r(root).list_clusters, limit=limit)
 
     @app.get("/api/cluster")
     async def api_cluster(id: int | None = None, name: str | None = None, limit: int = 200,
                           root: RootSlug = DEFAULT):
-        out = _r(root).cluster(id=id, name=name, limit=limit)
+        out = await asyncio.to_thread(_r(root).cluster, id=id, name=name, limit=limit)
         if not out.get("found") and not out.get("reindex_required"):
             raise HTTPException(404, "cluster not found")
         return out
@@ -358,12 +408,12 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.get("/api/api_impact")
     async def api_api_impact(route: str, depth: int = 4, min_confidence: float = 0.0,
                              root: RootSlug = DEFAULT):
-        return _r(root).api_impact(route, depth=depth, min_confidence=min_confidence)
+        return await asyncio.to_thread(_r(root).api_impact, route, depth=depth, min_confidence=min_confidence)
 
     @app.get("/api/trace")
     async def api_trace(a: str, b: str, max_depth: int = 8, min_confidence: float = 0.0,
                         root: RootSlug = DEFAULT):
-        return _r(root).trace(a, b, max_depth=max_depth, min_confidence=min_confidence)
+        return await asyncio.to_thread(_r(root).trace, a, b, max_depth=max_depth, min_confidence=min_confidence)
 
     @app.get("/api/health")
     async def api_health(limit: int = 15, min_confidence: float = 0.5, root: RootSlug = DEFAULT):
@@ -397,7 +447,7 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.get("/api/index_info")
     async def api_index_info(root: RootSlug = DEFAULT):
-        return _r(root).index_info()
+        return await asyncio.to_thread(_r(root).index_info)
 
     @app.get("/api/wiki/list")
     async def api_wiki_list(root: RootSlug = DEFAULT):
@@ -474,37 +524,37 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.post("/api/cypher")
     async def api_cypher(payload: dict, root: RootSlug = DEFAULT):
-        return _r(root).cypher(payload.get("query", ""), limit=int(payload.get("limit", 100)))
+        return await asyncio.to_thread(_r(root).cypher, payload.get("query", ""), limit=int(payload.get("limit", 100)))
 
     @app.get("/api/git_changes")
     async def api_git_changes(ref: str | None = None, root: RootSlug = DEFAULT):
-        return _r(root).git_changes(ref=ref)
+        return await asyncio.to_thread(_r(root).git_changes, ref=ref)
 
     @app.get("/api/git_blame")
     async def api_git_blame(file: str, line_start: int = 1,
                              line_end: int | None = None, root: RootSlug = DEFAULT):
-        return _r(root).git_blame(file, line_start=line_start, line_end=line_end)
+        return await asyncio.to_thread(_r(root).git_blame, file, line_start=line_start, line_end=line_end)
 
     @app.get("/api/git_recent")
     async def api_git_recent(file: str | None = None, limit: int = 20,
                               root: RootSlug = DEFAULT):
-        return _r(root).git_recent(file=file, limit=limit)
+        return await asyncio.to_thread(_r(root).git_recent, file=file, limit=limit)
 
     @app.get("/api/rules_for")
     async def api_rules_for(file: str, root: RootSlug = DEFAULT):
-        return _r(root).rules_for(file)
+        return await asyncio.to_thread(_r(root).rules_for, file)
 
     @app.get("/api/graph")
     async def api_graph(limit_nodes: int = 10000, root: RootSlug = DEFAULT):
-        return _r(root).graph_dump(limit_nodes=limit_nodes)
+        return await asyncio.to_thread(_r(root).graph_dump, limit_nodes=limit_nodes)
 
     @app.get("/api/files")
     async def api_files(edges: bool = True, root: RootSlug = DEFAULT):
-        return _r(root).files_dump(edges=edges)
+        return await asyncio.to_thread(_r(root).files_dump, edges=edges)
 
     @app.get("/api/node_neighbors")
     async def api_node_neighbors(id: int, hops: int = 1, root: RootSlug = DEFAULT):
-        out = _r(root).node_neighbors(int(id), hops=hops)
+        out = await asyncio.to_thread(_r(root).node_neighbors, int(id), hops=hops)
         # World positions for neighbours that sit in tiles the UI has not
         # loaded (drawn as ghost nodes).
         store = _tile_store(_slot(root))
@@ -522,12 +572,7 @@ def make_app(workspace: Workspace) -> FastAPI:
     app.state.tile_stores = {}
 
     def _tile_store(slot: RootSlot):
-        from docgraph.tiles import TileStore
-        st = app.state.tile_stores.get(slot.slug)
-        if st is None:
-            st = TileStore(slot.cfg.data_dir / "tiles")
-            app.state.tile_stores[slot.slug] = st
-        return st
+        return slot.tile_store
 
     def _parse_kinds(spec: str | None, names: list[str]) -> set[int] | None:
         if not spec:
@@ -558,7 +603,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             edge_kinds=_parse_kinds(edges, T.EDGE_KINDS),
             node_kinds=_parse_kinds(kinds, T.NODE_KINDS), min_conf=float(min_conf))
         tag = f'"{etag}"'
-        headers = {"ETag": tag, "Cache-Control": "no-cache"}
+        headers = {"ETag": tag, "Cache-Control": "no-cache", "Content-Encoding": "identity"}
         if request.headers.get("if-none-match") == tag:
             return Response(status_code=304, headers=headers)
         return Response(content=body, media_type="application/octet-stream", headers=headers)
@@ -566,8 +611,10 @@ def make_app(workspace: Workspace) -> FastAPI:
     @app.get("/api/tiles/batch")
     async def api_tiles_batch(keys: str, lod: str | None = None, edges: str | None = None,
                               kinds: str | None = None, min_conf: float = 0.0, budget: int = 0,
-                              root: RootSlug = DEFAULT):
-        """keys = "level/x/y,level/x/y,..." (at most 256) -> framed binary."""
+                              have: str | None = None, root: RootSlug = DEFAULT):
+        """keys = "level/x/y,level/x/y,..." (at most 256) -> framed binary.
+        have = the ETags the client holds, aligned with keys ("" for none):
+        an unchanged tile comes back as an empty frame carrying its ETag."""
         from fastapi.responses import Response
         from docgraph import tiles as T
         store = _tile_store(_slot(root))
@@ -584,17 +631,21 @@ def make_app(workspace: Workspace) -> FastAPI:
                 except ValueError:
                     continue
 
+        held = [h.strip().strip('"') for h in (have or "").split(",")] if have else []
+
         def _build() -> bytes:
             items = []
-            for lv, tx, ty in want:
+            for i, (lv, tx, ty) in enumerate(want):
                 body, etag = store.tile(lv, tx, ty, lod=lod, budget=budget or T.TILE_BUDGET,
                                         edge_kinds=ek, node_kinds=nk, min_conf=float(min_conf))
+                if i < len(held) and held[i] == etag:
+                    body = b""
                 items.append((lv, tx, ty, body, etag))
             return T.frame_batch(items)
 
         payload = await asyncio.to_thread(_build)
         return Response(content=payload, media_type="application/octet-stream",
-                        headers={"Cache-Control": "no-store"})
+                        headers={"Cache-Control": "no-store", "Content-Encoding": "identity"})
 
     @app.get("/api/tiles/bbox")
     async def api_tiles_bbox(x0: float, y0: float, x1: float, y1: float, level: int,
@@ -639,7 +690,7 @@ def make_app(workspace: Workspace) -> FastAPI:
 
         payload = await asyncio.to_thread(_build)
         return Response(content=payload, media_type="application/octet-stream",
-                        headers={"Cache-Control": "no-store"})
+                        headers={"Cache-Control": "no-store", "Content-Encoding": "identity"})
 
     @app.get("/api/tiles/locate")
     async def api_tiles_locate(ids: str, root: RootSlug = DEFAULT):
@@ -819,6 +870,9 @@ def make_app(workspace: Workspace) -> FastAPI:
             except Exception:
                 pass
 
+        paths = (payload or {}).get("paths")
+        changed_paths = [str(x) for x in paths] if isinstance(paths, list) and not full else None
+
         def _do() -> tuple[dict, str]:
             # Indexer.index_all() prints Rich progress bars. We capture
             # them so the response can return both the stats dict AND a
@@ -827,28 +881,12 @@ def make_app(workspace: Workspace) -> FastAPI:
             # related crashes if the host runs in a non-utf-8 console.
             import io, contextlib
             sink = io.StringIO()
-            writer = workspace.take_writer(slot.cfg.repo_root)
-            indexer = None
-            try:
-                writer.init_schema()
-                embedder = workspace._embedder_for(slot.cfg)
-                indexer = Indexer(slot.cfg, writer, embedder=embedder)
-                with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
-                    stats = indexer.index_all(incremental=not full,
-                                               cancel_token=token,
-                                               progress_cb=_progress_cb,
-                                               fetch_links=fetch_links,
-                                               force_fetch=force_fetch)
-                return stats, sink.getvalue()
-            finally:
-                # Also on failure/cancel: a full reindex leaves its own handle
-                # in indexer.db, which would keep the file lock.
-                if indexer is not None and indexer.db is not writer:
-                    try:
-                        indexer.db.close()
-                    except Exception:
-                        pass
-                workspace.release_writer(slot.cfg.repo_root)
+            with contextlib.redirect_stdout(sink), contextlib.redirect_stderr(sink):
+                stats = workspace.index_pass(slot.cfg.repo_root, incremental=not full,
+                                             changed_paths=changed_paths,
+                                             cancel_token=token, progress_cb=_progress_cb,
+                                             fetch_links=fetch_links, force_fetch=force_fetch)
+            return stats, sink.getvalue()
 
         async def _run_job():
             try:
@@ -1018,12 +1056,12 @@ def make_app(workspace: Workspace) -> FastAPI:
         # If a watcher / index / wiki is mid-flight it's holding the writer
         # and clear_data() would refuse. Signal cancel + wait briefly for
         # the writer to release before giving up with 503.
-        if slot.db_writer is not None:
+        if slot.maint.get("writer_taken"):
             workspace.request_cancel(slot.cfg.repo_root)
             deadline = time.time() + 10.0
-            while time.time() < deadline and slot.db_writer is not None:
+            while time.time() < deadline and slot.maint.get("writer_taken"):
                 await asyncio.sleep(0.2)
-            if slot.db_writer is not None:
+            if slot.maint.get("writer_taken"):
                 raise HTTPException(
                     status_code=503,
                     detail="clear blocked: writer still held after 10s — retry",

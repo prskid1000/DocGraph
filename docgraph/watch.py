@@ -29,7 +29,6 @@ from watchfiles import Change, awatch
 
 from docgraph.config import Config, MAX_FILE_BYTES
 # (embedder is sourced from the workspace pool, not constructed here)
-from docgraph.index import Indexer
 from docgraph.parse import classify_file
 from docgraph.workspace import Workspace, slug_for_root
 
@@ -57,7 +56,9 @@ def _is_relevant(cfg: Config, path: Path) -> bool:
     text_ok = bool(getattr(cfg, "text_fallback", True))
     if path.exists():
         if path.is_dir():
-            return False
+            # a directory that appeared (moved / copied in): its files are
+            # indexed by walking it in the indexer's fast path
+            return not cfg.is_ignored(f"{rel}/", root=matched_root)
         try:
             if path.stat().st_size > MAX_FILE_BYTES:
                 return False
@@ -67,6 +68,10 @@ def _is_relevant(cfg: Config, path: Path) -> bool:
     else:
         # Deleted: decide from the name alone (the file can't be sniffed).
         kind = classify_file(path, sniff=False)
+        if kind is None and not path.suffix:
+            # possibly a deleted directory: the indexer drops every cached
+            # file under it
+            return not cfg.is_ignored(f"{rel}/", root=matched_root)
     if kind is None:
         return False
     if kind.startswith("text:") and not text_ok:
@@ -129,7 +134,7 @@ async def _watch_one(
             )
             async with serialize:
                 try:
-                    await asyncio.to_thread(_reindex, workspace, root)
+                    await asyncio.to_thread(_reindex, workspace, root, relevant)
                 except Exception as exc:
                     _console.print(f"[red]Reindex {slot.slug} failed:[/] {exc}")
                     continue
@@ -146,31 +151,18 @@ async def _watch_one(
 
 
 def _baseline_reindex(workspace: Workspace, root: Path) -> None:
-    """Run an incremental index pass on `root`. Used to bring the on-disk
-    DB up to date before the watcher starts emitting deltas."""
-    slot = workspace.resolve(root)
-    writer = workspace.take_writer(root)
-    indexer = None
-    try:
-        # Use the workspace-pooled embedder (not a fresh standalone one) so
-        # in-process mode shares a single model + idle-unload is single-source,
-        # and so daemon routing (Embedder.embed → daemon) applies uniformly.
-        embedder = workspace.embedder_for(slot.cfg)
-        indexer = Indexer(slot.cfg, writer, embedder=embedder)
-        indexer.index_all(incremental=True)
-    finally:
-        # A full reindex (e.g. a schema bump) wipes the DB and reopens it as
-        # indexer.db, a different handle from `writer`; it must be closed too
-        # or the read-only reopen in release_writer cannot take the file lock.
-        if indexer is not None and indexer.db is not writer:
-            indexer.db.close()
-        workspace.release_writer(root)
+    """Run an incremental index pass on `root` (a full walk). Used to bring
+    the on-disk DB up to date before the watcher starts emitting deltas;
+    also primes the root's live state so later passes are proportional."""
+    workspace.index_pass(root, incremental=True, label="watch")
 
 
-def _reindex(workspace: Workspace, root: Path) -> None:
-    """Same as baseline; kept as a separate function so future logic can
-    diverge (e.g. a faster delta-only pass)."""
-    _baseline_reindex(workspace, root)
+def _reindex(workspace: Workspace, root: Path, paths: list[Path] | None = None) -> None:
+    """A watcher-triggered pass: the event paths go straight to the indexer
+    (no directory walk). The indexer falls back to a walk when its scan
+    state is cold or old."""
+    workspace.index_pass(root, incremental=True, label="watch",
+                         changed_paths=[str(p) for p in paths] if paths else None)
 
 
 # ── public entry points ─────────────────────────────────────────────────────
