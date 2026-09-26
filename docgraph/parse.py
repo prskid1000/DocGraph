@@ -1538,3 +1538,28 @@ def _parse_grammar(source: bytes, lang_key: str, rel: str) -> FileParse | None:
         entities=entities,
         edges=raw_edges,
     )
+
+
+def parse_worker(args: tuple) -> dict | None:
+    """ProcessPool entry point (kept in this module so a spawned worker
+    imports tree-sitter only, not the indexer / DB / CLI stack).
+    args = (file_path, repo_root, logical_rel[, text_fallback])."""
+    from dataclasses import asdict
+    file_path, repo_root, rel_override = args[:3]
+    text_fallback = bool(args[3]) if len(args) > 3 else True
+    try:
+        fp = parse_file(Path(file_path), Path(repo_root), rel_override=rel_override,
+                        text_fallback=text_fallback)
+        if fp is None:
+            return None
+        return {
+            "file": fp.file,
+            "language": fp.language,
+            "lines": fp.lines,
+            "entities": [asdict(e) for e in fp.entities],
+            "edges": [asdict(e) for e in fp.edges],
+            "chunks": fp.chunks,
+            "extra": fp.extra,
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"_error": f"{file_path}: {e}"}

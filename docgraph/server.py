@@ -613,7 +613,20 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.get("/api/stats")
     async def api_stats(root: RootSlug = DEFAULT):
+        # Counts are cached on the Retriever, which is replaced after every
+        # reindex -- so this is one pass of count queries per index generation.
         slot = _slot(root)
+        memo = getattr(slot.retriever, "_stats_memo", None)
+        if memo is not None:
+            return memo
+        out = await asyncio.to_thread(_stats_uncached, slot)
+        try:
+            slot.retriever._stats_memo = out
+        except Exception:
+            pass
+        return out
+
+    def _stats_uncached(slot):
         d = slot.db_ro
         rows = d.fetch_all("CALL show_tables() RETURN *")
         out: dict = {"tables": rows, "repo": str(slot.cfg.repo_root)}

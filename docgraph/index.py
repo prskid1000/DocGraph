@@ -228,25 +228,9 @@ def walk_files(cfg: Config) -> list[tuple[Path, str]]:
 # --- Parse worker ---------------------------------------------------------
 
 
-def _parse_worker(args: tuple) -> dict | None:
-    file_path, repo_root, rel_override = args[:3]
-    text_fallback = bool(args[3]) if len(args) > 3 else True
-    try:
-        fp = parse_file(Path(file_path), Path(repo_root), rel_override=rel_override,
-                        text_fallback=text_fallback)
-        if fp is None:
-            return None
-        return {
-            "file": fp.file,
-            "language": fp.language,
-            "lines": fp.lines,
-            "entities": [asdict(e) for e in fp.entities],
-            "edges": [asdict(e) for e in fp.edges],
-            "chunks": fp.chunks,
-            "extra": fp.extra,
-        }
-    except Exception as e:  # noqa: BLE001
-        return {"_error": f"{file_path}: {e}"}
+# The pool worker lives in parse.py so spawned workers import tree-sitter
+# only; the name is kept for callers that import it from here.
+from docgraph.parse import parse_worker as _parse_worker  # noqa: E402
 
 
 _SLIM_DROP = ("body", "signature")
@@ -891,6 +875,11 @@ class Indexer:
         batch_files = max(50, int(getattr(self.cfg, "index_batch_files", 2000) or 2000))
         blame_budget = int(getattr(self.cfg, "history_max_files", 5000) or 0)
         counts = {"files": 0, "classes": 0, "functions": 0, "variables": 0, "chunks": 0}
+        # A large incremental (a branch switch, a big merge) reloads like a
+        # full pass: drop the search indexes so node inserts take the Arrow
+        # COPY path, and let ensure_search_indexes() rebuild them afterwards.
+        if incremental and len(changed) > max(2000, 0.1 * max(1, len(on_disk_rel))):
+            self.db.drop_search_indexes()
         if changed:
             _emit("parse", 0, len(changed))
             parse_emit = _throttled("parse", len(changed))
@@ -1012,17 +1001,21 @@ class Indexer:
         symtab_total = sum(counts.values())
         with _bar() as prog:
             stask = prog.add_task("Building symbol table", total=symtab_total)
+            # Columnar reads (Arrow): no per-row dicts from the DB layer.
             for label in ("Function", "Class", "Variable"):
-                for r in self.db.fetch_all(
-                    f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, "
-                    f"n.qname AS qname, n.file AS file"
-                ):
-                    qname_index[r["qname"]] = (label, r["id"])
-                    name_index[r["name"]].append((label, r["id"], r["file"]))
-                    prog.advance(stask)
-            for r in self.db.fetch_all("MATCH (f:File) RETURN f.id AS id, f.path AS path"):
-                file_index[r["path"]] = r["id"]
-                prog.advance(stask)
+                d = self.db.node_columns(label, {"id": "n.id", "name": "n.name",
+                                                 "qname": "n.qname", "file": "n.file"})
+                if d.get("id") is None:
+                    continue
+                for i, nm, qn, fl in zip(d["id"].tolist(), d["name"].tolist(),
+                                         d["qname"].tolist(), d["file"].tolist()):
+                    qname_index[qn] = (label, i)
+                    name_index[nm].append((label, i, fl))
+                prog.advance(stask, len(d["id"]))
+            d = self.db.node_columns("File", {"id": "n.id", "path": "n.path"})
+            if d.get("id") is not None:
+                file_index.update(zip(d["path"].tolist(), d["id"].tolist()))
+                prog.advance(stask, len(d["id"]))
 
         # Scope-aware resolution (resolve.py). ModuleIndex maps import
         # strings to files (dotted / relative / JS specifiers, suffix
@@ -1187,12 +1180,38 @@ class Indexer:
             existing_fw = {}
         calls_cand_rows: list[dict] = []
 
+        # Incremental scope: an edge from an unchanged file can only need a
+        # (re)insert when it resolves into a changed file, i.e. when its target
+        # name -- directly, through an import alias, or by the fuzzy
+        # underscore-insensitive match -- names an entity of a changed file.
+        # Everything else is skipped without running the cascade, so an
+        # incremental pass resolves O(edges touching the change), not every
+        # edge of the repo. Module-level IMPORTS are cheap and always checked.
+        from docgraph.resolve import _norm as _rnorm
+        scoped = incremental and cache_was_present
+        hot_names: set[str] = set()
+        if scoped:
+            for rel in changed_set:
+                for e in (cache.get(rel) or {}).get("entities", []):
+                    if e.get("name"):
+                        hot_names.add(e["name"])
+        hot_norms = {_rnorm(n) for n in hot_names if len(n) >= 4}
+        n_scoped_skip = 0
+
         # Other edges from cached RawEdges
         for rel, file_data in cache.items():
+            src_changed = rel in changed_set
+            al = aliases.get(rel) if scoped else None
             for raw in file_data.get("edges", []):
                 if prog_resolve is not None:
                     prog_resolve.advance(rtask)
                 kind = raw["kind"]
+                if scoped and not src_changed and kind != "IMPORTS":
+                    t = raw.get("target_name") or ""
+                    if (t not in hot_names and (len(t) < 4 or _rnorm(t) not in hot_norms)
+                            and not (al and al.get(t) in hot_names)):
+                        n_scoped_skip += 1
+                        continue
                 src_qname = raw.get("src_qname")
                 target_name = raw.get("target_name")
                 src_file = rel
@@ -1431,6 +1450,7 @@ class Indexer:
                 self.db.insert_edges("HANDLES", "Route", "Function", handles_route_rows, on_progress=cb)
                 self.db.insert_edges("HANDLES", "Tool", "Function", handles_tool_rows, on_progress=cb)
         resolution_stats = dict(resolver.stats)
+        scope_info = {"scoped": bool(scoped), "skipped_edges": int(n_scoped_skip)}
 
         # ---- Step 8a: optional precise references (SCIP) ----
         scip_status: dict = {}
@@ -1534,6 +1554,7 @@ class Indexer:
         state["resolution"] = resolution_stats
         state["embed_cache"] = {"hits": self.embed_cache_hits, "misses": self.embed_cache_misses}
         state["search_index"] = search_status
+        state["resolution_scope"] = scope_info
         state["scan"] = {"hashed": scan_res.hashed, "reused": scan_res.reused,
                          "root_hash": scan_res.root_hash}
         if n_communities is not None:

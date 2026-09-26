@@ -239,11 +239,43 @@ class DatabaseBusy(RuntimeError):
 MAX_DB_SIZE = 1 << 40
 
 
+def _default_buffer_pool() -> int:
+    """Kuzu's own default buffer pool is 80% of physical RAM, which a big
+    index happily fills. Bound it to a quarter of RAM, at most 4 GB (Kuzu
+    spills to disk beyond the pool)."""
+    try:
+        import ctypes
+
+        class _MS(ctypes.Structure):
+            _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong), ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong), ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong), ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+        m = _MS()
+        m.dwLength = ctypes.sizeof(_MS)
+        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):
+            total = int(m.ullTotalPhys)
+        else:
+            raise OSError
+    except Exception:
+        try:
+            import os as _os
+            total = _os.sysconf("SC_PAGE_SIZE") * _os.sysconf("SC_PHYS_PAGES")
+        except Exception:
+            return 0
+    return int(min(4 << 30, max(512 << 20, total // 4)))
+
+
+BUFFER_POOL_SIZE = _default_buffer_pool()
+
+
 class GraphDB:
     def __init__(self, db_path: Path, embedding_dim: int = 384, read_only: bool = False):
         self.db_path = Path(db_path)
         self.embedding_dim = embedding_dim
-        self.db = kuzu.Database(str(self.db_path), read_only=read_only, max_db_size=MAX_DB_SIZE)
+        self.db = kuzu.Database(str(self.db_path), read_only=read_only, max_db_size=MAX_DB_SIZE,
+                                buffer_pool_size=BUFFER_POOL_SIZE)
         self.conn = kuzu.Connection(self.db)
         # Per-node-table id sets, populated lazily on first edge insert. Used
         # to filter dangling-endpoint rows before COPY FROM (which errors hard
@@ -883,6 +915,17 @@ class GraphDB:
         rows = list(rows)
         if not rows:
             return 0
+        # Bulk path: COPY FROM Arrow is ~75x faster than UNWIND for rows with
+        # an embedding (UNWIND converts every float of every row). Only for
+        # tables without a search index -- Kuzu's FTS index does not see
+        # COPY'd rows, so indexed tables (incremental passes) take UNWIND.
+        if len(rows) >= self.COPY_MIN_ROWS and not self._has_search_index(table):
+            try:
+                return self._copy_nodes(table, rows, batch_size=max(batch_size, 20_000),
+                                        on_progress=on_progress)
+            except Exception as exc:  # noqa: BLE001 - fall back to the portable path
+                import logging
+                logging.getLogger(__name__).debug("COPY %s failed, using UNWIND: %s", table, exc)
         keys = list(rows[0].keys())
         cols = ", ".join(f"{k}: row.{k}" for k in keys)
         cypher = f"UNWIND $rows AS row CREATE (n:{table} {{{cols}}})"
@@ -904,6 +947,62 @@ class GraphDB:
             if on_progress is not None:
                 on_progress(len(slab))
         return n
+
+    COPY_MIN_ROWS = 64
+
+    def _has_search_index(self, table: str) -> bool:
+        have = self.list_indexes()
+        return any(v.get("table") == table for v in have.values())
+
+    def _arrow_type(self, ktype: str):
+        t = ktype.upper()
+        if t.startswith("FLOAT[") or t.startswith("DOUBLE["):
+            return None  # fixed-size list, built separately
+        return {"INT64": pa.int64(), "INT32": pa.int32(), "STRING": pa.string(),
+                "DOUBLE": pa.float64(), "FLOAT": pa.float32(), "BOOL": pa.bool_(),
+                "BOOLEAN": pa.bool_()}.get(t, pa.string())
+
+    def _copy_nodes(self, table: str, rows: list[dict], batch_size: int = 20_000,
+                    on_progress: "Callable[[int], None] | None" = None) -> int:
+        import importlib.util  # noqa: F401 - kuzu's Arrow scan uses it without importing
+        import numpy as np
+        types = {}
+        for r in self.fetch_all(f"CALL table_info('{table}') RETURN *"):
+            types[str(r.get("name"))] = str(r.get("type"))
+        keys = [k for k in rows[0].keys() if k in types]
+        cached = self._known_ids.get(table)
+        for i in range(0, len(rows), batch_size):
+            slab = rows[i:i + batch_size]
+            cols = {}
+            for k in keys:
+                kt = types[k]
+                if "[" in kt:
+                    dim = int(kt[kt.index("[") + 1:-1])
+                    dt = np.float32 if kt.upper().startswith("FLOAT") else np.float64
+                    mat = np.empty((len(slab), dim), dtype=dt)
+                    mask = np.zeros(len(slab), dtype=bool)
+                    for j, r in enumerate(slab):
+                        v = r.get(k)
+                        if v is None:
+                            mask[j] = True
+                            mat[j] = 0
+                        else:
+                            mat[j] = np.asarray(v, dtype=dt)
+                    arr = pa.FixedSizeListArray.from_arrays(pa.array(mat.reshape(-1)), dim)
+                    if mask.any():
+                        arr = pa.FixedSizeListArray.from_arrays(pa.array(mat.reshape(-1)), dim,
+                                                                mask=pa.array(mask))
+                    cols[k] = arr
+                else:
+                    cols[k] = pa.array([r.get(k) for r in slab], type=self._arrow_type(kt))
+            nodes_arrow = pa.table(cols)
+            self.execute(f"COPY {table}({', '.join(keys)}) FROM nodes_arrow")
+            if cached is not None:
+                for r in slab:
+                    cached.add(r["id"])
+            if on_progress is not None:
+                on_progress(len(slab))
+        return len(rows)
 
     def _ensure_known_ids(self, table: str) -> set[int]:
         """Lazy-load the set of existing primary-key ids for a node table.

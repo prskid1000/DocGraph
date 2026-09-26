@@ -1275,6 +1275,19 @@ class Retriever:
     )
 
     def graph_dump(self, limit_nodes: int = 2000) -> dict:
+        """Top-`limit_nodes` subgraph by PageRank (legacy API; the UI streams
+        tiles instead). Memoized per Retriever, i.e. until the next reindex."""
+        memo = getattr(self, "_graph_dump_memo", None)
+        if memo is None:
+            memo = self._graph_dump_memo = {}
+        key = int(limit_nodes)
+        if key not in memo:
+            if len(memo) > 4:
+                memo.clear()
+            memo[key] = self._graph_dump(key)
+        return memo[key]
+
+    def _graph_dump(self, limit_nodes: int = 2000) -> dict:
         # Top-K by PageRank, proportional across labels. Functions get the
         # biggest slice (most numerous + structurally interesting); Files,
         # Classes, Variables share the rest. A 200k-symbol codebase still
@@ -1407,6 +1420,14 @@ class Retriever:
     # ---- clusters --------------------------------------------------------
 
     def list_clusters(self, limit: int = 100) -> dict:
+        memo = getattr(self, "_clusters_memo", None)
+        if memo is None:
+            memo = self._clusters_memo = {}
+        if int(limit) not in memo:
+            memo[int(limit)] = self._list_clusters(int(limit))
+        return memo[int(limit)]
+
+    def _list_clusters(self, limit: int = 100) -> dict:
         import json as _json
         if not self._cap("community"):
             return {"clusters": [], "links": [], "reindex_required": True}
@@ -1721,19 +1742,18 @@ class Retriever:
     def _mem_graph(self) -> dict:
         """The whole CALLS graph + handler / test / method maps in memory,
         loaded once per Retriever (rebuilt after every reindex). Used where
-        a tool would otherwise issue hundreds of 1-hop queries."""
+        a tool would otherwise issue hundreds of 1-hop queries. Adjacency
+        is CSR numpy (Arrow in, ~16 bytes per edge), not a dict of tuples."""
         g = getattr(self, "_mem_graph_cache", None)
         if g is not None:
             return g
         from collections import defaultdict as _dd
-        conf = "coalesce(r.confidence, 1.0)" if self._cap("calls_conf") else "1.0"
-        fwd: dict[int, list] = _dd(list)
-        rev: dict[int, list] = _dd(list)
-        for r in self.db.fetch_all(
-                f"MATCH (a:Function)-[r:CALLS]->(b:Function) RETURN a.id AS a, b.id AS b, {conf} AS c"):
-            c = float(r["c"] or 0.0)
-            fwd[r["a"]].append((r["b"], c))
-            rev[r["b"]].append((r["a"], c))
+        src, dst, conf, _k = self.db.edge_endpoints(("CALLS",), with_conf=self._cap("calls_conf"),
+                                                    from_label="Function", to_label="Function")
+        if conf is None:
+            conf = np.ones(len(src), dtype=np.float32)
+        fwd = _CSRAdj(src, dst, conf)
+        rev = _CSRAdj(dst, src, conf)
         handlers: dict[int, list] = _dd(list)
         for label, cap in (("Route", "routes"), ("Tool", "tools")):
             if not self._cap(cap):
@@ -1745,15 +1765,17 @@ class Retriever:
                                            "file": r["file"], "handler": r["handler"]})
         tests_into: dict[int, list] = _dd(list)
         try:
-            for r in self.db.fetch_all("MATCH (t:Function)-[:TESTS]->(x) RETURN t.id AS t, x.id AS x"):
-                tests_into[r["x"]].append(r["t"])
+            ts, tx, _c, _k2 = self.db.edge_endpoints(("TESTS",), from_label="Function")
+            for t, x in zip(ts.tolist(), tx.tolist()):
+                tests_into[x].append(t)
         except Exception:
             pass
-        is_test = {r["id"] for r in self.db.fetch_all(
-            "MATCH (f:Function) WHERE f.is_test RETURN f.id AS id")}
+        d = self.db.node_columns("Function", {"id": "n.id"}, where="n.is_test")
+        is_test = set(d["id"].tolist()) if d.get("id") is not None else set()
         methods: dict[int, list] = _dd(list)
-        for r in self.db.fetch_all("MATCH (c:Class)-[:CONTAINS]->(f:Function) RETURN c.id AS c, f.id AS f"):
-            methods[r["c"]].append(r["f"])
+        cs, cf, _c, _k3 = self.db.edge_endpoints(("CONTAINS",), from_label="Class", to_label="Function")
+        for c, f in zip(cs.tolist(), cf.tolist()):
+            methods[c].append(f)
         g = {"fwd": fwd, "rev": rev, "handlers": handlers, "tests_into": tests_into,
              "is_test": is_test, "methods": methods}
         self._mem_graph_cache = g
@@ -1939,6 +1961,8 @@ class Retriever:
 
     # ---- repo map --------------------------------------------------------
 
+    REPO_MAP_POOL = 6000
+
     def repo_map(self, focus: list[str] | None = None, tokens: int = 1024,
                  exclude_tests: bool = True, include_focus_files: bool = True) -> dict:
         """Aider-style map: personalized PageRank biased to `focus` (files or
@@ -1962,14 +1986,36 @@ class Retriever:
                 ids = self._symbol_ids(f, ("Function", "Class"))
                 seeds += ids
                 resolved.append({"focus": f, "kind": "symbol", "ids": len(ids)})
-        rows = self.db.fetch_all(
-            "MATCH (n:Function) RETURN n.id AS id, n.qname AS qname, n.file AS file, "
-            "coalesce(n.pagerank, 0.0) AS pr, n.is_test AS is_test, 'Function' AS kind"
-        ) + self.db.fetch_all(
-            "MATCH (n:Class) RETURN n.id AS id, n.qname AS qname, n.file AS file, "
-            "coalesce(n.pagerank, 0.0) AS pr, false AS is_test, 'Class' AS kind"
-        )
         ppr = self._maybe_ppr_ids(seeds) if seeds else None
+        # Bounded candidate set: the top REPO_MAP_POOL by (personalized)
+        # rank plus the focus files' symbols -- never every row of the graph.
+        pool = self.REPO_MAP_POOL
+        cols = ("n.id AS id, n.qname AS qname, n.file AS file, coalesce(n.pagerank, 0.0) AS pr, "
+                "{t} AS is_test, '{k}' AS kind")
+        rows: list[dict] = []
+        if ppr:
+            ids = np.asarray(getattr(ppr, "ids", []), dtype=np.int64)
+            sc = np.asarray(getattr(ppr, "scores", []), dtype=np.float64)
+            if len(ids) > pool:
+                top = np.argpartition(-sc, pool - 1)[:pool]
+                ids = ids[top]
+            want = [int(i) for i in ids.tolist()]
+            for label, t in (("Function", "n.is_test"), ("Class", "false")):
+                for s_ in range(0, len(want), 5000):
+                    rows += self.db.fetch_all(
+                        f"MATCH (n:{label}) WHERE n.id IN $ids RETURN " + cols.format(t=t, k=label),
+                        {"ids": want[s_:s_ + 5000]})
+            if focus_files:
+                have = {r["id"] for r in rows}
+                for label, t in (("Function", "n.is_test"), ("Class", "false")):
+                    rows += [r for r in self.db.fetch_all(
+                        f"MATCH (n:{label}) WHERE n.file IN $f RETURN " + cols.format(t=t, k=label),
+                        {"f": sorted(focus_files)}) if r["id"] not in have]
+        else:
+            for label, t in (("Function", "n.is_test"), ("Class", "false")):
+                rows += self.db.fetch_all(
+                    f"MATCH (n:{label}) RETURN " + cols.format(t=t, k=label)
+                    + f" ORDER BY pr DESC LIMIT {pool}")
         scored = []
         for r in rows:
             if exclude_tests and (r.get("is_test") or "/test" in (r["file"] or "")):
@@ -2216,10 +2262,16 @@ class Retriever:
 
     # ---- health ----------------------------------------------------------
 
+    # Above these sizes health() bounds its two super-linear parts: sampled
+    # betweenness runs on the HEALTH_BRIDGE_NODES best-connected functions,
+    # and the name-reference text scan (reads every file) is skipped.
+    HEALTH_BRIDGE_NODES = 20_000
+    HEALTH_TEXT_SCAN_FILES = 5_000
+
     def health(self, limit: int = 15, min_confidence: float = 0.5) -> dict:
         """Hubs, bridges, dead code, import cycles, large functions and
-        untested hotspots. Computed on demand, cached per retriever (which
-        is rebuilt after every reindex)."""
+        untested hotspots. Computed on demand from Arrow arrays, cached per
+        retriever (which is rebuilt after every reindex)."""
         import re as _re
         from collections import Counter as _Counter
         import networkx as nx
@@ -2228,57 +2280,102 @@ class Retriever:
         cache = getattr(self, "_health_cache", {})
         if key in cache:
             return cache[key]
-        funcs = {r["id"]: r for r in self.db.fetch_all(
-            "MATCH (f:Function) RETURN f.id AS id, f.name AS name, f.qname AS qname, f.file AS file, "
-            "f.line_start AS line, f.line_end AS line_end, coalesce(f.pagerank, 0.0) AS pagerank, "
-            "coalesce(f.is_test, false) AS is_test")}
+        fcols = self.db.node_columns("Function", {
+            "id": "n.id", "name": "n.name", "qname": "n.qname", "file": "n.file",
+            "line": "coalesce(n.line_start, 0)", "line_end": "coalesce(n.line_end, 0)",
+            "pagerank": "coalesce(n.pagerank, 0.0)", "is_test": "coalesce(n.is_test, false)"})
+        fid = fcols.get("id")
+        if fid is None or not len(fid):
+            fid = np.zeros(0, np.int64)
+        fid = fid.astype(np.int64)
+        n = len(fid)
+        order = np.argsort(fid, kind="stable")
+        sid = fid[order]
+        names = fcols.get("name", np.zeros(0)).tolist()
+        qnames = fcols.get("qname", np.zeros(0)).tolist()
+        files = fcols.get("file", np.zeros(0)).tolist()
+        lines = fcols.get("line", np.zeros(0)).astype(np.int64) if n else np.zeros(0, np.int64)
+        line_end = fcols.get("line_end", np.zeros(0)).astype(np.int64) if n else np.zeros(0, np.int64)
+        prs = fcols.get("pagerank", np.zeros(0)).astype(np.float64) if n else np.zeros(0)
+        is_test = fcols.get("is_test", np.zeros(0)).astype(bool) if n else np.zeros(0, bool)
+
+        def rows_of(ids: np.ndarray) -> np.ndarray:
+            if not n or not len(ids):
+                return np.full(len(ids), -1, dtype=np.int64)
+            p = np.clip(np.searchsorted(sid, ids), 0, n - 1)
+            return np.where(sid[p] == ids, order[p], -1)
+
         has_conf = self._cap("calls_conf")
-        conf = "coalesce(r.confidence, 1.0)" if has_conf else "1.0"
-        calls = self.db.fetch_all(
-            f"MATCH (a:Function)-[r:CALLS]->(b:Function) RETURN a.id AS a, b.id AS b, {conf} AS c")
-        g = nx.DiGraph()
-        g.add_nodes_from(funcs)
-        for r in calls:
-            if float(r["c"] or 0.0) >= min_confidence and r["a"] != r["b"]:
-                g.add_edge(r["a"], r["b"])
-        inbound_any: set[int] = {r["b"] for r in calls}
-        for q in ("MATCH (t)-[:TESTS]->(x:Function) RETURN x.id AS id",
-                  "MATCH (h)-[:HANDLES]->(x:Function) RETURN x.id AS id",
-                  "MATCH (f:File)-[:IMPORTS_SYMBOL]->(x:Function) RETURN x.id AS id",
-                  "MATCH (y)-[:DECORATED_BY]->(x:Function) RETURN x.id AS id",
-                  "MATCH (y:Function)-[:CALLS_CANDIDATE]->(x:Function) RETURN x.id AS id",
-                  "MATCH (x:Function)-[:OVERRIDES]->(y:Function) RETURN x.id AS id",
-                  "MATCH (y:Function)-[:OVERRIDES]->(x:Function) RETURN x.id AS id"):
+        ca, cb, cc, _k = self.db.edge_endpoints(("CALLS",), with_conf=has_conf,
+                                               from_label="Function", to_label="Function")
+        if cc is None:
+            cc = np.ones(len(ca), dtype=np.float32)
+        ra, rb = rows_of(ca), rows_of(cb)
+        keep = (ra >= 0) & (rb >= 0) & (cc >= min_confidence) & (ra != rb)
+        ea, eb = ra[keep], rb[keep]
+        if len(ea):     # DiGraph semantics: collapse duplicate edges
+            k2 = np.unique(ea * n + eb)
+            ea, eb = k2 // n, k2 % n
+        in_deg = np.bincount(eb, minlength=n) if n else np.zeros(0, np.int64)
+        out_deg = np.bincount(ea, minlength=n) if n else np.zeros(0, np.int64)
+        inbound = np.zeros(n, dtype=bool)
+        rbv = rb[rb >= 0]
+        inbound[rbv] = True
+        for rel, fl, tl, side in (("TESTS", None, "Function", "b"), ("HANDLES", None, "Function", "b"),
+                                  ("IMPORTS_SYMBOL", "File", "Function", "b"),
+                                  ("DECORATED_BY", None, "Function", "b"),
+                                  ("CALLS_CANDIDATE", "Function", "Function", "b"),
+                                  ("OVERRIDES", "Function", "Function", "a"),
+                                  ("OVERRIDES", "Function", "Function", "b")):
             try:
-                inbound_any |= {r["id"] for r in self.db.fetch_all(q)}
+                xa, xb, _c2, _k2 = self.db.edge_endpoints((rel,), from_label=fl, to_label=tl)
+                r_ = rows_of(xa if side == "a" else xb)
+                inbound[r_[r_ >= 0]] = True
             except Exception:
                 pass
 
         def row(i: int, **extra) -> dict:
-            f = funcs[i]
-            return dict({k: f.get(k) for k in ("id", "name", "qname", "file", "line", "pagerank")}, **extra)
+            return dict({"id": int(fid[i]), "name": names[i], "qname": qnames[i], "file": files[i],
+                         "line": int(lines[i]), "pagerank": float(prs[i])}, **extra)
 
-        prod = [i for i, f in funcs.items() if not f["is_test"]]
+        prod = np.nonzero(~is_test)[0] if n else np.zeros(0, np.int64)
         # hubs
-        hubs = sorted(prod, key=lambda i: -(g.in_degree(i) + g.out_degree(i)))[:limit]
-        hubs_out = [row(i, fan_in=g.in_degree(i), fan_out=g.out_degree(i)) for i in hubs
-                    if g.in_degree(i) + g.out_degree(i) > 0]
-        # bridges (approximate betweenness on the undirected call graph)
-        ug = g.subgraph(prod).to_undirected()
-        ug.remove_nodes_from([n for n in list(ug.nodes) if ug.degree(n) == 0])
+        deg = in_deg + out_deg if n else np.zeros(0, np.int64)
+        hubs = prod[np.argsort(-deg[prod], kind="stable")][:limit] if len(prod) else prod
+        hubs_out = [row(int(i), fan_in=int(in_deg[i]), fan_out=int(out_deg[i])) for i in hubs if deg[i] > 0]
+        # bridges (sampled betweenness on the undirected production call graph,
+        # restricted to the best-connected functions on very big graphs)
         bridges_out = []
+        prod_mask = np.zeros(n, dtype=bool)
+        prod_mask[prod] = True
+        um = prod_mask[ea] & prod_mask[eb] if len(ea) else np.zeros(0, bool)
+        ua, ub = ea[um], eb[um]
+        active = np.unique(np.concatenate([ua, ub])) if len(ua) else np.zeros(0, np.int64)
+        bounded = len(active) > self.HEALTH_BRIDGE_NODES
+        if bounded:
+            udeg = np.bincount(np.concatenate([ua, ub]), minlength=n)
+            best = active[np.argsort(-udeg[active], kind="stable")][:self.HEALTH_BRIDGE_NODES]
+            sel = np.zeros(n, dtype=bool)
+            sel[best] = True
+            m2 = sel[ua] & sel[ub]
+            ua, ub = ua[m2], ub[m2]
+        ug = nx.Graph()
+        ug.add_edges_from(zip(ua.tolist(), ub.tolist()))
         if ug.number_of_nodes() > 2:
-            k = min(ug.number_of_nodes(), 200 if ug.number_of_nodes() < 20000 else 50)
+            k = min(ug.number_of_nodes(), 200 if ug.number_of_nodes() < 20000 else 32)
             bc = nx.betweenness_centrality(ug, k=k, seed=7, normalized=True)
             for i, s in sorted(bc.items(), key=lambda t: -t[1])[:limit]:
                 if s > 0:
-                    bridges_out.append(row(i, betweenness=round(s, 4)))
+                    bridges_out.append(row(int(i), betweenness=round(s, 4)))
+        del ug
         # text references (callbacks, module-level calls, registrations)
         tokens: _Counter = _Counter()
         texts: dict[str, list[str]] = {}
-        if self.cfg is not None:
-            for r in self.db.fetch_all("MATCH (f:File) RETURN f.path AS p"):
-                p = r["p"]
+        file_rows = self.db.node_columns("File", {"p": "n.path"})
+        all_files = file_rows["p"].tolist() if file_rows.get("p") is not None else []
+        text_scan = self.cfg is not None and len(all_files) <= self.HEALTH_TEXT_SCAN_FILES
+        if text_scan:
+            for p in all_files:
                 try:
                     full = self.cfg.path_for(p)
                     if full.stat().st_size > 1_500_000:
@@ -2291,23 +2388,22 @@ class Retriever:
         entry_names = {"main", "__init__", "setup", "teardown", "setUp", "tearDown", "run", "cli",
                        "handler", "lambda_handler", "app", "create_app", "make_app"}
         dead = []
-        for i in prod:
-            f = funcs[i]
-            name = f["name"] or ""
-            if i in inbound_any or name in entry_names or (name.startswith("__") and name.endswith("__")):
+        for i in prod.tolist():
+            name = names[i] or ""
+            if inbound[i] or name in entry_names or (name.startswith("__") and name.endswith("__")):
                 continue
-            parts = (f["qname"] or "").split("::")
+            parts = (qnames[i] or "").split("::")
             if len(parts) >= 3 and not name.startswith("_"):
                 continue  # public methods: dynamic dispatch / framework hooks
             if texts:
                 if tokens.get(name, 0) > 1:
                     continue  # referenced somewhere by name (callback, registration, export)
-                lines = texts.get(f["file"]) or []
-                ln = int(f["line"] or 1)
-                prev = lines[ln - 2].strip() if 2 <= ln <= len(lines) + 1 else ""
+                flines = texts.get(files[i]) or []
+                ln = int(lines[i] or 1)
+                prev = flines[ln - 2].strip() if 2 <= ln <= len(flines) + 1 else ""
                 if prev.startswith("@"):
                     continue  # registered by a decorator
-                if ln - 1 < len(lines) and lines[ln - 1].lstrip().startswith("export"):
+                if ln - 1 < len(flines) and flines[ln - 1].lstrip().startswith("export"):
                     continue
             dead.append(row(i, reason="no inbound calls/references and name not referenced elsewhere"
                             if texts else "no inbound calls/references"))
@@ -2329,37 +2425,41 @@ class Retriever:
                     cycles.append(sorted(comp))
         cycles.sort(key=lambda c: (len(c), c))
         # large functions
-        sizes = sorted(prod, key=lambda i: -((funcs[i]["line_end"] or 0) - (funcs[i]["line"] or 0)))
-        large = [row(i, lines=(funcs[i]["line_end"] or 0) - (funcs[i]["line"] or 0) + 1)
-                 for i in sizes[:limit] if (funcs[i]["line_end"] or 0) - (funcs[i]["line"] or 0) + 1 >= 60]
-        # untested hotspots: top-PageRank production functions no test reaches
-        tested: set[int] = set()
+        span = line_end - lines if n else np.zeros(0, np.int64)
+        sizes = prod[np.argsort(-span[prod], kind="stable")] if len(prod) else prod
+        large = [row(int(i), lines=int(span[i]) + 1) for i in sizes[:limit] if span[i] + 1 >= 60]
+        # untested hotspots: top-PageRank production functions no test reaches (3 hops)
+        tested = np.zeros(n, dtype=bool)
         try:
-            tested |= {r["id"] for r in self.db.fetch_all(
-                "MATCH (t:Function)-[:TESTS]->(x:Function) RETURN x.id AS id")}
+            ta, tb, _c3, _k3 = self.db.edge_endpoints(("TESTS",), from_label="Function", to_label="Function")
+            r_ = rows_of(tb)
+            tested[r_[r_ >= 0]] = True
         except Exception:
             pass
-        test_ids = [i for i, f in funcs.items() if f["is_test"]]
-        frontier = set(test_ids)
-        reached = set(test_ids)
+        fwd = _CSRAdj(ea, eb, np.ones(len(ea), np.float32)) if len(ea) else None
+        reached = is_test.copy()
+        frontier = np.nonzero(is_test)[0]
         for _ in range(3):
-            nxt = set()
-            for n in frontier:
-                if n in g:
-                    for m in g.successors(n):
-                        if m not in reached:
-                            reached.add(m)
-                            nxt.add(m)
-            frontier = nxt
+            if fwd is None or not len(frontier):
+                break
+            nxt = []
+            for u in frontier.tolist():
+                for v, _c in fwd.get(u, ()):
+                    if not reached[v]:
+                        reached[v] = True
+                        nxt.append(v)
+            frontier = np.asarray(nxt, dtype=np.int64)
         tested |= reached
-        ranked = sorted(prod, key=lambda i: -(funcs[i]["pagerank"] or 0.0))
+        ranked = prod[np.argsort(-prs[prod], kind="stable")] if len(prod) else prod
         top_n = ranked[:max(limit * 4, len(ranked) // 10)]
-        untested = [row(i, fan_in=g.in_degree(i)) for i in top_n if i not in tested][:limit]
+        untested = [row(int(i), fan_in=int(in_deg[i])) for i in top_n if not tested[i]][:limit]
         result = {
-            "summary": {"functions": len(funcs), "production": len(prod), "tests": len(test_ids),
-                        "call_edges": g.number_of_edges(), "dead_code": len(dead),
+            "summary": {"functions": n, "production": int(len(prod)), "tests": int(is_test.sum()),
+                        "call_edges": int(len(ea)), "dead_code": len(dead),
                         "import_cycles": len(cycles), "untested_hotspots": len(untested),
-                        "min_confidence": min_confidence},
+                        "min_confidence": min_confidence,
+                        "bridges_sampled_on": int(min(len(active), self.HEALTH_BRIDGE_NODES)),
+                        "name_reference_scan": bool(text_scan)},
             "hubs": hubs_out,
             "bridges": bridges_out,
             "dead_code": dead[:max(limit * 3, 30)],
@@ -2531,3 +2631,47 @@ class Retriever:
             "capabilities": {k: self._cap(k) for k in
                              ("calls_conf", "community", "routes", "tools", "cand", "history")},
         }
+
+
+class _CSRAdj:
+    """Read-only adjacency {node: [(neighbour, confidence), ...]} over CSR
+    arrays; `.get(n, ())` builds only the requested row."""
+
+    __slots__ = ("keys", "start", "nbr", "conf")
+
+    def __init__(self, src: np.ndarray, dst: np.ndarray, conf: np.ndarray):
+        order = np.argsort(src, kind="stable")
+        s = np.asarray(src, dtype=np.int64)[order]
+        self.nbr = np.asarray(dst, dtype=np.int64)[order]
+        self.conf = np.asarray(conf, dtype=np.float32)[order]
+        self.keys, self.start = np.unique(s, return_index=True)
+        self.start = np.append(self.start, len(s)).astype(np.int64)
+
+    def _row(self, n):
+        i = int(np.searchsorted(self.keys, int(n)))
+        if i < len(self.keys) and int(self.keys[i]) == int(n):
+            return int(self.start[i]), int(self.start[i + 1])
+        return None
+
+    def get(self, n, default=()):
+        r = self._row(n)
+        if r is None:
+            return default
+        a, b = r
+        return list(zip(self.nbr[a:b].tolist(), self.conf[a:b].tolist()))
+
+    def __getitem__(self, n):
+        v = self.get(n, None)
+        if v is None:
+            raise KeyError(n)
+        return v
+
+    def __contains__(self, n) -> bool:
+        return self._row(n) is not None
+
+    def degree(self, n) -> int:
+        r = self._row(n)
+        return 0 if r is None else r[1] - r[0]
+
+    def __len__(self) -> int:
+        return len(self.keys)

@@ -995,6 +995,7 @@ const G = {
   hulls: false, hullCache: null, hullAt: 0, clusterNames: new Map(), communities: [],
   overlay: null, overlayPos: new Map(), styleVersion: 1, layoutRunning: false, worker: null,
   stats: { frames: 0, fpsT: 0, fps: 0, bytes: 0, tileMs: [], tilesLoaded: 0, firstFrameAt: 0, loadStart: 0 },
+  forceLevel: null,
 };
 window.__dgStats = G.stats;
 const commColor = (c) => COMMUNITY_PALETTE[Math.abs(Number(c) || 0) % COMMUNITY_PALETTE.length];
@@ -1033,6 +1034,7 @@ function spawnWorker() {
 const worldSide = () => G.man ? (G.man.bbox[2] - G.man.bbox[0]) : 1;
 function levelFor(scale) {
   if (!G.man) return 0;
+  if (G.forceLevel != null) return Math.max(0, Math.min(G.man.max_level, G.forceLevel)); // benchmarks / debugging
   const l = Math.ceil(Math.log2(Math.max(1e-9, worldSide() * scale / tilePx())));
   return Math.max(0, Math.min(G.man.max_level, l));
 }

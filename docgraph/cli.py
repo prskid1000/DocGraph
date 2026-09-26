@@ -321,6 +321,29 @@ def index(
         True, "--communities/--no-communities",
         help="Detect communities (Louvain) at index time.",
     ),
+    text_fallback: bool = typer.Option(
+        True, "--text-fallback/--no-text-fallback",
+        help="Index files no grammar claims (and grammar files without any "
+             "function/class) as plain-text chunks when they decode as text.",
+    ),
+    index_batch_files: int = typer.Option(
+        2000, "--index-batch-files",
+        help="Files parsed + embedded + written per batch (memory stays flat).",
+    ),
+    tiles: bool = typer.Option(
+        True, "--tiles/--no-tiles",
+        help="Compute the world layout and the LOD tile sidecar the graph UI streams.",
+    ),
+    full_recompute_max_nodes: int = typer.Option(
+        50_000, "--full-recompute-max-nodes",
+        help="Graphs up to this many nodes recompute PageRank / communities on every "
+             "dirty pass; bigger ones patch changed files until --recompute-drift.",
+    ),
+    recompute_drift: float = typer.Option(
+        0.05, "--recompute-drift",
+        help="Fraction of files changed since the last global pass that triggers "
+             "a global PageRank / communities / layout recompute.",
+    ),
     scip: str = typer.Option(
         "auto", "--scip",
         help="Precise SCIP references: auto (use scip-python / scip-typescript "
@@ -373,6 +396,11 @@ def index(
         history=history and history_max_files > 0,
         history_max_files=history_max_files,
         communities=communities,
+        text_fallback=text_fallback,
+        index_batch_files=index_batch_files,
+        tiles=tiles,
+        full_recompute_max_nodes=full_recompute_max_nodes,
+        recompute_drift=recompute_drift,
         scip=scip,
         scip_python=scip_python or "",
         scip_typescript=scip_typescript or "",
@@ -662,6 +690,29 @@ def host(
         True, "--communities/--no-communities",
         help="Detect communities (Louvain) at index time.",
     ),
+    text_fallback: bool = typer.Option(
+        True, "--text-fallback/--no-text-fallback",
+        help="Index files no grammar claims (and grammar files without any "
+             "function/class) as plain-text chunks when they decode as text.",
+    ),
+    index_batch_files: int = typer.Option(
+        2000, "--index-batch-files",
+        help="Files parsed + embedded + written per batch (memory stays flat).",
+    ),
+    tiles: bool = typer.Option(
+        True, "--tiles/--no-tiles",
+        help="Compute the world layout and the LOD tile sidecar the graph UI streams.",
+    ),
+    full_recompute_max_nodes: int = typer.Option(
+        50_000, "--full-recompute-max-nodes",
+        help="Graphs up to this many nodes recompute PageRank / communities on every "
+             "dirty pass; bigger ones patch changed files until --recompute-drift.",
+    ),
+    recompute_drift: float = typer.Option(
+        0.05, "--recompute-drift",
+        help="Fraction of files changed since the last global pass that triggers "
+             "a global PageRank / communities / layout recompute.",
+    ),
     scip: str = typer.Option(
         "auto", "--scip",
         help="Precise SCIP references: auto (use scip-python / scip-typescript "
@@ -748,6 +799,11 @@ def host(
     overrides["history"] = history and history_max_files > 0
     overrides["history_max_files"] = history_max_files
     overrides["communities"] = communities
+    overrides["text_fallback"] = text_fallback
+    overrides["index_batch_files"] = index_batch_files
+    overrides["tiles"] = tiles
+    overrides["full_recompute_max_nodes"] = full_recompute_max_nodes
+    overrides["recompute_drift"] = recompute_drift
     overrides["scip"] = scip
     if scip_python:                overrides["scip_python"] = scip_python
     if scip_typescript:            overrides["scip_typescript"] = scip_typescript
