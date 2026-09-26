@@ -324,6 +324,15 @@ class Embedder:
             self._fallback_to_cpu()
             return self._run_embed(texts_list, batch_size, on_progress)
 
+    def uses_daemon(self) -> bool:
+        """Embeds of this model are routed to the shared daemon (the host
+        then never loads torch for them)."""
+        try:
+            from docgraph import daemon as _daemon
+            return bool(_daemon.client_enabled()) and _daemon.client_model() in (None, self.model_name)
+        except Exception:
+            return False
+
     def _maybe_embed_via_daemon(
         self,
         texts_list: list[str],

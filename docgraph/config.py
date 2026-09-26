@@ -88,6 +88,14 @@ class Config:
     # convention but per-model-class on the docgraph side.
     embed_unload_after: float = 0.0
     rerank_unload_after: float = 0.0
+    # Host memory: drop the in-memory graph structures of a root (call
+    # graph CSRs, node payload table, tile arrays, the incremental live
+    # state) after this many seconds without a tool call or index pass,
+    # then trim the working set. Rebuilt lazily on the next use. 0 = never.
+    graph_unload_after: float = 600.0
+    # Kuzu buffer pool per open database in MB; 0 = half the database size,
+    # clamped to [256, 512] MB.
+    db_buffer_mb: int = 0
     # Embedding daemon (opt-in). When True, embed + rerank calls route to a
     # shared `docgraph daemon` process over loopback (one warm model + one
     # CUDA context for the whole host, requests queued). The host becomes
@@ -322,6 +330,8 @@ def load_config(
     embed_batch_size: int = 256,
     embed_unload_after: float = 0.0,
     rerank_unload_after: float = 0.0,
+    graph_unload_after: float = 600.0,
+    db_buffer_mb: int = 0,
     embed_daemon: bool = False,
     daemon_port: int = 5577,
     daemon_idle_exit_sec: float = 0.0,
@@ -397,6 +407,8 @@ def load_config(
         embed_batch_size=embed_batch_size,
         embed_unload_after=embed_unload_after,
         rerank_unload_after=rerank_unload_after,
+        graph_unload_after=float(graph_unload_after),
+        db_buffer_mb=int(db_buffer_mb or 0),
         embed_daemon=embed_daemon,
         daemon_port=daemon_port,
         daemon_idle_exit_sec=daemon_idle_exit_sec,

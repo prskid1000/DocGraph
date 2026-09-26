@@ -313,6 +313,7 @@ class _InlineExecutor:
 
 class Indexer:
     INPROC_PARSE_MAX = 8
+    BULK_REOPEN_FILES = 2000
     KEPT_POOL_MAX = 2000
     KEPT_POOL_WORKERS = 4
 
@@ -643,7 +644,9 @@ class Indexer:
         if n_embed:
             embed_state["total"] += n_embed
             prog.update(etask, total=embed_state["total"])
-            self.embedder._ensure()
+            uses_daemon = getattr(self.embedder, "uses_daemon", None)
+            if not (callable(uses_daemon) and uses_daemon()):
+                self.embedder._ensure()        # daemon mode: never load torch here
         for label, plan, lookup in (("Class", class_plan, use_cache),
                                     ("Function", function_plan, use_cache),
                                     ("Chunk", chunk_plan, False)):
@@ -897,7 +900,8 @@ class Indexer:
             with T("wipe"):
                 self.db.close()
                 self.db.wipe(self.cfg.db_path)
-                self.db = GraphDB(self.cfg.db_path, self.embedder.dim)
+                # bulk load: the large buffer pool (see GraphDB `bulk`)
+                self.db = GraphDB(self.cfg.db_path, self.embedder.dim, bulk=True)
                 self.db.init_schema()
                 self._next_id = 1
                 cache.wipe()
@@ -1037,6 +1041,11 @@ class Indexer:
         if incremental and len(changed) > max(2000, 0.1 * max(1, n_files)):
             self.db.drop_search_indexes()
             live.vector_ok = False
+        if incremental and len(changed) > self.BULK_REOPEN_FILES and not getattr(self.db, "bulk", False):
+            # thousands of files re-inserted: reopen with the bulk buffer
+            # pool (Kuzu 0.11 fails bulk inserts under a small pool)
+            self.db.close()
+            self.db = GraphDB(self.cfg.db_path, self.embedder.dim, bulk=True)
         t_parse = time.perf_counter()
         if changed:
             _emit("parse", 0, len(changed))

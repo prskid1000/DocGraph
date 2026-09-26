@@ -344,6 +344,11 @@ def index(
         help="Fraction of files changed since the last global pass that triggers "
              "a global PageRank / communities / layout recompute.",
     ),
+    db_buffer_mb: int = typer.Option(
+        0, "--db-buffer-mb",
+        help="Kuzu buffer pool per open database, MB. 0 (default) = half the "
+             "database size clamped to 256-512 MB; the pool caps Kuzu's resident memory.",
+    ),
     scip: str = typer.Option(
         "auto", "--scip",
         help="Precise SCIP references: auto (use scip-python / scip-typescript "
@@ -437,6 +442,8 @@ def index(
             f"  [yellow]LLM docstrings[/]: {cfg.llm_format} @ "
             f"{cfg.llm_host}:{cfg.llm_port} (model={cfg.llm_model})"
         )
+    from docgraph.db import set_buffer_pool_mb
+    set_buffer_pool_mb(db_buffer_mb)
     db = GraphDB(cfg.db_path, embedding_dim=cfg.embedding_dim)
     db.init_schema()
     indexer = Indexer(cfg, db)
@@ -655,6 +662,18 @@ def host(
              "seconds of inactivity. 0 (default) = never unload. "
              "Reloads lazily on the next reranked search.",
     ),
+    graph_idle_unload_sec: float = typer.Option(
+        600.0, "--graph-idle-unload-sec",
+        help="Drop a root's in-memory graph structures (call-graph CSRs, node "
+             "table, tile arrays, incremental state) after this many seconds "
+             "without a tool call or index pass, then trim the working set. "
+             "Rebuilt on next use. 0 = never.",
+    ),
+    db_buffer_mb: int = typer.Option(
+        0, "--db-buffer-mb",
+        help="Kuzu buffer pool per open database, MB. 0 (default) = half the "
+             "database size clamped to 256-512 MB; the pool caps Kuzu's resident memory.",
+    ),
     embed_daemon: bool = typer.Option(
         False, "--embed-daemon/--no-embed-daemon",
         help="Route embed + rerank through a shared `docgraph daemon` "
@@ -808,11 +827,16 @@ def host(
     if scip_python:                overrides["scip_python"] = scip_python
     if scip_typescript:            overrides["scip_typescript"] = scip_typescript
     if scip_index:                 overrides["scip_index"] = scip_index
+    overrides["graph_unload_after"] = float(graph_idle_unload_sec or 0.0)
+    overrides["db_buffer_mb"] = int(db_buffer_mb or 0)
+    from docgraph.db import set_buffer_pool_mb
+    set_buffer_pool_mb(db_buffer_mb)
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
     # Propagate to the workspace so the lifespan can start the unloader.
     workspace.embed_unload_after  = float(embed_idle_unload_sec  or 0.0)
     workspace.rerank_unload_after = float(rerank_idle_unload_sec or 0.0)
+    workspace.graph_unload_after = float(graph_idle_unload_sec or 0.0)
     # Daemon mode: register the client spec so Embedder/Reranker route
     # through (and lazily spawn) the shared daemon. When the daemon owns the
     # models, the host's own idle-unload thresholds become moot — the daemon

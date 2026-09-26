@@ -274,6 +274,48 @@ def _default_buffer_pool() -> int:
 
 BUFFER_POOL_SIZE = _default_buffer_pool()
 
+# `--db-buffer-mb`: the Kuzu buffer pool per open database. 0 = scaled to
+# the database: half its size on disk, clamped to [256, 512] MB (a 720 MB
+# graph of 200k functions gets 360 MB). Kuzu keeps every page it has read
+# in the pool until the database closes, so the pool is the ceiling of its
+# resident memory; queries past it evict pages, they do not fail.
+BUFFER_MIN_MB = 256
+BUFFER_MAX_MB = 512
+_BUFFER_MB = 0
+
+
+def set_buffer_pool_mb(mb: int | float | None) -> None:
+    """Process-wide buffer pool size for databases opened from now on
+    (0 / None = scaled to the database)."""
+    global _BUFFER_MB
+    _BUFFER_MB = max(0, int(mb or 0))
+
+
+def _dir_size(path: Path) -> int:
+    try:
+        if path.is_file():
+            return path.stat().st_size
+        total = 0
+        for p in path.rglob("*"):
+            try:
+                if p.is_file():
+                    total += p.stat().st_size
+            except OSError:
+                pass
+        return total
+    except OSError:
+        return 0
+
+
+def buffer_pool_bytes(db_path: Path, mb: int | None = None) -> int:
+    mb = _BUFFER_MB if mb is None else int(mb)
+    if mb > 0:
+        return int(mb) << 20
+    size = _dir_size(Path(db_path))
+    auto = min(BUFFER_MAX_MB << 20, max(BUFFER_MIN_MB << 20, size // 2))
+    cap = BUFFER_POOL_SIZE or auto
+    return int(min(auto, cap))
+
 
 _PK_IN = re.compile(r"\b([A-Za-z_]\w*)\.id IN \$ids\b")
 _PK_EQ = re.compile(r"\b([A-Za-z_]\w*)\.id = \$id\b")
@@ -293,11 +335,21 @@ class EdgeJournal:
 
 
 class GraphDB:
-    def __init__(self, db_path: Path, embedding_dim: int = 384, read_only: bool = False):
+    def __init__(self, db_path: Path, embedding_dim: int = 384, read_only: bool = False,
+                 buffer_pool_mb: int | None = None, bulk: bool = False):
         self.db_path = Path(db_path)
         self.embedding_dim = embedding_dim
+        # `bulk`: a full / very large pass. Kuzu 0.11 reports a spurious
+        # "duplicated primary key" while bulk-inserting 200k rows into a
+        # vector table under a 256 MB pool (reproducible; fine at 4 GB), so
+        # bulk loads get the large pool; the host drops the handle after the
+        # pass and reads through a capped one again.
+        self.bulk = bool(bulk)
+        self.buffer_pool_bytes = buffer_pool_bytes(self.db_path, buffer_pool_mb)
+        if self.bulk:
+            self.buffer_pool_bytes = max(self.buffer_pool_bytes, BUFFER_POOL_SIZE)
         self.db = kuzu.Database(str(self.db_path), read_only=read_only, max_db_size=MAX_DB_SIZE,
-                                buffer_pool_size=BUFFER_POOL_SIZE)
+                                buffer_pool_size=self.buffer_pool_bytes)
         self.conn = kuzu.Connection(self.db)
         # Per-node-table id sets, populated lazily on first edge insert. Used
         # to filter dangling-endpoint rows before COPY FROM (which errors hard
