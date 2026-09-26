@@ -303,6 +303,39 @@ def index(
         False, "--force-fetch-links",
         help="Re-fetch ALL external links regardless of TTL.",
     ),
+    embed_cache: bool = typer.Option(
+        True, "--embed-cache/--no-embed-cache",
+        help="Reuse embeddings of entities whose content hash is unchanged "
+             "(moves / renames / re-parses) on incremental runs.",
+    ),
+    history: bool = typer.Option(
+        True, "--history/--no-history",
+        help="Record first_seen / last_changed commit per symbol via one "
+             "`git blame` per changed file.",
+    ),
+    history_max_files: int = typer.Option(
+        5000, "--history-max-files",
+        help="Cap on files blamed per index run (0 disables history).",
+    ),
+    communities: bool = typer.Option(
+        True, "--communities/--no-communities",
+        help="Detect communities (Louvain) at index time.",
+    ),
+    scip: str = typer.Option(
+        "auto", "--scip",
+        help="Precise SCIP references: auto (use scip-python / scip-typescript "
+             "on PATH or --scip-index when present), on (always re-run the "
+             "binaries), off.",
+    ),
+    scip_python: str | None = typer.Option(
+        None, "--scip-python", help="Path to the scip-python binary (overrides PATH).",
+    ),
+    scip_typescript: str | None = typer.Option(
+        None, "--scip-typescript", help="Path to the scip-typescript binary (overrides PATH).",
+    ),
+    scip_index: str | None = typer.Option(
+        None, "--scip-index", help="A prebuilt index.scip to ingest instead of running binaries.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Index a codebase. Incremental by default; pass --full to wipe and rebuild.
@@ -336,6 +369,14 @@ def index(
         llm_model=llm_model or "qwen3.6-35b",
         llm_format=llm_format,
         llm_max_tokens=llm_max_tokens,
+        embed_cache=embed_cache,
+        history=history and history_max_files > 0,
+        history_max_files=history_max_files,
+        communities=communities,
+        scip=scip,
+        scip_python=scip_python or "",
+        scip_typescript=scip_typescript or "",
+        scip_index=scip_index or "",
     )
     if workers > 0:
         cfg.workers = workers
@@ -603,6 +644,39 @@ def host(
              "it has been idle this long, the daemon exits to free the "
              "~300 MB CUDA context (0 = never). Respawned on next demand.",
     ),
+    embed_cache: bool = typer.Option(
+        True, "--embed-cache/--no-embed-cache",
+        help="Reuse embeddings of entities whose content hash is unchanged "
+             "(moves / renames / re-parses) on incremental runs.",
+    ),
+    history: bool = typer.Option(
+        True, "--history/--no-history",
+        help="Record first_seen / last_changed commit per symbol via one "
+             "`git blame` per changed file.",
+    ),
+    history_max_files: int = typer.Option(
+        5000, "--history-max-files",
+        help="Cap on files blamed per index run (0 disables history).",
+    ),
+    communities: bool = typer.Option(
+        True, "--communities/--no-communities",
+        help="Detect communities (Louvain) at index time.",
+    ),
+    scip: str = typer.Option(
+        "auto", "--scip",
+        help="Precise SCIP references: auto (use scip-python / scip-typescript "
+             "on PATH or --scip-index when present), on (always re-run the "
+             "binaries), off.",
+    ),
+    scip_python: str | None = typer.Option(
+        None, "--scip-python", help="Path to the scip-python binary (overrides PATH).",
+    ),
+    scip_typescript: str | None = typer.Option(
+        None, "--scip-typescript", help="Path to the scip-typescript binary (overrides PATH).",
+    ),
+    scip_index: str | None = typer.Option(
+        None, "--scip-index", help="A prebuilt index.scip to ingest instead of running binaries.",
+    ),
     verbose: bool = typer.Option(False, "--verbose", "-v"),
 ) -> None:
     """Run the unified DocGraph host: web UI + JSON API + MCP HTTP, multi-root.
@@ -670,6 +744,14 @@ def host(
     overrides["embed_daemon"] = embed_daemon
     overrides["daemon_port"] = daemon_port
     overrides["daemon_idle_exit_sec"] = daemon_idle_exit_sec
+    overrides["embed_cache"] = embed_cache
+    overrides["history"] = history and history_max_files > 0
+    overrides["history_max_files"] = history_max_files
+    overrides["communities"] = communities
+    overrides["scip"] = scip
+    if scip_python:                overrides["scip_python"] = scip_python
+    if scip_typescript:            overrides["scip_typescript"] = scip_typescript
+    if scip_index:                 overrides["scip_index"] = scip_index
     roots = _resolve_roots(path, root)
     workspace = _build_workspace(roots, **overrides)
     # Propagate to the workspace so the lifespan can start the unloader.
@@ -1199,6 +1281,205 @@ def install_mcp(
     }
     console.print("[cyan]Add this to your MCP client config:[/cyan]")
     console.print_json(json.dumps(snippet))
+
+
+# -- agent integration --------------------------------------------------------
+
+hook_app = typer.Typer(name="hook", help="Hook entry points written by `agent-setup`.",
+                       no_args_is_help=True)
+app.add_typer(hook_app)
+
+
+def _clusters_for(repo: Path, host_url: str, root: str | None) -> list[dict]:
+    """Clusters from a running host, else from the local DB (read-only)."""
+    from docgraph import agent_setup as _as
+    data = _as.fetch_json(_as._q(host_url, "/api/clusters", root, limit=40))
+    if isinstance(data, dict) and data.get("clusters") is not None:
+        return data["clusters"]
+    try:
+        from docgraph.retrieve import Retriever
+        cfg = load_config(repo)
+        if not cfg.db_path.exists():
+            return []
+        db = GraphDB(cfg.db_path, read_only=True)
+        try:
+            return Retriever(db, Embedder(cfg.embedding_model), cfg=cfg).list_clusters(40).get("clusters", [])
+        finally:
+            db.close()
+    except Exception:
+        return []
+
+
+@app.command(name="agent-setup")
+def agent_setup_cmd(
+    path: Path = typer.Argument(Path.cwd(), help="Target repo (default: cwd)."),
+    target: list[str] = typer.Option(
+        None, "--target", "-t",
+        help="claude | codex | agy | all (repeatable; default all).",
+    ),
+    host_url: str = typer.Option("http://127.0.0.1:5500", "--host-url",
+                                 help="DocGraph host the skills and hooks point at."),
+    root: str | None = typer.Option(None, "--root", help="Root slug on that host."),
+    hooks: bool = typer.Option(True, "--hooks/--no-hooks",
+                               help="Claude PreToolUse impact hint + git post-commit notice."),
+    clusters: bool = typer.Option(True, "--clusters/--no-clusters",
+                                  help="One skill per detected cluster (area)."),
+    max_clusters: int = typer.Option(12, "--max-clusters"),
+    docgraph_cmd: str = typer.Option("docgraph", "--docgraph-cmd",
+                                     help="Command the hooks invoke (default: docgraph on PATH)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show what would change; write nothing."),
+) -> None:
+    """Write DocGraph skill files + hooks for Claude Code / Codex / agy into a
+    repo. Only runs when invoked; idempotent; --dry-run to preview."""
+    from docgraph import agent_setup as _as
+    repo = path.resolve()
+    targets = list(_as.TARGETS) if not target or "all" in target else list(target)
+    bad = [t for t in targets if t not in _as.TARGETS]
+    if bad:
+        console.print(f"[red]unknown target(s): {', '.join(bad)}[/red]")
+        raise typer.Exit(2)
+    cl = _clusters_for(repo, host_url, root) if clusters else []
+    actions = _as.plan(repo, targets, host_url, root, cl, hooks=hooks, per_cluster=clusters,
+                       docgraph_cmd=docgraph_cmd, max_clusters=max_clusters)
+    results = _as.apply(actions, dry_run=dry_run)
+    table = Table(show_header=True, box=None)
+    table.add_column("status")
+    table.add_column("file")
+    for r in results:
+        p = Path(r["path"])
+        try:
+            shown = p.relative_to(repo).as_posix()
+        except ValueError:
+            shown = str(p)
+        table.add_row(r["status"], shown)
+    console.print(table)
+    if dry_run:
+        console.print("[dim]dry run: nothing written[/dim]")
+
+
+@hook_app.command("pre-edit")
+def hook_pre_edit(
+    host_url: str = typer.Option("http://127.0.0.1:5500", "--host-url"),
+    root: str | None = typer.Option(None, "--root"),
+) -> None:
+    """Claude Code PreToolUse hook: print an impact hint for the file about
+    to be edited. Reads the hook JSON on stdin; never blocks the edit."""
+    from docgraph import agent_setup as _as
+    try:
+        payload = json.loads(sys.stdin.read() or "{}")
+    except Exception:
+        payload = {}
+    try:
+        hint = _as.pre_edit_hint(payload, host_url, root)
+    except Exception:
+        hint = None
+    if hint:
+        sys.stdout.write(json.dumps({"hookSpecificOutput": {
+            "hookEventName": "PreToolUse", "additionalContext": hint}}))
+    raise typer.Exit(0)
+
+
+@hook_app.command("post-commit")
+def hook_post_commit(
+    host_url: str = typer.Option("http://127.0.0.1:5500", "--host-url"),
+    root: str | None = typer.Option(None, "--root"),
+) -> None:
+    """git post-commit hook: tell the committer the index is stale."""
+    from docgraph import agent_setup as _as
+    try:
+        msg = _as.post_commit_notice(host_url, root)
+    except Exception:
+        msg = "DocGraph: run `docgraph index` to refresh the graph."
+    sys.stdout.write(msg + "\n")
+    raise typer.Exit(0)
+
+
+@app.command(name="embed-models")
+def embed_models() -> None:
+    """List the embedding models with built-in profiles (dims, prefixes,
+    remote code). Any sentence-transformers id works with --embed-model;
+    switching model changes the vector size and needs a full reindex."""
+    from docgraph.embed import MODEL_PROFILES
+    table = Table(show_header=True)
+    for col in ("model", "dim", "query prefix", "remote code", "notes"):
+        table.add_column(col)
+    table.add_row("BAAI/bge-small-en-v1.5 (default)", "384", "-", "no", "general text; fast on CPU")
+    for name, p in MODEL_PROFILES.items():
+        table.add_row(name, str(p["dim"]), "yes" if p.get("query_prefix") else "-",
+                      "yes" if p.get("trust_remote_code") else "no", p.get("notes", ""))
+    console.print(table)
+
+
+@app.command()
+def bench(
+    path: Path = typer.Argument(Path.cwd(), help="Repo the questions are about (default: cwd)."),
+    runner: list[str] = typer.Option(
+        None, "--runner", "-r",
+        help="docgraph | grep | search | telecode-mcp | telecode-grep (repeatable; "
+             "default: docgraph + grep).",
+    ),
+    host_url: str = typer.Option("http://127.0.0.1:5500", "--host-url",
+                                 help="DocGraph host for the docgraph / telecode-mcp runners."),
+    root: str | None = typer.Option(None, "--root", help="Root slug on that host."),
+    questions: Path | None = typer.Option(None, "--questions", help="Question set JSON."),
+    ids: str | None = typer.Option(None, "--ids", help="Comma-separated question ids."),
+    limit: int = typer.Option(0, "--limit", help="Only the first N questions (0 = all)."),
+    telecode_url: str = typer.Option("http://127.0.0.1:1235", "--telecode-url"),
+    model: str = typer.Option("haiku", "--model", help="Cloud model for telecode runners."),
+    judge: bool = typer.Option(False, "--judge", help="LLM-judge answers (telecode runners)."),
+    embed_model: str | None = typer.Option(None, "--embed-model",
+                                           help="search runner: embedding model of the index."),
+    gpu: bool = typer.Option(False, "--gpu", help="search runner: embed queries on CUDA."),
+    out: Path | None = typer.Option(None, "--out", help="Write the full JSON report here."),
+) -> None:
+    """Benchmark answers with DocGraph vs a grep baseline (optionally with a
+    real agent through telecode's Task API, cloud haiku only)."""
+    from docgraph import bench as _b
+    qs = _b.load_questions(questions)
+    if ids:
+        want = {s.strip() for s in ids.split(",") if s.strip()}
+        qs = [q for q in qs if q["id"] in want]
+    if limit > 0:
+        qs = qs[:limit]
+    names = runner or ["docgraph", "grep"]
+    runners = []
+    for n in names:
+        if n == "docgraph":
+            runners.append(_b.DocGraphRunner(host_url, root))
+        elif n == "grep":
+            runners.append(_b.GrepRunner(path.resolve()))
+        elif n == "search":
+            runners.append(_b.SearchRunner(path.resolve(), embedding_model=embed_model, gpu=gpu))
+        elif n in ("telecode-mcp", "telecode-grep"):
+            runners.append(_b.TelecodeRunner(path.resolve(), mode=n.split("-", 1)[1],
+                                             host_url=host_url, root=root,
+                                             telecode_url=telecode_url, model=model, judge=judge))
+        else:
+            console.print(f"[red]unknown runner {n}[/red]")
+            raise typer.Exit(2)
+
+    def _p(row: dict) -> None:
+        console.print(f"  {row['runner']:<14} {row['id']:<24} recall {row['recall']:.2f}  "
+                      f"tokens {row['tokens']:>6}  tools {row['tool_calls']}"
+                      + (f"  mrr {row['mrr']:.2f}" if "mrr" in row else "")
+                      + (f"  judge {row['judge_score']:.2f}" if "judge_score" in row else "")
+                      + (f"  [red]{row['error']}[/red]" if row.get("error") else ""))
+
+    report = _b.run(qs, runners, progress=_p)
+    table = Table(show_header=True)
+    for col in ("runner", "n", "recall", "judge", "mrr", "recall@5", "tokens/q", "tools/q", "errors"):
+        table.add_column(col)
+    for name, s in report["summary"].items():
+        table.add_row(name, str(s["n"]), f"{s['recall']:.3f}", str(s.get("judge", "-")),
+                      str(s.get("mrr", "-")), str(s.get("recall_at_k", "-")),
+                      str(s["tokens"]), str(s["tool_calls"]), str(s["errors"]))
+    console.print(table)
+    for r in runners:
+        if hasattr(r, "close"):
+            r.close()
+    if out:
+        out.write_text(json.dumps(report, indent=2), encoding="utf-8")
+        console.print(f"[dim]report: {out}[/dim]")
 
 
 if __name__ == "__main__":

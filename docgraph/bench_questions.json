@@ -1,0 +1,126 @@
+{
+  "repo": "docgraph",
+  "note": "Reference answers for the DocGraph repository itself (schema v3). keywords are scored case-insensitively against the answer; symbols are the definitions a search should surface.",
+  "questions": [
+    {
+      "id": "def-communities",
+      "category": "where-defined",
+      "question": "Where is community detection implemented, and which indexer method runs it?",
+      "reference": "docgraph/communities.py defines detect() (Louvain via networkx). Indexer._recompute_communities in docgraph/index.py calls it after PageRank and writes Community + MEMBER_OF through GraphDB.replace_communities.",
+      "keywords": ["communities.py", "detect", "_recompute_communities", "louvain"],
+      "symbols": ["detect", "_recompute_communities"]
+    },
+    {
+      "id": "def-scip-decoder",
+      "category": "where-defined",
+      "question": "Which function decodes SCIP protobuf index files?",
+      "reference": "decode_index in docgraph/scip.py, a dependency-free protobuf wire-format reader (_fields / _varint).",
+      "keywords": ["decode_index", "scip.py"],
+      "symbols": ["decode_index"]
+    },
+    {
+      "id": "def-schema",
+      "category": "where-defined",
+      "question": "Where are the Kuzu table definitions and the schema version constant defined?",
+      "reference": "docgraph/db.py: NODE_DDL and EDGE_DDL lists, SCHEMA_VERSION, applied by GraphDB.init_schema (+ migrate).",
+      "keywords": ["db.py", "SCHEMA_VERSION", "NODE_DDL", "init_schema"],
+      "symbols": ["init_schema", "migrate"]
+    },
+    {
+      "id": "def-cancel",
+      "category": "where-defined",
+      "question": "How is a cooperative cancel checked during indexing?",
+      "reference": "CancelToken.raise_if_set in docgraph/cancel.py raises OperationCancelled; Indexer.index_all calls it via its _ck helper between phases and _stream_embed_insert checks it per batch.",
+      "keywords": ["raise_if_set", "cancel.py", "OperationCancelled", "_ck"],
+      "symbols": ["raise_if_set"]
+    },
+    {
+      "id": "callers-insert-edges",
+      "category": "callers",
+      "question": "Which functions call GraphDB.insert_edges?",
+      "reference": "Indexer.index_all, Indexer._write_similar_edges, Indexer._recompute_similar_partial, Indexer._write_co_changed, Indexer._write_tests_edges, GraphDB.replace_communities and scip.maybe_ingest.",
+      "keywords": ["index_all", "_write_similar_edges", "_write_co_changed", "_write_tests_edges", "maybe_ingest"],
+      "symbols": ["insert_edges"]
+    },
+    {
+      "id": "callers-parse-file",
+      "category": "callers",
+      "question": "What calls parse_file?",
+      "reference": "_parse_worker in docgraph/index.py (run in the process pool by Indexer.index_all), plus parser tests.",
+      "keywords": ["_parse_worker", "index.py"],
+      "symbols": ["parse_file"]
+    },
+    {
+      "id": "callers-bfs",
+      "category": "callers",
+      "question": "Which Retriever methods use the confidence-filtered BFS helper _bfs_calls?",
+      "reference": "call_graph, _callers_rows (impact_of with min_confidence), test_impact, _flow_for (processes / flow), context, _tests_for, detect_changes, route_map and api_impact.",
+      "keywords": ["call_graph", "detect_changes", "_flow_for", "api_impact", "context"],
+      "symbols": ["_bfs_calls"]
+    },
+    {
+      "id": "impact-take-writer",
+      "category": "impact",
+      "question": "What would be affected by changing Workspace.take_writer?",
+      "reference": "The /api/admin/index route (api_admin_index -> _do) and the watcher reindex paths in docgraph/watch.py (_reindex / _baseline_reindex), plus workspace and job tests.",
+      "keywords": ["api_admin_index", "watch.py", "_reindex"],
+      "symbols": ["take_writer"]
+    },
+    {
+      "id": "impact-search-routes",
+      "category": "impact",
+      "question": "Which HTTP routes and MCP tools depend on Retriever.search?",
+      "reference": "GET /api/search (api_search in server.py) and the MCP `search` tool in mcp_tools.py; context() also uses it for suggestions (GET /api/context).",
+      "keywords": ["/api/search", "api_search", "mcp_tools"],
+      "symbols": ["search", "api_search"]
+    },
+    {
+      "id": "flow-index-to-pagerank",
+      "category": "flow",
+      "question": "Trace the call path from the POST /api/admin/index route to the PageRank computation.",
+      "reference": "api_admin_index -> _do -> Indexer.index_all -> Indexer._recompute_tier4 -> compute_pagerank (docgraph/rank.py), then write_pagerank.",
+      "keywords": ["api_admin_index", "index_all", "_recompute_tier4", "compute_pagerank"],
+      "symbols": ["compute_pagerank", "_recompute_tier4"]
+    },
+    {
+      "id": "flow-mcp-search",
+      "category": "flow",
+      "question": "What happens when an MCP client calls the `search` tool?",
+      "reference": "mcp_tools.search resolves the root slot and calls Retriever.search: query embedding (Embedder.embed_query), chunk max-similarity, BM25 (_bm25_for) fused with RRF (rrf_fuse), PageRank / personalized PageRank boost, optional cross-encoder rerank.",
+      "keywords": ["Retriever", "embed", "_bm25_for", "rrf_fuse", "rerank"],
+      "symbols": ["search", "rrf_fuse"]
+    },
+    {
+      "id": "arch-components",
+      "category": "architecture",
+      "question": "What are the main components of DocGraph and how do they interact?",
+      "reference": "CLI (cli.py) starts the host; Workspace holds per-root read-only Kuzu connections and Retrievers; Indexer (index.py) parses with tree-sitter (parse.py), resolves edges (resolve.py), embeds (embed.py) and writes Kuzu (db.py); server.py serves REST + the FastMCP tools from mcp_tools.py; the UI is ui/index.html.",
+      "keywords": ["Indexer", "Retriever", "Workspace", "server", "mcp_tools", "Kuzu"],
+      "symbols": ["Indexer", "Retriever", "Workspace"]
+    },
+    {
+      "id": "arch-daemon",
+      "category": "architecture",
+      "question": "How does the shared embedding daemon relate to the Embedder class?",
+      "reference": "docgraph/daemon.py runs one warm model; Embedder.embed routes through _maybe_embed_via_daemon -> embed_via_daemon when client mode is configured (configure_client at host start), falling back to in-process embedding.",
+      "keywords": ["daemon.py", "_maybe_embed_via_daemon", "embed_via_daemon", "configure_client"],
+      "symbols": ["_maybe_embed_via_daemon", "embed_via_daemon"]
+    },
+    {
+      "id": "tests-cypher-guard",
+      "category": "tests-to-run",
+      "question": "Which tests cover the read-only Cypher guard?",
+      "reference": "The test_cypher_* tests in tests/test_new_tools.py and the cypher write-blocker tests in tests/test_api.py.",
+      "keywords": ["test_cypher", "test_new_tools", "test_api"],
+      "symbols": ["_is_read_only", "cypher"]
+    },
+    {
+      "id": "tests-resolution",
+      "category": "tests-to-run",
+      "question": "Which tests should run after changing the call-resolution cascade in resolve.py?",
+      "reference": "tests/test_graph_features.py (resolution tiers, ambiguity candidates, receivers) plus the indexer / retrieval suites that depend on CALLS edges (tests/test_indexer.py, tests/test_retrieval.py, tests/test_new_tools.py).",
+      "keywords": ["test_graph_features", "test_indexer", "test_retrieval"],
+      "symbols": ["SymbolResolver", "resolve"]
+    }
+  ]
+}

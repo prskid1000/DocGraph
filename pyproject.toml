@@ -60,6 +60,7 @@ packages = ["docgraph"]
 
 [tool.hatch.build.targets.wheel.force-include]
 "docgraph/ui/index.html" = "docgraph/ui/index.html"
+"docgraph/bench_questions.json" = "docgraph/bench_questions.json"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
