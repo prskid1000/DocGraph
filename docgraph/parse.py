@@ -58,15 +58,83 @@ EXT_TO_LANG: dict[str, str] = {
     ".yml": "yaml",
     ".md": "markdown",
     ".markdown": "markdown",
+    ".swift": "swift",
+    ".dart": "dart",
+    ".lua": "lua",
+    ".zig": "zig",
+    ".zon": "zig",
+    ".hs": "haskell",
+    ".ml": "ocaml",
+    ".mli": "ocaml_interface",
+    ".jl": "julia",
+    ".pl": "perl",
+    ".pm": "perl",
+    ".ps1": "powershell",
+    ".psm1": "powershell",
+    ".psd1": "powershell",
+    ".m": "objc",
+    ".mm": "objc",
+    ".sql": "sql",
+    ".toml": "toml",
+    ".xml": "xml",
+    ".xsd": "xml",
+    ".xsl": "xml",
+    ".xslt": "xml",
+    ".plist": "xml",
+    ".csproj": "xml",
+    ".vbproj": "xml",
+    ".fsproj": "xml",
+    ".vcxproj": "xml",
+    ".props": "xml",
+    ".targets": "xml",
+    ".pom": "xml",
+    ".nuspec": "xml",
+    ".resx": "xml",
+    ".wsdl": "xml",
+    ".xaml": "xml",
+    ".tf": "hcl",
+    ".tfvars": "hcl",
+    ".hcl": "hcl",
+    ".mk": "make",
+    ".mak": "make",
+    ".svelte": "svelte",
+    ".nix": "nix",
+    ".groovy": "groovy",
+    ".gvy": "groovy",
+    ".gradle": "groovy",
+    ".f90": "fortran",
+    ".f95": "fortran",
+    ".f03": "fortran",
+    ".f08": "fortran",
+    ".f": "fortran",
+    ".for": "fortran",
+    ".ftn": "fortran",
+    ".v": "verilog",
+    ".vh": "verilog",
+    ".sv": "verilog",
+    ".svh": "verilog",
+    ".vhd": "vhdl",
+    ".vhdl": "vhdl",
 }
 
 
 # Exact lower-case basenames that name a grammar language regardless of
 # extension (Dockerfile, Makefile, ...). Checked before EXT_TO_LANG.
-FILENAME_TO_LANG: dict[str, str] = {}
+FILENAME_TO_LANG: dict[str, str] = {
+    "makefile": "make",
+    "gnumakefile": "make",
+    "bsdmakefile": "make",
+    "jenkinsfile": "groovy",
+    "cargo.lock": "toml",
+    "poetry.lock": "toml",
+    "uv.lock": "toml",
+}
 
 # Lower-case basename prefixes (e.g. "dockerfile." for `Dockerfile.dev`).
-FILENAME_PREFIX_TO_LANG: dict[str, str] = {}
+FILENAME_PREFIX_TO_LANG: dict[str, str] = {
+    "makefile.": "make",
+    "jenkinsfile.": "groovy",
+}
 
 
 # --- Plain-text fallback ----------------------------------------------------
@@ -169,6 +237,28 @@ LANGUAGES: dict[str, tuple[str, str]] = {
     "json": ("tree_sitter_json", "language"),
     "yaml": ("tree_sitter_yaml", "language"),
     "markdown": ("tree_sitter_markdown", "language"),
+    "swift": ("tree_sitter_swift", "language"),
+    "dart": ("tree_sitter_dart", "language"),
+    "lua": ("tree_sitter_lua", "language"),
+    "zig": ("tree_sitter_zig", "language"),
+    "haskell": ("tree_sitter_haskell", "language"),
+    "ocaml": ("tree_sitter_ocaml", "language_ocaml"),
+    "ocaml_interface": ("tree_sitter_ocaml", "language_ocaml_interface"),
+    "julia": ("tree_sitter_julia", "language"),
+    "perl": ("tree_sitter_perl", "language"),
+    "powershell": ("tree_sitter_powershell", "language"),
+    "objc": ("tree_sitter_objc", "language"),
+    "sql": ("tree_sitter_sql", "language"),
+    "toml": ("tree_sitter_toml", "language"),
+    "xml": ("tree_sitter_xml", "language_xml"),
+    "hcl": ("tree_sitter_hcl", "language"),
+    "make": ("tree_sitter_make", "language"),
+    "svelte": ("tree_sitter_svelte", "language"),
+    "nix": ("tree_sitter_nix", "language"),
+    "groovy": ("tree_sitter_groovy", "language"),
+    "fortran": ("tree_sitter_fortran", "language"),
+    "verilog": ("tree_sitter_verilog", "language"),
+    "vhdl": ("tree_sitter_vhdl", "language"),
 }
 
 
@@ -375,6 +465,406 @@ TAGS_QUERIES: dict[str, str] = {
   (inline) @name) @definition.section
 (setext_heading
   (paragraph (inline) @name)) @definition.section
+""",
+    # Swift: class_declaration also covers struct / enum / actor.
+    "swift": """
+(class_declaration name: (type_identifier) @name) @definition.class
+(protocol_declaration name: (type_identifier) @name) @definition.interface
+(class_declaration
+  (inheritance_specifier inherits_from: (user_type (type_identifier) @parent.class)))
+(function_declaration name: (simple_identifier) @name) @definition.function
+(protocol_function_declaration name: (simple_identifier) @name) @definition.method
+(init_declaration "init" @name) @definition.method
+(source_file
+  (property_declaration
+    name: (pattern bound_identifier: (simple_identifier) @name)) @definition.variable)
+(class_body
+  (property_declaration
+    name: (pattern bound_identifier: (simple_identifier) @name)) @definition.variable)
+(call_expression (simple_identifier) @ref.call)
+(call_expression
+  (navigation_expression
+    suffix: (navigation_suffix suffix: (simple_identifier) @ref.call)))
+(import_declaration (identifier) @import.module)
+""",
+    # Dart: a function body is a sibling of its signature, so definitions
+    # span the signature only.
+    "dart": """
+(class_definition name: (identifier) @name) @definition.class
+(class_definition superclass: (superclass (type_identifier) @parent.class))
+(mixin_declaration (identifier) @name) @definition.class
+(enum_declaration name: (identifier) @name) @definition.class
+(extension_declaration name: (identifier) @name) @definition.class
+(program (function_signature name: (identifier) @name) @definition.function)
+(local_function_declaration
+  (lambda_expression
+    parameters: (function_signature name: (identifier) @name))) @definition.function
+(program
+  (static_final_declaration_list
+    (static_final_declaration (identifier) @name) @definition.variable))
+(method_signature (function_signature name: (identifier) @name)) @definition.method
+(method_signature (getter_signature name: (identifier) @name)) @definition.method
+(method_signature (setter_signature name: (identifier) @name)) @definition.method
+(declaration (function_signature name: (identifier) @name)) @definition.method
+(class_body
+  (declaration
+    (initialized_identifier_list
+      (initialized_identifier (identifier) @name))) @definition.variable)
+(_ (identifier) @ref.call . (selector (argument_part)))
+(_
+  (selector (unconditional_assignable_selector (identifier) @ref.call))
+  .
+  (selector (argument_part)))
+(new_expression (type_identifier) @ref.new)
+(library_import
+  (import_specification (configurable_uri (uri (string_literal) @import.module))))
+""",
+    "lua": """
+(function_declaration name: (identifier) @name) @definition.function
+(function_declaration
+  name: (dot_index_expression field: (identifier) @name)) @definition.method
+(function_declaration
+  name: (method_index_expression method: (identifier) @name)) @definition.method
+(chunk
+  (variable_declaration
+    (assignment_statement
+      (variable_list name: (identifier) @name))) @definition.variable)
+(chunk
+  (assignment_statement
+    (variable_list name: (identifier) @name)) @definition.variable)
+(function_call name: (identifier) @ref.call)
+(function_call name: (dot_index_expression field: (identifier) @ref.call))
+(function_call name: (method_index_expression method: (identifier) @ref.call))
+((function_call
+   name: (identifier) @_req
+   arguments: (arguments (string content: (string_content) @import.module)))
+ (#eq? @_req "require"))
+""",
+    "zig": """
+(function_declaration name: (identifier) @name) @definition.function
+(variable_declaration
+  (identifier) @name
+  [(struct_declaration) (enum_declaration) (union_declaration) (opaque_declaration)]) @definition.class
+(source_file (variable_declaration (identifier) @name) @definition.variable)
+(test_declaration (string (string_content) @name)) @definition.function
+(call_expression function: (identifier) @ref.call)
+(call_expression function: (field_expression member: (identifier) @ref.call))
+((builtin_function
+   (builtin_identifier) @_b
+   (arguments (string (string_content) @import.module)))
+ (#eq? @_b "@import"))
+""",
+    "haskell": """
+(function name: (variable) @name) @definition.function
+(bind name: (variable) @name) @definition.function
+(data_type name: (name) @name) @definition.class
+(newtype name: (name) @name) @definition.class
+(type_synomym name: (name) @name) @definition.class
+(class name: (name) @name) @definition.interface
+(class_declarations (signature name: (variable) @name) @definition.method)
+(apply function: (variable) @ref.call)
+(apply function: (qualified id: (variable) @ref.call))
+(import module: (module) @import.module)
+(import_list (import_name (variable) @import.symbol))
+(import_list (import_name (name) @import.symbol))
+""",
+    "ocaml": """
+(compilation_unit
+  (value_definition
+    (let_binding pattern: (value_name) @name (parameter))) @definition.function)
+(structure
+  (value_definition
+    (let_binding pattern: (value_name) @name (parameter))) @definition.function)
+(compilation_unit
+  (value_definition
+    (let_binding pattern: (value_name) @name body: (fun_expression))) @definition.function)
+(structure
+  (value_definition
+    (let_binding pattern: (value_name) @name body: (fun_expression))) @definition.function)
+(compilation_unit
+  (value_definition (let_binding pattern: (value_name) @name)) @definition.variable)
+(structure
+  (value_definition (let_binding pattern: (value_name) @name)) @definition.variable)
+(type_definition (type_binding name: (type_constructor) @name)) @definition.class
+(module_definition (module_binding (module_name) @name)) @definition.class
+(module_type_definition (module_type_name) @name) @definition.interface
+(class_definition (class_binding name: (class_name) @name)) @definition.class
+(method_definition name: (method_name) @name) @definition.method
+(application_expression function: (value_path (value_name) @ref.call))
+(open_module module: (module_path) @import.module)
+""",
+    "ocaml_interface": """
+(value_specification (value_name) @name) @definition.function
+(type_definition (type_binding name: (type_constructor) @name)) @definition.class
+(module_definition (module_binding (module_name) @name)) @definition.class
+(module_type_definition (module_type_name) @name) @definition.interface
+(open_module_signature module: (extended_module_path) @import.module)
+""",
+    # Julia: the definition signature is itself a call_expression, so calls
+    # are matched per parent kind (never under `signature` / typed / where).
+    "julia": """
+(function_definition
+  (signature (call_expression . (identifier) @name))) @definition.function
+(function_definition
+  (signature (typed_expression . (call_expression . (identifier) @name)))) @definition.function
+(function_definition
+  (signature (where_expression . (call_expression . (identifier) @name)))) @definition.function
+(macro_definition
+  (signature (call_expression . (identifier) @name))) @definition.function
+(assignment . (call_expression . (identifier) @name)) @definition.function
+(struct_definition (type_head (identifier) @name)) @definition.class
+(struct_definition (type_head (binary_expression . (identifier) @name))) @definition.class
+(struct_definition (type_head (binary_expression (identifier) @parent.class .)))
+(abstract_definition (type_head (identifier) @name)) @definition.interface
+(module_definition name: (identifier) @name) @definition.class
+(source_file (const_statement (assignment . (identifier) @name)) @definition.variable)
+(argument_list (call_expression . (identifier) @ref.call))
+(return_statement (call_expression . (identifier) @ref.call))
+(function_definition (call_expression . (identifier) @ref.call))
+(macro_definition (call_expression . (identifier) @ref.call))
+(module_definition (call_expression . (identifier) @ref.call))
+(source_file (call_expression . (identifier) @ref.call))
+(compound_statement (call_expression . (identifier) @ref.call))
+(if_statement (call_expression . (identifier) @ref.call))
+(elseif_clause (call_expression . (identifier) @ref.call))
+(else_clause (call_expression . (identifier) @ref.call))
+(for_statement (call_expression . (identifier) @ref.call))
+(for_binding (call_expression . (identifier) @ref.call))
+(while_statement (call_expression . (identifier) @ref.call))
+(let_statement (call_expression . (identifier) @ref.call))
+(do_clause (call_expression . (identifier) @ref.call))
+(try_statement (call_expression . (identifier) @ref.call))
+(catch_clause (call_expression . (identifier) @ref.call))
+(finally_clause (call_expression . (identifier) @ref.call))
+(binary_expression (call_expression . (identifier) @ref.call))
+(unary_expression (call_expression . (identifier) @ref.call))
+(ternary_expression (call_expression . (identifier) @ref.call))
+(parenthesized_expression (call_expression . (identifier) @ref.call))
+(tuple_expression (call_expression . (identifier) @ref.call))
+(vector_expression (call_expression . (identifier) @ref.call))
+(matrix_row (call_expression . (identifier) @ref.call))
+(comprehension_expression (call_expression . (identifier) @ref.call))
+(range_expression (call_expression . (identifier) @ref.call))
+(index_expression (call_expression . (identifier) @ref.call))
+(field_expression (call_expression . (identifier) @ref.call))
+(splat_expression (call_expression . (identifier) @ref.call))
+(named_argument (call_expression . (identifier) @ref.call))
+(macro_argument_list (call_expression . (identifier) @ref.call))
+(string_interpolation (call_expression . (identifier) @ref.call))
+(open_tuple (call_expression . (identifier) @ref.call))
+(arrow_function_expression (call_expression . (identifier) @ref.call))
+(let_binding (call_expression . (identifier) @ref.call))
+(assignment (operator) . (call_expression . (identifier) @ref.call))
+(compound_assignment_expression (operator) . (call_expression . (identifier) @ref.call))
+(call_expression . (field_expression (identifier) @ref.call .))
+(broadcast_call_expression . (identifier) @ref.call)
+(using_statement (identifier) @import.module)
+(using_statement (scoped_identifier) @import.module)
+(import_statement (identifier) @import.module)
+(import_statement (scoped_identifier) @import.module)
+(selected_import . (identifier) @import.module)
+(selected_import . (scoped_identifier) @import.module)
+(selected_import . (_) (identifier) @import.symbol)
+""",
+    "perl": """
+(subroutine_declaration_statement name: (bareword) @name) @definition.function
+(method_declaration_statement name: (bareword) @name) @definition.method
+(package_statement name: (package) @name) @definition.class
+(class_statement name: (package) @name) @definition.class
+(function_call_expression function: (function) @ref.call)
+(ambiguous_function_call_expression function: (function) @ref.call)
+(method_call_expression method: (method) @ref.call)
+(use_statement module: (package) @import.module)
+(require_expression (bareword) @import.module)
+""",
+    "powershell": """
+(function_statement (function_name) @name) @definition.function
+(class_statement . (simple_name) @name) @definition.class
+(class_statement (simple_name) (simple_name) @parent.class)
+(enum_statement (simple_name) @name) @definition.class
+(class_method_definition (simple_name) @name) @definition.method
+(class_property_definition (variable) @name) @definition.variable
+(command command_name: (command_name) @ref.call)
+(invokation_expression (member_name (simple_name) @ref.call))
+((command
+   command_name: (command_name) @_c
+   command_elements: (command_elements (generic_token) @import.module))
+ (#match? @_c "^[Ii]mport-[Mm]odule$"))
+((command
+   command_name: (command_name) @_u
+   command_elements: (command_elements (generic_token) @import.module .))
+ (#eq? @_u "using"))
+""",
+    "objc": """
+(class_interface . (identifier) @name) @definition.class
+(class_interface superclass: (identifier) @parent.class)
+(class_implementation . (identifier) @name) @definition.class
+(protocol_declaration . (identifier) @name) @definition.interface
+(protocol_declaration (method_declaration (identifier) @name) @definition.method)
+(method_definition (identifier) @name) @definition.method
+(function_definition
+  declarator: (function_declarator declarator: (identifier) @name)) @definition.function
+(property_declaration
+  (struct_declaration (struct_declarator (identifier) @name))) @definition.variable
+(call_expression function: (identifier) @ref.call)
+(message_expression method: (identifier) @ref.call)
+(preproc_include path: (_) @import.module)
+""",
+    "sql": """
+(create_table (object_reference name: (identifier) @name)) @definition.class
+(create_view (object_reference name: (identifier) @name)) @definition.class
+(create_materialized_view (object_reference name: (identifier) @name)) @definition.class
+(create_type (object_reference name: (identifier) @name)) @definition.class
+(create_function (object_reference name: (identifier) @name)) @definition.function
+(create_trigger (object_reference name: (identifier) @name)) @definition.function
+(create_index column: (identifier) @name) @definition.variable
+(create_sequence (object_reference name: (identifier) @name)) @definition.variable
+(column_definition name: (identifier) @name) @definition.variable
+(invocation (object_reference name: (identifier) @ref.call))
+""",
+    "toml": """
+(table (bare_key) @name) @definition.class
+(table (dotted_key) @name) @definition.class
+(table (quoted_key) @name) @definition.class
+(table_array_element (bare_key) @name) @definition.class
+(table_array_element (dotted_key) @name) @definition.class
+(document (pair (bare_key) @name) @definition.variable)
+""",
+    "xml": """
+(document root: (element (STag (Name) @name)) @definition.class)
+(document root: (element (EmptyElemTag (Name) @name)) @definition.class)
+(document
+  root: (element (content (element (STag (Name) @name)) @definition.variable)))
+(document
+  root: (element (content (element (EmptyElemTag (Name) @name)) @definition.variable)))
+""",
+    # Terraform / HCL: `resource "type" "name"` and `data` blocks are named
+    # by their second label, one-label blocks by their label.
+    "hcl": """
+((block
+   (identifier) @_t
+   .
+   (string_lit)
+   .
+   (string_lit (template_literal) @name)) @definition.class
+ (#any-of? @_t "resource" "data"))
+((block
+   (identifier) @_t
+   .
+   (string_lit (template_literal) @name)
+   .
+   (block_start)) @definition.class
+ (#any-of? @_t "module" "provider"))
+((block
+   (identifier) @_t
+   .
+   (string_lit (template_literal) @name)
+   .
+   (block_start)) @definition.variable
+ (#any-of? @_t "variable" "output"))
+((block
+   (identifier) @_t
+   (body (attribute (identifier) @name) @definition.variable))
+ (#eq? @_t "locals"))
+(function_call (identifier) @ref.call)
+((block
+   (identifier) @_t
+   (body
+     (attribute
+       (identifier) @_s
+       (expression (literal_value (string_lit (template_literal) @import.module))))))
+ (#eq? @_t "module")
+ (#eq? @_s "source"))
+""",
+    # Makefile: rule targets are functions, prerequisites are calls.
+    "make": """
+((rule (targets (word) @name)) @definition.function
+ (#not-match? @name "^\\\\."))
+(variable_assignment name: (word) @name) @definition.variable
+(define_directive name: (word) @name) @definition.function
+((rule
+   (targets (word) @_t)
+   normal: (prerequisites (word) @ref.call))
+ (#not-match? @_t "^\\\\."))
+(include_directive filenames: (list (word) @import.module))
+""",
+    # Svelte: <script> is raw text (no injection here); components used in
+    # the markup and event handlers are the references.
+    "svelte": """
+((element (start_tag (tag_name) @ref.new)) (#match? @ref.new "^[A-Z]"))
+((element (self_closing_tag (tag_name) @ref.new)) (#match? @ref.new "^[A-Z]"))
+((attribute
+   (attribute_name) @_a
+   (expression (svelte_raw_text) @ref.call))
+ (#match? @_a "^on:")
+ (#match? @ref.call "^[A-Za-z_$][A-Za-z0-9_$]*$"))
+""",
+    "nix": """
+(binding
+  attrpath: (attrpath . (identifier) @name)
+  expression: (function_expression)) @definition.function
+(binding attrpath: (attrpath . (identifier) @name)) @definition.variable
+(apply_expression function: (variable_expression name: (identifier) @ref.call))
+(apply_expression
+  function: (select_expression attrpath: (attrpath (identifier) @ref.call .)))
+((apply_expression
+   function: (variable_expression name: (identifier) @_i)
+   argument: [(path_expression) (spath_expression)] @import.module)
+ (#any-of? @_i "import" "callPackage"))
+""",
+    "groovy": """
+(class_declaration name: (identifier) @name) @definition.class
+(class_declaration superclass: (superclass (type_identifier) @parent.class))
+(interface_declaration name: (identifier) @name) @definition.interface
+(method_declaration name: (identifier) @name) @definition.method
+(function_definition name: (identifier) @name) @definition.function
+(field_declaration
+  declarator: (variable_declarator name: (identifier) @name)) @definition.variable
+(method_invocation name: (identifier) @ref.call)
+(juxt_function_call name: (identifier) @ref.call)
+(object_creation_expression type: (type_identifier) @ref.new)
+(import_declaration (scoped_identifier) @import.module)
+""",
+    "fortran": """
+(module (module_statement (name) @name)) @definition.class
+(program (program_statement (name) @name)) @definition.class
+(function (function_statement name: (name) @name)) @definition.function
+(subroutine (subroutine_statement name: (name) @name)) @definition.function
+(derived_type_definition (derived_type_statement (type_name) @name)) @definition.class
+(interface (interface_statement (name) @name)) @definition.interface
+(subroutine_call subroutine: (identifier) @ref.call)
+(call_expression . (identifier) @ref.call)
+(use_statement (module_name) @import.module)
+""",
+    "verilog": """
+(module_declaration (module_header (simple_identifier) @name)) @definition.class
+(interface_declaration (interface_ansi_header (interface_identifier) @name)) @definition.interface
+(package_declaration (package_identifier) @name) @definition.class
+(class_declaration (class_identifier) @name) @definition.class
+(function_declaration
+  (function_body_declaration (function_identifier) @name)) @definition.function
+(task_declaration (task_body_declaration (task_identifier) @name)) @definition.function
+(module_instantiation (simple_identifier) @ref.new)
+(checker_instantiation (checker_identifier) @ref.new)
+(tf_call (simple_identifier) @ref.call)
+(function_subroutine_call (subroutine_call (tf_call (simple_identifier) @ref.call)))
+(system_tf_call (system_tf_identifier) @ref.call)
+(include_compiler_directive (double_quoted_string) @import.module)
+(package_import_item (package_identifier) @import.module)
+""",
+    "vhdl": """
+(entity_declaration entity: (identifier) @name) @definition.class
+(architecture_definition architecture: (identifier) @name) @definition.class
+(package_declaration package: (identifier) @name) @definition.class
+(subprogram_definition
+  (function_specification function: (_) @name)) @definition.function
+(subprogram_definition
+  (procedure_specification procedure: (_) @name)) @definition.function
+(component_declaration component: (identifier) @name) @definition.interface
+(name . (identifier) @ref.call . (parenthesis_group))
+(instantiated_unit entity: (name) @ref.new)
+(instantiated_unit component: (name) @ref.new)
+(use_clause (selected_name_list (selected_name) @import.module))
 """,
 }
 
@@ -594,6 +1084,11 @@ _MEMBER_PARENTS = {
     "method_invocation": "object",           # java (name is a field of the call)
     "call": "receiver",                      # ruby
     "navigation_expression": None,           # kotlin
+    "dot_index_expression": "table",         # lua  (a.b())
+    "method_index_expression": "table",      # lua  (a:b())
+    "value_path": None,                      # ocaml (List.iter)
+    "method_call_expression": "invocant",    # perl  ($obj->m())
+    "message_expression": "receiver",        # objc  ([obj m])
 }
 _SIMPLE_RECV = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){0,3}$")
 
