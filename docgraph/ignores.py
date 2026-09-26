@@ -115,20 +115,11 @@ UNIVERSAL: list[str] = [
     "*.xlsx",
     "*.ppt",
     "*.pptx",
-    # Common repo-root documentation files (informational, not source)
-    "README*",
-    "readme*",
-    "CHANGELOG*",
-    "changelog*",
-    "CHANGES*",
-    "CONTRIBUTING*",
-    "contributing*",
-    "LICENSE*",
-    "license*",
-    "LICENCE*",
-    "NOTICE*",
-    "AUTHORS*",
-    "CODEOWNERS",
+    # README / LICENSE / CHANGELOG / CONTRIBUTING ... are indexed (plain-text
+    # fallback). Example env files are the one dotfile kind worth reading.
+    "!.env.example",
+    "!.env.sample",
+    "!.env.template",
     # Min / map
     "*.min.js",
     "*.min.css",

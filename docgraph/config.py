@@ -111,6 +111,19 @@ class Config:
     scip_python: str = ""
     scip_typescript: str = ""
     scip_index: str = ""
+    # Plain-text fallback: files no grammar claims (and grammar files with
+    # no function/class) are indexed as text chunks when they decode as text.
+    text_fallback: bool = True
+    # Files parsed + embedded + written per batch (memory stays flat).
+    index_batch_files: int = 2000
+    # World layout + LOD tile sidecar (.docgraph/tiles/) for the graph UI.
+    tiles: bool = True
+    # Graphs up to this many symbol nodes recompute PageRank / communities /
+    # layout globally on every dirty pass. Bigger graphs patch them locally
+    # on small incrementals and recompute once the files changed since the
+    # last global pass exceed `recompute_drift` (fraction of all files).
+    full_recompute_max_nodes: int = 50_000
+    recompute_drift: float = 0.05
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
 
@@ -320,6 +333,11 @@ def load_config(
     scip_python: str = "",
     scip_typescript: str = "",
     scip_index: str = "",
+    text_fallback: bool = True,
+    index_batch_files: int = 2000,
+    tiles: bool = True,
+    full_recompute_max_nodes: int = 50_000,
+    recompute_drift: float = 0.05,
 ) -> Config:
     """Build a Config from explicit kwargs.
 
@@ -390,5 +408,10 @@ def load_config(
         scip_python=scip_python,
         scip_typescript=scip_typescript,
         scip_index=scip_index,
+        text_fallback=text_fallback,
+        index_batch_files=index_batch_files,
+        tiles=tiles,
+        full_recompute_max_nodes=full_recompute_max_nodes,
+        recompute_drift=recompute_drift,
         **({"workers": workers} if workers is not None else {}),
     )

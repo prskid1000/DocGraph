@@ -15,7 +15,7 @@ import pyarrow as pa
 # Node tables — all entities share an integer pk for fast joins; qname is the
 # stable human-readable identifier.
 #
-# Embedding columns are `DOUBLE[{dim}]` and substituted at init time from
+# Embedding columns are `FLOAT[{dim}]` (v4; v3 used DOUBLE) and substituted at init time from
 # `GraphDB.embedding_dim` so the DB matches the chosen embedding model
 # (BGE small = 384, mpnet = 768, e5-large = 1024 …). A schema mismatch is
 # unrecoverable — Kuzu won't auto-resize a fixed-length array column — so
@@ -28,6 +28,8 @@ NODE_DDL = [
         lines INT64,
         hash STRING,
         pagerank DOUBLE,
+        x DOUBLE,
+        y DOUBLE,
         PRIMARY KEY (id)
     )""",
     """CREATE NODE TABLE IF NOT EXISTS Module(
@@ -46,9 +48,12 @@ NODE_DDL = [
         body STRING,
         kind STRING,
         llm_doc STRING,
-        embedding DOUBLE[{dim}],
+        embedding FLOAT[{dim}],
         pagerank DOUBLE,
         ehash STRING,
+        terms STRING,
+        x DOUBLE,
+        y DOUBLE,
         first_seen_commit STRING,
         first_seen_ts INT64,
         last_changed_commit STRING,
@@ -67,9 +72,12 @@ NODE_DDL = [
         is_method BOOLEAN,
         is_test BOOLEAN,
         llm_doc STRING,
-        embedding DOUBLE[{dim}],
+        embedding FLOAT[{dim}],
         pagerank DOUBLE,
         ehash STRING,
+        terms STRING,
+        x DOUBLE,
+        y DOUBLE,
         first_seen_commit STRING,
         first_seen_ts INT64,
         last_changed_commit STRING,
@@ -83,6 +91,8 @@ NODE_DDL = [
         file STRING,
         line INT64,
         scope STRING,
+        x DOUBLE,
+        y DOUBLE,
         PRIMARY KEY (id)
     )""",
     # Sub-function chunks. Long entity bodies get split into sub-chunks so
@@ -96,8 +106,11 @@ NODE_DDL = [
         file STRING,
         idx INT64,
         body STRING,
-        embedding DOUBLE[{dim}],
+        embedding FLOAT[{dim}],
         ehash STRING,
+        line_start INT64,
+        line_end INT64,
+        terms STRING,
         PRIMARY KEY (id)
     )""",
     # Server-side communities (Louvain over the resolved call/type graph).
@@ -111,6 +124,9 @@ NODE_DDL = [
         top_members STRING,
         files STRING,
         pagerank DOUBLE,
+        x DOUBLE,
+        y DOUBLE,
+        r DOUBLE,
         PRIMARY KEY (id)
     )""",
     # Framework HTTP routes (aiohttp / FastAPI / Flask / Express) and MCP
@@ -164,7 +180,7 @@ EDGE_DDL = [
     "CREATE REL TABLE IF NOT EXISTS SIMILAR_TO(FROM Function TO Function, FROM Class TO Class, score DOUBLE)",
     "CREATE REL TABLE IF NOT EXISTS CO_CHANGED_WITH(FROM File TO File, count INT64)",
     "CREATE REL TABLE IF NOT EXISTS TESTS(FROM Function TO Function, FROM Function TO Class)",
-    "CREATE REL TABLE IF NOT EXISTS CONTAINS_CHUNK(FROM Function TO Chunk, FROM Class TO Chunk)",
+    "CREATE REL TABLE IF NOT EXISTS CONTAINS_CHUNK(FROM Function TO Chunk, FROM Class TO Chunk, FROM File TO Chunk)",
     # External-link structure: BFS parent→child hyperlinks from the web crawler.
     "CREATE REL TABLE IF NOT EXISTS LINKS_TO(FROM File TO File)",
     # Communities + framework maps
@@ -177,7 +193,7 @@ EDGE_DDL = [
 # forces a full reindex on mismatch (an incremental run over an old-shape
 # DB would leave pre-upgrade edges without confidence, nodes without
 # ehash, etc.).
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # Columns added after the first public schema. `migrate()` ALTERs them onto
 # an existing DB opened read-write so an old DB never hard-errors on a new
@@ -192,8 +208,15 @@ _ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
     "Class": [("ehash", "STRING"), ("first_seen_commit", "STRING"),
               ("first_seen_ts", "INT64"), ("last_changed_commit", "STRING"),
               ("last_changed_ts", "INT64")],
-    "Chunk": [("ehash", "STRING")],
+    "Chunk": [("ehash", "STRING"), ("line_start", "INT64"), ("line_end", "INT64"),
+              ("terms", "STRING")],
 }
+# v4 layout / keyword columns; ALTERed onto an old DB like the ones above.
+for _t in ("Function", "Class"):
+    _ADDED_COLUMNS[_t] += [("terms", "STRING"), ("x", "DOUBLE"), ("y", "DOUBLE")]
+_ADDED_COLUMNS["File"] = [("x", "DOUBLE"), ("y", "DOUBLE")]
+_ADDED_COLUMNS["Variable"] = [("x", "DOUBLE"), ("y", "DOUBLE")]
+_ADDED_COLUMNS["Community"] = [("x", "DOUBLE"), ("y", "DOUBLE"), ("r", "DOUBLE")]
 
 
 class DatabaseBusy(RuntimeError):
@@ -410,6 +433,116 @@ class GraphDB:
             if h in want and h not in out and r.get("e") is not None:
                 out[h] = r["e"]
         return out
+
+    # ---- search indexes (Kuzu's statically linked vector + FTS extensions) ----
+    #
+    # Kuzu 0.11 links VECTOR and FTS into the core, so nothing is INSTALLed
+    # (no network, offline-safe). Both index kinds are maintained by Kuzu on
+    # every CREATE / DELETE, so an incremental pass needs no rebuild; a full
+    # pass creates them once after the bulk load (much faster than inserting
+    # into a live HNSW graph). Embedding columns cannot be SET while a vector
+    # index exists -- rows are always delete + insert, which the indexer
+    # already does.
+
+    VECTOR_INDEXES = {"Function": "fn_vec", "Class": "cls_vec", "Chunk": "chunk_vec"}
+    FTS_INDEXES = {"Function": ("fn_fts", ["name", "terms", "body"]),
+                   "Class": ("cls_fts", ["name", "terms", "body"]),
+                   "Chunk": ("chunk_fts", ["terms", "body"])}
+
+    def list_indexes(self) -> dict[str, dict]:
+        """{index_name: {table, type, props}} from `show_indexes()`."""
+        out: dict[str, dict] = {}
+        try:
+            for r in self.fetch_all("CALL show_indexes() RETURN *"):
+                name = r.get("index name") or r.get("index_name") or ""
+                if name:
+                    out[str(name)] = {"table": r.get("table name") or r.get("table_name"),
+                                      "type": r.get("index type") or r.get("index_type"),
+                                      "props": r.get("property names") or r.get("property_names")}
+        except Exception:
+            return {}
+        return out
+
+    def ensure_search_indexes(self, on_progress: "Callable[[str], None] | None" = None) -> dict:
+        """Create any missing vector / FTS index. Returns a status dict
+        {vector: {label: ok|error}, fts: {label: ok|error}}; never raises."""
+        have = self.list_indexes()
+        status: dict[str, dict[str, str]] = {"vector": {}, "fts": {}}
+        for label, name in self.VECTOR_INDEXES.items():
+            if name in have:
+                status["vector"][label] = "ok"
+                continue
+            if "embedding" not in self.table_props(label):
+                status["vector"][label] = "missing column"
+                continue
+            if on_progress:
+                on_progress(f"vector index {label}")
+            try:
+                self.execute(f"CALL CREATE_VECTOR_INDEX('{label}', '{name}', 'embedding', "
+                             f"metric := 'cosine')")
+                status["vector"][label] = "ok"
+            except Exception as exc:  # noqa: BLE001 - search falls back to brute force
+                status["vector"][label] = f"error: {exc}"
+        for label, (name, props) in self.FTS_INDEXES.items():
+            if name in have:
+                status["fts"][label] = "ok"
+                continue
+            tp = self.table_props(label)
+            cols = [p for p in props if p in tp]
+            if not cols:
+                status["fts"][label] = "missing column"
+                continue
+            if on_progress:
+                on_progress(f"fts index {label}")
+            try:
+                cols_sql = ", ".join(f"'{c}'" for c in cols)
+                self.execute(f"CALL CREATE_FTS_INDEX('{label}', '{name}', [{cols_sql}])")
+                status["fts"][label] = "ok"
+            except Exception as exc:  # noqa: BLE001
+                status["fts"][label] = f"error: {exc}"
+        return status
+
+    def drop_search_indexes(self) -> None:
+        have = self.list_indexes()
+        for label, name in self.VECTOR_INDEXES.items():
+            if name in have:
+                try:
+                    self.execute(f"CALL DROP_VECTOR_INDEX('{label}', '{name}')")
+                except Exception:
+                    pass
+        for label, (name, _p) in self.FTS_INDEXES.items():
+            if name in have:
+                try:
+                    self.execute(f"CALL DROP_FTS_INDEX('{label}', '{name}')")
+                except Exception:
+                    pass
+
+    def vector_topk(self, label: str, vec, k: int, efs: int = 0) -> list[tuple[int, float]]:
+        """[(id, cosine_similarity)] of the k nearest `label` rows via HNSW."""
+        name = self.VECTOR_INDEXES[label]
+        v = vec.tolist() if hasattr(vec, "tolist") else list(vec)
+        opt = f", efs := {int(efs)}" if efs else ""
+        rows = self.fetch_all(
+            f"CALL QUERY_VECTOR_INDEX('{label}', '{name}', $v, {int(k)}{opt}) "
+            f"RETURN node.id AS id, distance AS d", {"v": v})
+        return [(int(r["id"]), 1.0 - float(r["d"])) for r in rows]
+
+    def fts_topk(self, label: str, query: str, k: int) -> list[tuple[int, float]]:
+        """[(id, bm25_score)] best-first via Kuzu FTS (disjunctive)."""
+        name = self.FTS_INDEXES[label][0]
+        if not query.strip():
+            return []
+        rows = self.fetch_all(
+            f"CALL QUERY_FTS_INDEX('{label}', '{name}', $q, conjunctive := false, top := {int(k)}) "
+            f"RETURN node.id AS id, score AS s ORDER BY s DESC LIMIT {int(k)}", {"q": query})
+        return [(int(r["id"]), float(r["s"])) for r in rows]
+
+    def fetch_arrow(self, cypher: str, params: dict | None = None, chunk: int = 1_000_000):
+        """Query result as one pyarrow Table (columnar; embeddings come back
+        as a fixed-size-list column that converts to numpy without Python
+        float objects)."""
+        result = self.execute(cypher, params)
+        return result.get_as_arrow(chunk)
 
     def execute(self, cypher: str, params: dict | None = None) -> Any:
         if self.conn is None:

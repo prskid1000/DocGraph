@@ -254,3 +254,96 @@ def build_embedding_text(
     parts.append(smart_body_sample(body))
     text = "\n".join(p for p in parts if p)
     return text[:MAX_EMBED_CHARS]
+
+
+# --- File-level text chunks (plain-text fallback / symbol-less files) -------
+
+TEXT_CHUNK_TARGET_CHARS = 1200
+TEXT_CHUNK_MAX_CHARS = 2000
+TEXT_CHUNK_MAX_LINES = 60
+
+
+def text_chunks(text: str, target_chars: int = TEXT_CHUNK_TARGET_CHARS,
+                max_chars: int = TEXT_CHUNK_MAX_CHARS,
+                max_lines: int = TEXT_CHUNK_MAX_LINES) -> list[tuple[int, int, str]]:
+    """Line/paragraph-aware chunks of a whole file: [(line_start, line_end,
+    body)] with 1-based inclusive lines.
+
+    Paragraphs (runs of non-blank lines) are packed together up to
+    `target_chars`; a paragraph that alone exceeds `max_chars` / `max_lines`
+    is cut at line boundaries, and a single line longer than `max_chars`
+    (minified data) is cut into character windows that keep its line number.
+    Blank-only files give []."""
+    lines = text.splitlines()
+    out: list[tuple[int, int, str]] = []
+    cur: list[str] = []
+    cur_start = 0
+    cur_len = 0
+
+    def flush(end_line: int) -> None:
+        nonlocal cur, cur_len
+        body = "\n".join(cur).strip("\n")
+        if body.strip():
+            out.append((cur_start, end_line, body))
+        cur = []
+        cur_len = 0
+
+    i = 0
+    n = len(lines)
+    while i < n:
+        # Skip blank lines between paragraphs.
+        while i < n and not lines[i].strip():
+            i += 1
+        if i >= n:
+            break
+        p_start = i
+        while i < n and lines[i].strip():
+            i += 1
+        para = lines[p_start:i]
+        para_len = sum(len(x) + 1 for x in para)
+        # Pack whole paragraphs while they fit.
+        if para_len <= max_chars and len(para) <= max_lines:
+            if cur and (cur_len + para_len > target_chars or
+                        len(cur) + len(para) > max_lines):
+                flush(cur_start + len(cur) - 1 if cur else p_start)
+            if not cur:
+                cur_start = p_start + 1
+            elif cur:
+                # keep the blank separator so line numbers stay exact
+                gap = (p_start + 1) - (cur_start + len(cur))
+                cur.extend([""] * max(0, gap))
+                cur_len += max(0, gap)
+            cur.extend(para)
+            cur_len += para_len
+            continue
+        # Oversized paragraph: flush, then cut it at line boundaries.
+        if cur:
+            flush(cur_start + len(cur) - 1)
+        seg: list[str] = []
+        seg_start = p_start
+        seg_len = 0
+        for j, ln in enumerate(para):
+            ln_no = p_start + j
+            if len(ln) > max_chars:
+                if seg:
+                    out.append((seg_start + 1, ln_no, "\n".join(seg)))
+                    seg, seg_len = [], 0
+                for k in range(0, len(ln), max_chars):
+                    piece = ln[k:k + max_chars]
+                    if piece.strip():
+                        out.append((ln_no + 1, ln_no + 1, piece))
+                seg_start = ln_no + 1
+                continue
+            if seg and (seg_len + len(ln) + 1 > target_chars or len(seg) >= max_lines):
+                out.append((seg_start + 1, ln_no, "\n".join(seg)))
+                seg, seg_len = [], 0
+                seg_start = ln_no
+            if not seg:
+                seg_start = ln_no
+            seg.append(ln)
+            seg_len += len(ln) + 1
+        if seg and "\n".join(seg).strip():
+            out.append((seg_start + 1, seg_start + len(seg), "\n".join(seg)))
+    if cur:
+        flush(cur_start + len(cur) - 1)
+    return out

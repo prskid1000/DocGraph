@@ -57,7 +57,7 @@ def _bar() -> Progress:
 from docgraph.config import Config, MAX_FILE_BYTES
 from docgraph.db import GraphDB, SCHEMA_VERSION
 from docgraph.embed import Embedder, resolve_device
-from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
+from docgraph.parse import classify_file, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
 from docgraph.resolve import ModuleIndex, SymbolResolver, candidate_confidence
 from docgraph.summary import build_embedding_text, chunk_body
@@ -196,6 +196,7 @@ def walk_files(cfg: Config) -> list[tuple[Path, str]]:
     """Return [(absolute_path, logical_rel)]. logical_rel includes a `<repo>/`
     prefix in multi-root mode; in single-root mode it's just the rel path."""
     out: list[tuple[Path, str]] = []
+    text_fallback = bool(getattr(cfg, "text_fallback", True))
     for root, prefix in cfg.roots_with_prefix():
         for dirpath, dirnames, filenames in os.walk(root):
             rel_dir = os.path.relpath(dirpath, root).replace("\\", "/")
@@ -210,12 +211,15 @@ def walk_files(cfg: Config) -> list[tuple[Path, str]]:
                 rel = str(full.relative_to(root)).replace("\\", "/")
                 if cfg.is_ignored(rel, root=root):
                     continue
-                if detect_language(full) is None:
-                    continue
                 try:
                     if full.stat().st_size > MAX_FILE_BYTES:
                         continue
                 except OSError:
+                    continue
+                kind = classify_file(full)
+                if kind is None:
+                    continue
+                if kind.startswith("text:") and not text_fallback:
                     continue
                 out.append((full, f"{prefix}{rel}"))
     return out
@@ -224,10 +228,12 @@ def walk_files(cfg: Config) -> list[tuple[Path, str]]:
 # --- Parse worker ---------------------------------------------------------
 
 
-def _parse_worker(args: tuple[str, str, str]) -> dict | None:
-    file_path, repo_root, rel_override = args
+def _parse_worker(args: tuple) -> dict | None:
+    file_path, repo_root, rel_override = args[:3]
+    text_fallback = bool(args[3]) if len(args) > 3 else True
     try:
-        fp = parse_file(Path(file_path), Path(repo_root), rel_override=rel_override)
+        fp = parse_file(Path(file_path), Path(repo_root), rel_override=rel_override,
+                        text_fallback=text_fallback)
         if fp is None:
             return None
         return {
@@ -236,9 +242,35 @@ def _parse_worker(args: tuple[str, str, str]) -> dict | None:
             "lines": fp.lines,
             "entities": [asdict(e) for e in fp.entities],
             "edges": [asdict(e) for e in fp.edges],
+            "chunks": fp.chunks,
+            "extra": fp.extra,
         }
     except Exception as e:  # noqa: BLE001
         return {"_error": f"{file_path}: {e}"}
+
+
+_SLIM_DROP = ("body", "signature")
+
+
+def _slim_entity(e: dict) -> dict:
+    """Cache form of a parsed entity: everything except the body/signature
+    (those are in the DB) and transient extras."""
+    out = {k: v for k, v in e.items() if k not in _SLIM_DROP}
+    ex = out.get("extra")
+    if isinstance(ex, dict) and ("_id" in ex or "llm_doc" in ex):
+        out["extra"] = {k: v for k, v in ex.items() if k not in ("_id", "llm_doc")}
+    return out
+
+
+def _terms(*parts: str) -> str:
+    """Identifier-split keyword text for the FTS index (`fetchAllRows` ->
+    `fetch all rows`); Kuzu's own tokenizer does not split camelCase."""
+    from docgraph.bm25 import tokenize
+    seen: dict[str, None] = {}
+    for p in parts:
+        for t in tokenize(p or ""):
+            seen.setdefault(t, None)
+    return " ".join(seen)
 
 
 def _file_hash(path: Path) -> str:
@@ -257,7 +289,8 @@ def load_cache(cfg: Config) -> dict[str, dict]:
     if not cfg.cache_path.exists():
         return {}
     try:
-        return json.loads(cfg.cache_path.read_text())
+        import orjson
+        return orjson.loads(cfg.cache_path.read_bytes())
     except Exception:
         return {}
 
@@ -274,7 +307,10 @@ def _atomic_write_text(path: Path, text: str) -> None:
 
 
 def save_cache(cfg: Config, cache: dict[str, dict]) -> None:
-    _atomic_write_text(cfg.cache_path, json.dumps(cache))
+    import orjson
+    tmp = cfg.cache_path.with_name(cfg.cache_path.name + ".tmp")
+    tmp.write_bytes(orjson.dumps(cache))
+    os.replace(tmp, cfg.cache_path)
 
 
 # --- Indexer --------------------------------------------------------------
@@ -324,6 +360,8 @@ class Indexer:
         progress_emit: "Callable[[int], None] | None" = None,
         vec_cache: "dict[str, list] | None" = None,
         db_lookup: bool = False,
+        prog=None,
+        task=None,
     ) -> None:
         """Stream-embed and insert. plan: [(row_dict, embed_text), ...].
 
@@ -364,8 +402,10 @@ class Indexer:
         t.start()
         try:
             total = len(plan)
-            with _bar() as prog:
-                task = prog.add_task(prog_label, total=total)
+            own = prog is None
+            with (_bar() if own else contextlib.nullcontext(prog)) as prog:
+                if own:
+                    task = prog.add_task(prog_label, total=total)
                 # Pop slabs off the front so already-consumed rows + body
                 # strings can be GC'd while later batches are still embedding.
                 # Caller's list is mutated; callers .clear() it anyway.
@@ -430,6 +470,131 @@ class Indexer:
             t.join()
         if errors:
             raise errors[0]
+
+    def _write_parsed_batch(self, parsed: dict[str, FileParse], new_hashes: dict[str, str],
+                            blame_map: dict, vec_cache: dict, use_cache: bool,
+                            cancel_token, prog, etask, embed_state: dict,
+                            embed_emit: Callable[[int], None], counts: dict) -> None:
+        """Rows for one parsed batch -> File/Variable inserts, embedded
+        Class/Function/Chunk inserts and CONTAINS_CHUNK edges."""
+        file_rows: list[dict] = []
+        variable_rows: list[dict] = []
+        class_plan: list[tuple[dict, str]] = []
+        function_plan: list[tuple[dict, str]] = []
+        chunk_plan: list[tuple[dict, str]] = []
+        cc_func: list[dict] = []
+        cc_class: list[dict] = []
+        cc_file: list[dict] = []
+        model = self.embedder.model_name
+        for rel, fp in parsed.items():
+            fid = self._new_id()
+            file_rows.append({
+                "id": fid, "path": rel, "language": fp.language, "lines": fp.lines,
+                "hash": new_hashes[rel], "pagerank": 0.0,
+            })
+            for ent in fp.entities:
+                eid = self._new_id()
+                ent.extra["_id"] = eid
+                llm_doc = ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None
+                if ent.kind in ("class", "interface", "function", "method"):
+                    text = build_embedding_text(ent.name, ent.qname, ent.signature, ent.body,
+                                                fp.language, ent.kind, llm_doc=llm_doc)
+                    row = {
+                        "id": eid, "name": ent.name, "qname": ent.qname, "file": rel,
+                        "line_start": ent.line_start, "line_end": ent.line_end,
+                        "body": ent.body, "llm_doc": llm_doc, "pagerank": 0.0,
+                        "terms": _terms(ent.name, ent.qname.replace("::", " ")),
+                    }
+                    if ent.kind in ("class", "interface"):
+                        row["kind"] = ent.kind
+                    else:
+                        row["signature"] = ent.signature or ent.body.split("\n")[0][:200]
+                        row["is_method"] = ent.kind == "method"
+                        row["is_test"] = (
+                            ent.name.startswith("test_") or
+                            (ent.name.startswith("test") and len(ent.name) > 4 and ent.name[4:5].isupper()) or
+                            "/test" in rel or "/tests/" in rel or "_test." in rel
+                        )
+                    row["ehash"] = _ehash(model, text)
+                    row.update(self._history_cols(blame_map.get(rel), ent.line_start, ent.line_end))
+                    (class_plan if ent.kind in ("class", "interface") else function_plan).append((row, text))
+                else:
+                    variable_rows.append({
+                        "id": eid, "name": ent.name, "qname": ent.qname, "file": rel,
+                        "line": ent.line_start,
+                        "scope": ent.extra.get("scope", "module") if isinstance(ent.extra, dict) else "module",
+                    })
+            # Sub-entity chunks (long bodies) ...
+            for ent in fp.entities:
+                eid = ent.extra.get("_id") if isinstance(ent.extra, dict) else None
+                if eid is None or ent.kind not in ("function", "method", "class", "interface"):
+                    continue
+                body = ent.body or ""
+                pieces = chunk_body(body, language=fp.language)
+                if not pieces:
+                    continue
+                parent_label = "Class" if ent.kind in ("class", "interface") else "Function"
+                pos = 0
+                for idx, piece in enumerate(pieces):
+                    cid = self._new_id()
+                    at = body.find(piece[:120], pos)
+                    if at < 0:
+                        at = pos
+                    pos = at + 1
+                    ls = ent.line_start + body.count("\n", 0, at)
+                    le = ls + piece.count("\n")
+                    body_truncated = piece[:6000]
+                    row = {
+                        "id": cid, "parent_qname": ent.qname, "parent_label": parent_label,
+                        "file": rel, "idx": idx, "body": body_truncated,
+                        "ehash": _ehash(model, body_truncated),
+                        "line_start": ls, "line_end": min(le, ent.line_end),
+                        "terms": _terms(ent.name, rel),
+                    }
+                    chunk_plan.append((row, body_truncated))
+                    (cc_func if parent_label == "Function" else cc_class).append({"from_id": eid, "to_id": cid})
+            # ... and file-level chunks (plain text / symbol-less / notebook markdown)
+            for ch in fp.chunks or []:
+                cid = self._new_id()
+                body = str(ch.get("body") or "")[:6000]
+                text = f"{rel}\n{body}"
+                chunk_plan.append(({
+                    "id": cid, "parent_qname": rel, "parent_label": "File", "file": rel,
+                    "idx": int(ch.get("idx", 0)), "body": body, "ehash": _ehash(model, text),
+                    "line_start": int(ch.get("line_start") or 1),
+                    "line_end": int(ch.get("line_end") or ch.get("line_start") or 1),
+                    "terms": _terms(rel),
+                }, text))
+                cc_file.append({"from_id": fid, "to_id": cid})
+
+        counts["files"] += len(file_rows)
+        counts["variables"] += len(variable_rows)
+        counts["classes"] += len(class_plan)
+        counts["functions"] += len(function_plan)
+        counts["chunks"] += len(chunk_plan)
+        if file_rows:
+            self.db.insert_nodes("File", file_rows)
+        if variable_rows:
+            self.db.insert_nodes("Variable", variable_rows)
+        n_embed = len(class_plan) + len(function_plan) + len(chunk_plan)
+        if n_embed:
+            embed_state["total"] += n_embed
+            prog.update(etask, total=embed_state["total"])
+            self.embedder._ensure()
+        for label, plan, lookup in (("Class", class_plan, use_cache),
+                                    ("Function", function_plan, use_cache),
+                                    ("Chunk", chunk_plan, False)):
+            if plan:
+                self._stream_embed_insert(
+                    label, plan, f"Embedding ({label})", cancel_token=cancel_token,
+                    progress_emit=embed_emit,
+                    vec_cache=vec_cache.get(label, {}) if use_cache else None,
+                    db_lookup=lookup, prog=prog, task=etask,
+                )
+                plan.clear()
+        self.db.insert_edges("CONTAINS_CHUNK", "Function", "Chunk", cc_func)
+        self.db.insert_edges("CONTAINS_CHUNK", "Class", "Chunk", cc_class)
+        self.db.insert_edges("CONTAINS_CHUNK", "File", "Chunk", cc_file)
 
     # ---- DB delete ----
     def _augment_llm_docstrings(self, parsed: dict,
@@ -706,33 +871,56 @@ class Indexer:
         for rel in deleted_rels:
             cache.pop(rel, None)
 
-        # ---- Step 2: parse changed files in parallel ----
+        # ---- Steps 2-5: parse -> rows -> embed -> insert, streamed in file batches ----
+        # Memory stays flat on big repos: each batch of `index_batch_files`
+        # files is parsed, blamed, (optionally) LLM-augmented, turned into
+        # node rows, embedded and written before the next batch is parsed, so
+        # at most one batch of bodies / vectors is alive at a time. Ids come
+        # from one allocator seeded from the DB state after the delete step.
         _ck()
-        _emit("parse", 0, len(changed))
-        parsed: dict[str, FileParse] = {}
+        _emit("seed_ids")
+        self._seed_ids_from_db()
         errors: list[str] = []
+        changed_set: set[str] = set()
+        n_parsed = 0
+        use_cache = incremental and getattr(self.cfg, "embed_cache", True)
+        text_fallback = bool(getattr(self.cfg, "text_fallback", True))
+        batch_files = max(50, int(getattr(self.cfg, "index_batch_files", 2000) or 2000))
+        blame_budget = int(getattr(self.cfg, "history_max_files", 5000) or 0)
+        counts = {"files": 0, "classes": 0, "functions": 0, "variables": 0, "chunks": 0}
         if changed:
+            _emit("parse", 0, len(changed))
             parse_emit = _throttled("parse", len(changed))
-            with _bar() as prog:
+            roots = self.cfg.roots_with_prefix()
+            args_all: list[tuple[str, str, str, bool]] = []
+            for path, logical_rel in changed:
+                owner = self.cfg.repo_root
+                for root, prefix in roots:
+                    if prefix == "" or logical_rel.startswith(prefix):
+                        owner = root
+                        break
+                args_all.append((str(path), str(owner), logical_rel, text_fallback))
+            embed_state = {"done": 0, "total": 0, "last": 0.0}
+
+            def _embed_emit(n: int) -> None:
+                embed_state["done"] += n
+                now = time.perf_counter()
+                if now - embed_state["last"] >= 1.0:
+                    embed_state["last"] = now
+                    _emit("embed_entities", embed_state["done"], embed_state["total"])
+
+            with _bar() as prog, ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
                 ptask = prog.add_task("Parsing files", total=len(changed))
-                # parse worker receives (absolute_path, owning_root, logical_rel)
-                args_iter = []
-                roots = self.cfg.roots_with_prefix()
-                for path, logical_rel in changed:
-                    owner = self.cfg.repo_root
-                    for root, prefix in roots:
-                        if prefix == "" or logical_rel.startswith(prefix):
-                            owner = root
-                            break
-                    args_iter.append((str(path), str(owner), logical_rel))
-                with ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
-                    for result in ex.map(_parse_worker, args_iter, chunksize=8):
+                etask = prog.add_task("Embedding", total=0)
+                for b0 in range(0, len(args_all), batch_files):
+                    _ck()
+                    batch_args = args_all[b0:b0 + batch_files]
+                    parsed: dict[str, FileParse] = {}
+                    for result in ex.map(_parse_worker, batch_args, chunksize=8):
                         prog.advance(ptask)
                         parse_emit(1)
-                        # Per-file checkpoint: parse can be the slowest
-                        # phase on big repos; this lets a cancel land
-                        # within a few hundred ms instead of waiting for
-                        # the whole pool to drain.
+                        # Per-file checkpoint: a cancel lands within a few
+                        # hundred ms instead of after the whole pool drains.
                         _ck()
                         if result is None:
                             continue
@@ -745,238 +933,65 @@ class Indexer:
                             lines=result["lines"],
                             entities=[Entity(**e) for e in result["entities"]],
                             edges=[RawEdge(**e) for e in result["edges"]],
+                            chunks=result.get("chunks") or [],
+                            extra=result.get("extra") or {},
                         )
                         parsed[fp.file] = fp
-                        # Update cache
                         cache[fp.file] = {
                             "hash": new_hashes[fp.file],
                             "language": fp.language,
                             "lines": fp.lines,
-                            "entities": result["entities"],
+                            # Bodies / signatures live in the DB; the cache
+                            # only needs what resolution and the delta read.
+                            "entities": [_slim_entity(e) for e in result["entities"]],
                             "edges": result["edges"],
                         }
-
-        # ---- Step 2b: symbol history (one `git blame` per parsed file) ----
-        blame_map: dict[str, list[tuple[str, int]]] = {}
-        if getattr(self.cfg, "history", True) and parsed:
-            _ck()
-            _emit("history", 0, len(parsed))
-            try:
-                blame_map = _history.blame_many(
-                    self._blame_jobs(list(parsed.keys())),
-                    workers=min(8, max(1, self.cfg.workers)),
-                    max_files=int(getattr(self.cfg, "history_max_files", 5000) or 0),
-                )
-            except Exception:
-                log.debug("history blame failed", exc_info=True)
-                blame_map = {}
-
-        # ---- Step 3a: optional LLM docstring augmentation ----
-        _ck()
-        if self.cfg.llm_docstrings and parsed:
-            _emit("llm_augment", 0, len(parsed))
-            self._augment_llm_docstrings(parsed, cancel_token=cancel_token)
-
-        # ---- Step 3: seed ID allocator ----
-        _ck()
-        _emit("seed_ids")
-        self._seed_ids_from_db()
-
-        # ---- Step 4: build node rows for newly-parsed files ----
-        # Streaming design: we collect (row, embed_text) plans per label and
-        # then embed-and-insert in batches via _stream_embed_insert(). This
-        # caps peak memory at ~one batch worth of vectors instead of holding
-        # all 200k+ embeddings live at once. No `[0.0] * dim` placeholders;
-        # numpy slices are attached just-in-time per batch.
-        file_rows: list[dict] = []
-        variable_rows: list[dict] = []
-        class_plan: list[tuple[dict, str]] = []     # (row, embed_text)
-        function_plan: list[tuple[dict, str]] = []  # (row, embed_text)
-
-        for rel, fp in parsed.items():
-            fid = self._new_id()
-            file_rows.append({
-                "id": fid,
-                "path": rel,
-                "language": fp.language,
-                "lines": fp.lines,
-                "hash": new_hashes[rel],
-                "pagerank": 0.0,
-            })
-            for ent in fp.entities:
-                eid = self._new_id()
-                # Stash id back into cache entity for lookups later
-                # (we'll rebuild the cache entity with ids below)
-                ent.extra["_id"] = eid
-                if ent.kind in ("class", "interface"):
-                    row = {
-                        "id": eid,
-                        "name": ent.name,
-                        "qname": ent.qname,
-                        "file": rel,
-                        "line_start": ent.line_start,
-                        "line_end": ent.line_end,
-                        "body": ent.body,
-                        "kind": ent.kind,
-                        "llm_doc": ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
-                        "pagerank": 0.0,
-                    }
-                    text = build_embedding_text(
-                        ent.name, ent.qname, ent.signature, ent.body,
-                        fp.language, ent.kind,
-                        llm_doc=row["llm_doc"],
+                    if not parsed:
+                        continue
+                    # 2b: symbol history (one `git blame` per parsed file)
+                    blame_map: dict[str, list[tuple[str, int]]] = {}
+                    if getattr(self.cfg, "history", True) and blame_budget > 0:
+                        _ck()
+                        _emit("history", 0, len(parsed))
+                        try:
+                            jobs = self._blame_jobs(list(parsed.keys()))
+                            if blame_budget > 0:
+                                jobs = jobs[:blame_budget]
+                                blame_budget -= len(jobs)
+                            blame_map = _history.blame_many(
+                                jobs, workers=min(8, max(1, self.cfg.workers)),
+                                max_files=len(jobs) or 1,
+                            )
+                        except Exception:
+                            log.debug("history blame failed", exc_info=True)
+                            blame_map = {}
+                    # 3a: optional LLM docstring augmentation
+                    _ck()
+                    if self.cfg.llm_docstrings:
+                        _emit("llm_augment", 0, len(parsed))
+                        self._augment_llm_docstrings(parsed, cancel_token=cancel_token)
+                    # 4-5: rows, embeddings, inserts for this batch
+                    self._write_parsed_batch(
+                        parsed, new_hashes, blame_map, vec_cache, use_cache,
+                        cancel_token, prog, etask, embed_state, _embed_emit, counts,
                     )
-                    row["ehash"] = _ehash(self.embedder.model_name, text)
-                    row.update(self._history_cols(blame_map.get(rel), ent.line_start, ent.line_end))
-                    class_plan.append((row, text))
-                elif ent.kind in ("function", "method"):
-                    is_test = (
-                        ent.name.startswith("test_") or
-                        (ent.name.startswith("test") and len(ent.name) > 4 and ent.name[4:5].isupper()) or
-                        "/test" in rel or "/tests/" in rel or "_test." in rel
-                    )
-                    row = {
-                        "id": eid,
-                        "name": ent.name,
-                        "qname": ent.qname,
-                        "file": rel,
-                        "line_start": ent.line_start,
-                        "line_end": ent.line_end,
-                        "body": ent.body,
-                        "signature": ent.signature or ent.body.split("\n")[0][:200],
-                        "is_method": ent.kind == "method",
-                        "is_test": is_test,
-                        "llm_doc": ent.extra.get("llm_doc") if isinstance(ent.extra, dict) else None,
-                        "pagerank": 0.0,
-                    }
-                    text = build_embedding_text(
-                        ent.name, ent.qname, ent.signature, ent.body,
-                        fp.language, ent.kind,
-                        llm_doc=row["llm_doc"],
-                    )
-                    row["ehash"] = _ehash(self.embedder.model_name, text)
-                    row.update(self._history_cols(blame_map.get(rel), ent.line_start, ent.line_end))
-                    function_plan.append((row, text))
-                else:
-                    variable_rows.append({
-                        "id": eid,
-                        "name": ent.name,
-                        "qname": ent.qname,
-                        "file": rel,
-                        "line": ent.line_start,
-                        "scope": ent.extra.get("scope", "module") if isinstance(ent.extra, dict) else "module",
-                    })
-
-        n_classes = len(class_plan)
-        n_functions = len(function_plan)
+                    changed_set.update(parsed.keys())
+                    n_parsed += len(parsed)
+                    parsed.clear()
+            _emit("embed_entities", embed_state["done"], embed_state["total"])
         _console.print(
-            f"[cyan]Indexing[/] {len(file_rows)} files, {n_classes} classes, "
-            f"{n_functions} functions, {len(variable_rows)} variables"
+            f"[cyan]Indexed[/] {counts['files']} files, {counts['classes']} classes, "
+            f"{counts['functions']} functions, {counts['variables']} variables, "
+            f"{counts['chunks']} chunks"
         )
+        del vec_cache
 
-        # ---- Step 5a: insert files + variables (no embeddings) ----
-        if file_rows:
-            with _bar() as prog:
-                task = prog.add_task("Writing files", total=len(file_rows))
-                self.db.insert_nodes("File", file_rows, on_progress=lambda n: prog.advance(task, n))
-        if variable_rows:
-            with _bar() as prog:
-                task = prog.add_task("Writing variables", total=len(variable_rows))
-                self.db.insert_nodes("Variable", variable_rows, on_progress=lambda n: prog.advance(task, n))
-        del file_rows, variable_rows
-
-        # Warm up the embedder once before any progress bar opens, so the
-        # "Loading embedding model" log doesn't punch through the live display.
-        ent_total = len(class_plan) + len(function_plan)
-        if class_plan or function_plan:
-            _ck()
-            _emit("embed_entities", 0, ent_total)
-            self.embedder._ensure()
-        ent_emit = _throttled("embed_entities", ent_total) if ent_total else None
-
-        # ---- Step 5b: stream embed + insert classes/functions ----
-        use_cache = incremental and getattr(self.cfg, "embed_cache", True)
-        if class_plan:
-            self._stream_embed_insert("Class", class_plan, "Embedding entities (classes)",
-                                       cancel_token=cancel_token,
-                                       progress_emit=ent_emit,
-                                       vec_cache=vec_cache.get("Class", {}) if use_cache else None,
-                                       db_lookup=use_cache)
-            class_plan.clear()
-        if function_plan:
-            self._stream_embed_insert("Function", function_plan, "Embedding entities (functions)",
-                                       cancel_token=cancel_token,
-                                       progress_emit=ent_emit,
-                                       vec_cache=vec_cache.get("Function", {}) if use_cache else None,
-                                       db_lookup=use_cache)
-            function_plan.clear()
-
-        # ---- Step 5c: build chunk plan, then stream embed + insert ----
-        chunk_plan: list[tuple[dict, str]] = []
-        chunk_contains_func: list[dict] = []
-        chunk_contains_class: list[dict] = []
-        for rel, fp in parsed.items():
-            for ent in fp.entities:
-                eid = ent.extra.get("_id") if isinstance(ent.extra, dict) else None
-                if eid is None:
-                    continue
-                if ent.kind not in ("function", "method", "class", "interface"):
-                    continue
-                pieces = chunk_body(ent.body or "", language=fp.language)
-                if not pieces:
-                    continue
-                parent_label = "Class" if ent.kind in ("class", "interface") else "Function"
-                for idx, piece in enumerate(pieces):
-                    cid = self._new_id()
-                    body_truncated = piece[:6000]
-                    row = {
-                        "id": cid,
-                        "parent_qname": ent.qname,
-                        "parent_label": parent_label,
-                        "file": rel,
-                        "idx": idx,
-                        "body": body_truncated,
-                        "ehash": _ehash(self.embedder.model_name, body_truncated),
-                    }
-                    chunk_plan.append((row, body_truncated))
-                    if parent_label == "Function":
-                        chunk_contains_func.append({"from_id": eid, "to_id": cid})
-                    else:
-                        chunk_contains_class.append({"from_id": eid, "to_id": cid})
-
-        if chunk_plan:
-            _ck()
-            _emit("embed_chunks", 0, len(chunk_plan))
-            chunk_emit = _throttled("embed_chunks", len(chunk_plan))
-            self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks",
-                                       cancel_token=cancel_token,
-                                       progress_emit=chunk_emit,
-                                       vec_cache=vec_cache.get("Chunk", {}) if use_cache else None,
-                                       db_lookup=False)
-            chunk_plan.clear()
-
-        # ---- Step 5d: CONTAINS_CHUNK edges ----
-        n_chunk_edges = len(chunk_contains_func) + len(chunk_contains_class)
-        if n_chunk_edges:
-            with _bar() as prog:
-                task = prog.add_task("Writing chunk edges", total=n_chunk_edges)
-                self.db.insert_edges(
-                    "CONTAINS_CHUNK", "Function", "Chunk", chunk_contains_func,
-                    on_progress=lambda n: prog.advance(task, n),
-                )
-                self.db.insert_edges(
-                    "CONTAINS_CHUNK", "Class", "Chunk", chunk_contains_class,
-                    on_progress=lambda n: prog.advance(task, n),
-                )
-        del chunk_contains_func, chunk_contains_class
-
-        # All entity bodies have been embedded + persisted; the rest of the
-        # pipeline reads from `cache` and the DB. Drop `parsed` so the entity
-        # body strings can be GC'd before symbol-table building loads its own
-        # working set.
-        changed_set = set(parsed.keys())
-        n_parsed = len(parsed)
-        parsed.clear()
+        # Search indexes (HNSW vectors + FTS). A fresh DB gets them once,
+        # after the bulk load; an existing DB keeps them current by itself.
+        _ck()
+        _emit("search_index")
+        search_status = self.db.ensure_search_indexes(
+            on_progress=lambda what: _console.print(f"[dim]Building {what}[/]"))
 
         _ck()
         _emit("symbol_table")
@@ -1511,6 +1526,7 @@ class Indexer:
         state["embedding_model"] = self.embedder.model_name
         state["resolution"] = resolution_stats
         state["embed_cache"] = {"hits": self.embed_cache_hits, "misses": self.embed_cache_misses}
+        state["search_index"] = search_status
         state["scan"] = {"hashed": scan_res.hashed, "reused": scan_res.reused,
                          "root_hash": scan_res.root_hash}
         if n_communities is not None:

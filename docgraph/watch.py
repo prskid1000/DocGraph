@@ -30,7 +30,7 @@ from watchfiles import Change, awatch
 from docgraph.config import Config, MAX_FILE_BYTES
 # (embedder is sourced from the workspace pool, not constructed here)
 from docgraph.index import Indexer
-from docgraph.parse import detect_language
+from docgraph.parse import classify_file
 from docgraph.workspace import Workspace, slug_for_root
 
 _console = Console()
@@ -54,19 +54,23 @@ def _is_relevant(cfg: Config, path: Path) -> bool:
         return False
     if cfg.is_ignored(rel, root=matched_root):
         return False
+    text_ok = bool(getattr(cfg, "text_fallback", True))
     if path.exists():
         if path.is_dir():
-            return False
-        if detect_language(path) is None:
             return False
         try:
             if path.stat().st_size > MAX_FILE_BYTES:
                 return False
         except OSError:
             return False
+        kind = classify_file(path)
     else:
-        if detect_language(path) is None:
-            return False
+        # Deleted: decide from the name alone (the file can't be sniffed).
+        kind = classify_file(path, sniff=False)
+    if kind is None:
+        return False
+    if kind.startswith("text:") and not text_ok:
+        return False
     return True
 
 

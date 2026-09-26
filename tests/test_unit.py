@@ -166,11 +166,16 @@ def test_watch_filter_accepts_python(tmp_path: Path):
 def test_watch_filter_rejects_unsupported_extension(tmp_path: Path):
     from docgraph.watch import _is_relevant
     cfg = load_config(tmp_path)
-    # Markdown is indexed by the document pass now, so use an extension no
-    # pass recognises.
+    # Unknown extensions are indexed when they are text (plain-text
+    # fallback); binary content is not.
     p = tmp_path / "notes.zzunknown"
-    p.write_text("hi")
+    p.write_bytes(b"\x00\x01binary\x00")
     assert _is_relevant(cfg, p) is False
+    t = tmp_path / "notes2.zzunknown"
+    t.write_text("plain words")
+    assert _is_relevant(cfg, t) is True
+    cfg2 = load_config(tmp_path, text_fallback=False)
+    assert _is_relevant(cfg2, t) is False
 
 
 def test_watch_filter_respects_ignore(tmp_path: Path):

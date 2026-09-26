@@ -410,6 +410,10 @@ class FileParse:
     lines: int
     entities: list[Entity]
     edges: list[RawEdge]
+    # File-level text chunks ({idx, line_start, line_end, body}) for
+    # plain-text files, symbol-less grammar files and notebook markdown.
+    chunks: list[dict] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)
 
 
 @lru_cache(maxsize=64)
@@ -659,22 +663,172 @@ def _string_comment_lines(root: ts.Node) -> set[int]:
     return out
 
 
-def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> FileParse | None:
-    lang_key = detect_language(path)
-    if lang_key is None:
-        return None
-    parser = _get_parser(lang_key)
-    if parser is None:
+_HTML_DROP = re.compile(r"<(script|style)\b.*?</\1\s*>", re.S | re.I)
+_HTML_TAG = re.compile(r"<[^>]*>")
+
+
+def _chunk_source_text(text: str, language: str) -> list[dict]:
+    """File-level chunks for a symbol-less / plain-text file. HTML/XML-ish
+    markup is reduced to its text per line so the line numbers still point
+    at the original file."""
+    from docgraph.summary import text_chunks
+    if language in ("html",):
+        # blank out script/style bodies but keep their newlines
+        text = _HTML_DROP.sub(lambda m: "\n" * m.group(0).count("\n"), text)
+        text = "\n".join(_HTML_TAG.sub(" ", ln) for ln in text.split("\n"))
+    return [{"idx": i, "line_start": s, "line_end": e, "body": b}
+            for i, (s, e, b) in enumerate(text_chunks(text))]
+
+
+def _rel(path: Path, repo_root: Path, rel_override: str | None) -> str:
+    return rel_override if rel_override is not None else str(path.relative_to(repo_root)).replace("\\", "/")
+
+
+def parse_file(path: Path, repo_root: Path, rel_override: str | None = None,
+               text_fallback: bool = True) -> FileParse | None:
+    """Parse one file. Grammar files give entities + edges; files no grammar
+    claims (or whose grammar is not installed) fall back to plain text when
+    they decode as text: a File with `language` = the detected kind and
+    line/paragraph `chunks`. Grammar files without any function/class get
+    the same file-level chunks so they stay searchable."""
+    kind = classify_file(path)
+    if kind is None:
         return None
     try:
         source = path.read_bytes()
     except OSError:
         return None
+    rel = _rel(path, repo_root, rel_override)
+    if kind == "ipynb":
+        return _parse_notebook(source, rel, text_fallback=text_fallback)
+    if kind.startswith("text:"):
+        if not text_fallback:
+            return None
+        return _parse_text(source, rel, kind[5:])
+    if _get_parser(kind) is None:
+        # Grammar wheel missing / broken: plain-text path under the same key.
+        if not text_fallback:
+            return None
+        return _parse_text(source, rel, kind)
+    fp = _parse_grammar(source, kind, rel)
+    if fp is None:
+        return _parse_text(source, rel, kind) if text_fallback else None
+    if text_fallback and not any(e.kind in ("function", "method", "class", "interface")
+                                 for e in fp.entities):
+        text = decode_text(source)
+        if text is not None:
+            fp.chunks = _chunk_source_text(text, kind)
+    return fp
+
+
+def _parse_text(source: bytes, rel: str, kind: str) -> FileParse | None:
+    text = decode_text(source)
+    if text is None:
+        return None
+    return FileParse(file=rel, language=kind or "text", lines=text.count("\n") + 1,
+                     entities=[], edges=[], chunks=_chunk_source_text(text, kind))
+
+
+# Jupyter kernel language names -> grammar keys.
+_NB_LANG = {"python": "python", "python3": "python", "ipython": "python",
+            "r": "r", "julia": "julia", "javascript": "javascript",
+            "typescript": "typescript", "scala": "scala", "ruby": "ruby",
+            "bash": "bash", "sh": "bash", "go": "go", "rust": "rust",
+            "c++": "cpp", "cpp": "cpp", "java": "java", "kotlin": "kotlin",
+            "csharp": "c_sharp", "c#": "c_sharp", "lua": "lua", "haskell": "haskell",
+            "sql": "sql", "powershell": "powershell"}
+
+
+def notebook_text(data: bytes) -> tuple[str, str, list[tuple[str, int, int]]] | None:
+    """(virtual_text, language, [(cell_type, line_start, line_end)]) for an
+    .ipynb: every cell's source in order, one blank line between cells. The
+    virtual line numbers are what entities / chunks of a notebook refer to
+    (the UI shows the same text for the file)."""
+    import json as _json
+    raw = decode_text(data)
+    if raw is None:
+        return None
+    try:
+        nb = _json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(nb, dict):
+        return None
+    meta = nb.get("metadata") or {}
+    lang = ""
+    if isinstance(meta, dict):
+        li = meta.get("language_info") or {}
+        ks = meta.get("kernelspec") or {}
+        lang = str((li.get("name") if isinstance(li, dict) else "") or
+                   (ks.get("language") if isinstance(ks, dict) else "") or "python").lower()
+    lang_key = _NB_LANG.get(lang, lang or "python")
+    parts: list[str] = []
+    spans: list[tuple[str, int, int]] = []
+    line = 1
+    for cell in nb.get("cells") or []:
+        if not isinstance(cell, dict):
+            continue
+        src = cell.get("source") or ""
+        if isinstance(src, list):
+            src = "".join(str(s) for s in src)
+        src = str(src).rstrip("\n")
+        n = src.count("\n") + 1
+        spans.append((str(cell.get("cell_type") or "code"), line, line + n - 1))
+        parts.append(src)
+        line += n + 1
+    return "\n\n".join(parts) + ("\n" if parts else ""), lang_key, spans
+
+
+def _parse_notebook(source: bytes, rel: str, text_fallback: bool = True) -> FileParse | None:
+    """Code cells parse as the notebook's language (markdown / raw cells are
+    blanked to keep line numbers); markdown cells become text chunks."""
+    nt = notebook_text(source)
+    if nt is None:
+        return _parse_text(source, rel, "json") if text_fallback else None
+    text, lang_key, spans = nt
+    lines = text.split("\n")
+    code_lines = list(lines)
+    md_blocks: list[tuple[int, int]] = []
+    for ctype, s, e in spans:
+        if ctype != "code":
+            for i in range(s - 1, min(e, len(code_lines))):
+                code_lines[i] = ""
+            if ctype == "markdown":
+                md_blocks.append((s, e))
+    fp: FileParse | None = None
+    if _get_parser(lang_key) is not None:
+        fp = _parse_grammar("\n".join(code_lines).encode("utf-8"), lang_key, rel)
+    if fp is None:
+        fp = FileParse(file=rel, language=lang_key, lines=len(lines), entities=[], edges=[])
+    fp.lines = len(lines)
+    chunks: list[dict] = []
+    from docgraph.summary import text_chunks
+    for s, e in md_blocks:
+        block = "\n".join(lines[s - 1:e])
+        for cs, ce, body in text_chunks(block):
+            chunks.append({"idx": len(chunks), "line_start": s + cs - 1,
+                           "line_end": s + ce - 1, "body": body})
+    if _get_parser(lang_key) is None:
+        # No grammar for the kernel language: code cells are text chunks too.
+        for ctype, s, e in spans:
+            if ctype == "code":
+                block = "\n".join(lines[s - 1:e])
+                for cs, ce, body in text_chunks(block):
+                    chunks.append({"idx": len(chunks), "line_start": s + cs - 1,
+                                   "line_end": s + ce - 1, "body": body})
+    fp.chunks = chunks if text_fallback else []
+    fp.extra = {"notebook": True}
+    return fp
+
+
+def _parse_grammar(source: bytes, lang_key: str, rel: str) -> FileParse | None:
+    parser = _get_parser(lang_key)
+    if parser is None:
+        return None
     try:
         tree = parser.parse(source)
     except Exception:
         return None
-    rel = rel_override if rel_override is not None else str(path.relative_to(repo_root)).replace("\\", "/")
     lines = source.count(b"\n") + 1
 
     entities: list[Entity] = []
