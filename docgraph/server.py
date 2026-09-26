@@ -596,6 +596,51 @@ def make_app(workspace: Workspace) -> FastAPI:
         return Response(content=payload, media_type="application/octet-stream",
                         headers={"Cache-Control": "no-store"})
 
+    @app.get("/api/tiles/bbox")
+    async def api_tiles_bbox(x0: float, y0: float, x1: float, y1: float, level: int,
+                             lod: str | None = None, edges: str | None = None,
+                             kinds: str | None = None, min_conf: float = 0.0, budget: int = 0,
+                             root: RootSlug = DEFAULT):
+        """Every tile of `level` that intersects the world rectangle
+        (x0, y0)-(x1, y1), framed like /api/tiles/batch. Bounded: at most
+        256 tiles -- ask for a coarser level for a bigger rectangle."""
+        from fastapi.responses import Response
+        from docgraph import tiles as T
+        store = _tile_store(_slot(root))
+        man = store.get_manifest()
+        if man is None:
+            raise HTTPException(404, "no tiles")
+        level = max(0, min(T.MAX_LEVEL, int(level)))
+        bx0, by0, bx1, _by1 = man["bbox"]
+        n = 1 << level
+        tw = (bx1 - bx0) / n
+
+        def cl(v: float) -> int:
+            return max(0, min(n - 1, int((v - bx0) // tw)))
+
+        def cly(v: float) -> int:
+            return max(0, min(n - 1, int((v - by0) // tw)))
+
+        xs = range(cl(min(x0, x1)), cl(max(x0, x1)) + 1)
+        ys = range(cly(min(y0, y1)), cly(max(y0, y1)) + 1)
+        if len(xs) * len(ys) > 256:
+            raise HTTPException(400, f"{len(xs) * len(ys)} tiles at level {level}; use a coarser level")
+        ek = _parse_kinds(edges, T.EDGE_KINDS)
+        nk = _parse_kinds(kinds, T.NODE_KINDS)
+
+        def _build() -> bytes:
+            items = []
+            for tx in xs:
+                for ty in ys:
+                    body, etag = store.tile(level, tx, ty, lod=lod, budget=budget or T.TILE_BUDGET,
+                                            edge_kinds=ek, node_kinds=nk, min_conf=float(min_conf))
+                    items.append((level, tx, ty, body, etag))
+            return T.frame_batch(items)
+
+        payload = await asyncio.to_thread(_build)
+        return Response(content=payload, media_type="application/octet-stream",
+                        headers={"Cache-Control": "no-store"})
+
     @app.get("/api/tiles/locate")
     async def api_tiles_locate(ids: str, root: RootSlug = DEFAULT):
         """World position (+ kind / cluster / name) of nodes by id -- the UI

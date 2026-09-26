@@ -511,6 +511,11 @@ def test_tile_endpoints(text_client):
     assert r2.status_code == 304
     b = text_client.get("/api/tiles/batch", params={"keys": "0/0/0,1/0/0,1/1/1"})
     assert b.status_code == 200 and struct.unpack_from("<I", b.content, 0)[0] == 3
+    bb = man["content_bbox"]
+    bx = text_client.get("/api/tiles/bbox", params={"x0": bb[0], "y0": bb[1], "x1": bb[2], "y1": bb[3], "level": 2})
+    assert bx.status_code == 200 and struct.unpack_from("<I", bx.content, 0)[0] >= 1
+    assert text_client.get("/api/tiles/bbox", params={"x0": bb[0], "y0": bb[1], "x1": bb[2], "y1": bb[3],
+                                                      "level": 16}).status_code in (200, 400)
     loc = text_client.get("/api/tiles/locate", params={"ids": ",".join(str(i) for i in t["ids"][:3].tolist())}).json()
     assert loc["ready"] and len(loc["nodes"]) == min(3, len(t["ids"]))
     nid = int(t["ids"][0])

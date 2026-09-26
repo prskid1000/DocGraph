@@ -904,11 +904,20 @@ class Indexer:
             with _bar() as prog, ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
                 ptask = prog.add_task("Parsing files", total=len(changed))
                 etask = prog.add_task("Embedding", total=0)
+                # Executor.map submits eagerly: queueing batch N+1 before
+                # batch N is embedded keeps the pool parsing while the GPU
+                # embeds (at most two batches of parse results in flight).
+                def _submit(start: int):
+                    return ex.map(_parse_worker, args_all[start:start + batch_files], chunksize=8)
+
+                pending = _submit(0)
                 for b0 in range(0, len(args_all), batch_files):
                     _ck()
-                    batch_args = args_all[b0:b0 + batch_files]
+                    current = pending
+                    nxt = b0 + batch_files
+                    pending = _submit(nxt) if nxt < len(args_all) else None
                     parsed: dict[str, FileParse] = {}
-                    for result in ex.map(_parse_worker, batch_args, chunksize=8):
+                    for result in current:
                         prog.advance(ptask)
                         parse_emit(1)
                         # Per-file checkpoint: a cancel lands within a few
@@ -1821,6 +1830,25 @@ class Indexer:
                 r = rows_of(mn)
                 ok = r >= 0
                 comm_of[r[ok]] = mc[ok]
+        # Files with no graph edges (READMEs, configs, empty __init__.py) have
+        # no Louvain community; for layout / tiles they join the dominant
+        # community of their directory (MEMBER_OF itself is left as is).
+        comm_of = comm_of.copy()
+        files_idx = np.nonzero(kinds == 0)[0]
+        lone = [int(i) for i in files_idx.tolist() if comm_of[i] < 0]
+        if lone and len(lone) < len(files_idx):
+            from collections import Counter as _Counter
+            by_dir: dict[str, _Counter] = defaultdict(_Counter)
+            for i in files_idx.tolist():
+                if comm_of[i] >= 0:
+                    by_dir[src["files"][i].rsplit("/", 1)[0] if "/" in src["files"][i] else ""][int(comm_of[i])] += 1
+            for i in lone:
+                f = src["files"][i]
+                cnt = by_dir.get(f.rsplit("/", 1)[0] if "/" in f else "")
+                if cnt:
+                    comm_of[i] = cnt.most_common(1)[0][0]
+            sym = (kinds != 0) & (file_row >= 0) & (comm_of < 0)
+            comm_of[sym] = comm_of[file_row[sym]]
         x, y = src["x"].astype(np.float64), src["y"].astype(np.float64)
         comm_xy: dict[int, tuple[float, float, float]] = {}
         if relayout:

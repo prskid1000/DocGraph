@@ -20,6 +20,12 @@ from docgraph.rerank import Reranker
 from docgraph.rules import rules_for as _rules_for
 
 
+from concurrent.futures import ThreadPoolExecutor as _TPE
+
+# Shared by every Retriever: search fans its index legs out over it.
+_SEARCH_POOL = _TPE(max_workers=6, thread_name_prefix="docgraph-search")
+
+
 class Retriever:
     def __init__(self, db: GraphDB, embedder: Embedder, cfg: Config | None = None,
                  workspace=None):
@@ -174,21 +180,43 @@ class Retriever:
         qlow = query.lower().strip()
         results: list[dict] = []
 
+        # -- index legs, run concurrently on per-thread connections --------
+        ident = bool(qlow) and not any(ch.isspace() for ch in qlow)
+        legs: dict[str, object] = {
+            "c_vec": lambda: self._safe(lambda: self.db.vector_topk("Chunk", qv, k * 2), []),
+            "c_kw": lambda: self._safe(lambda: self.db.fts_topk("Chunk", fts_q, k), []) if fts_q else [],
+        }
+        for label in labels:
+            legs[f"{label}_vec"] = (lambda lb: lambda: self._safe(lambda: self.db.vector_topk(lb, qv, k), []))(label)
+            legs[f"{label}_kw"] = (lambda lb: lambda: self._safe(lambda: self.db.fts_topk(lb, fts_q, k), [])
+                                   if fts_q else [])(label)
+            if ident:   # a multi-word query can never equal a symbol name
+                legs[f"{label}_name"] = (lambda lb: lambda: [r["id"] for r in self._safe(lambda: self.db.fetch_all(
+                    f"MATCH (n:{lb}) WHERE lower(n.name) = $q RETURN n.id AS id LIMIT 50",
+                    {"q": qlow}), [])])(label)
+        got = self._parallel(legs)
         # -- sub-chunk leg: best chunk similarity per parent --------------
-        chunk_vec = self._safe(lambda: self.db.vector_topk("Chunk", qv, k * 2), [])
-        chunk_kw = self._safe(lambda: self.db.fts_topk("Chunk", fts_q, k), []) if fts_q else []
+        chunk_vec = got["c_vec"]
+        chunk_kw = got["c_kw"]
         cids = list({i for i, _ in chunk_vec} | {i for i, _ in chunk_kw})
         crow: dict[int, dict] = {}
         if cids:
             for r in self.db.fetch_all(
                 "MATCH (c:Chunk) WHERE c.id IN $ids RETURN c.id AS id, c.parent_qname AS pq, "
                 "c.parent_label AS pl, c.file AS file, c.line_start AS line, "
-                "substring(c.body, 1, 400) AS body, c.embedding AS e", {"ids": cids}):
+                "substring(c.body, 1, 400) AS body", {"ids": cids}):
                 crow[r["id"]] = r
-        chunk_sim: dict[int, float] = {}
-        for cid, r in crow.items():
-            e = r.get("e")
-            chunk_sim[cid] = float(np.dot(self._unit(e), qv)) if e is not None else 0.0
+        chunk_sim: dict[int, float] = {i: s_ for i, s_ in chunk_vec}
+        need_c = [i for i in crow if i not in chunk_sim]
+        if need_c:
+            eids, emat = self._safe(lambda: self.db.embeddings_for("Chunk", need_c),
+                                    (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
+            if len(eids):
+                en = emat / (np.linalg.norm(emat, axis=1, keepdims=True) + 1e-9)
+                for i, s_ in zip(eids.tolist(), (en @ qv).tolist()):
+                    chunk_sim[i] = float(s_)
+        for cid in crow:
+            chunk_sim.setdefault(cid, 0.0)
         chunk_max: dict[str, float] = {}
         for cid, r in crow.items():
             if r.get("pl") in ("Function", "Class"):
@@ -197,30 +225,38 @@ class Retriever:
                     chunk_max[q] = chunk_sim[cid]
         chunk_kw_rank = {cid: i for i, (cid, _s) in enumerate(chunk_kw)}
 
-        for label in labels:
-            vec = self._safe(lambda: self.db.vector_topk(label, qv, k), [])
-            kw = self._safe(lambda: self.db.fts_topk(label, fts_q, k), []) if fts_q else []
+        def score_label(label: str) -> list[dict]:
+            out: list[dict] = []
+            vec = got[f"{label}_vec"]
+            kw = got[f"{label}_kw"]
             ids = {i for i, _ in vec} | {i for i, _ in kw}
-            if qlow:
-                ids |= {r["id"] for r in self._safe(lambda: self.db.fetch_all(
-                    f"MATCH (n:{label}) WHERE lower(n.name) = $q RETURN n.id AS id LIMIT 50",
-                    {"q": qlow}), [])}
+            ids |= set(got.get(f"{label}_name") or ())
             parents = [q for q in chunk_max if q]
             if parents:
                 ids |= {r["id"] for r in self._safe(lambda: self.db.fetch_all(
                     f"MATCH (n:{label}) WHERE n.qname IN $qs RETURN n.id AS id",
                     {"qs": parents}), [])}
             if not ids:
-                continue
+                return out
             rows = self.db.fetch_all(
                 f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name, "
                 f"n.qname AS qname, n.file AS file, n.line_start AS line_start, "
-                f"substring(n.body, 1, 400) AS body, n.embedding AS embedding, "
+                f"substring(n.body, 1, 400) AS body, "
                 f"n.pagerank AS pagerank, n.llm_doc AS llm_doc", {"ids": list(ids)})
             if not rows:
-                continue
-            sims = [float(np.dot(self._unit(r["embedding"]), qv)) if r.get("embedding") is not None
-                    else 0.0 for r in rows]
+                return out
+            # cosine of the vector hits comes from the index; only keyword /
+            # name / chunk-parent candidates need their embedding read
+            sim_of = {i: s_ for i, s_ in vec}
+            need = [r["id"] for r in rows if r["id"] not in sim_of]
+            if need:
+                eids, emat = self._safe(lambda: self.db.embeddings_for(label, need),
+                                        (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
+                if len(eids):
+                    en = emat / (np.linalg.norm(emat, axis=1, keepdims=True) + 1e-9)
+                    for i, s_ in zip(eids.tolist(), (en @ qv).tolist()):
+                        sim_of[i] = float(s_)
+            sims = [float(sim_of.get(r["id"], 0.0)) for r in rows]
             best = [max(s_, chunk_max.get(r["qname"], -1.0)) for r, s_ in zip(rows, sims)]
             idx_of = {r["id"]: i for i, r in enumerate(rows)}
             vec_order = sorted(range(len(rows)), key=lambda i: best[i], reverse=True)
@@ -233,13 +269,16 @@ class Retriever:
                 rank_term = (ppr_boost * 0.5) if ppr else (pr * 0.1)
                 score = best[i] + name_boost + rank_term + float(fused.get(i, 0.0)) * 8.0
                 _, snippet = self._redact(r["file"], None, (r["body"] or "")[:300])
-                results.append({
+                out.append({
                     "label": label, "id": r["id"], "name": r["name"], "qname": r["qname"],
                     "file": r["file"], "line": r["line_start"], "snippet": snippet,
                     "llm_doc": r.get("llm_doc"), "score": float(score), "pagerank": float(pr),
                     "ppr": float(ppr_boost),
                 })
+            return out
 
+        for part in self._parallel({lb: (lambda lb_: lambda: score_label(lb_))(lb) for lb in labels}).values():
+            results.extend(part)
         # -- file-level hits (plain text, docs, configs, notebook markdown) --
         if want_files:
             results.extend(self._file_hits(crow, chunk_sim, chunk_kw, chunk_kw_rank, qlow, ppr))
@@ -301,6 +340,21 @@ class Retriever:
                 "score": float(score), "pagerank": pr, "ppr": float(ppr_boost),
             })
         return out
+
+    def _parallel(self, legs: dict) -> dict:
+        """Run independent read legs concurrently, each on its own thread's
+        connection (GraphDB.thread_conn); falls back to sequential."""
+        if len(legs) <= 1:
+            return {k: fn() for k, fn in legs.items()}
+
+        def run(fn):
+            with self.db.thread_conn():
+                return fn()
+        try:
+            futs = {k: _SEARCH_POOL.submit(run, fn) for k, fn in legs.items()}
+            return {k: f.result() for k, f in futs.items()}
+        except Exception:  # noqa: BLE001 - e.g. DB closed under us: plain path
+            return {k: fn() for k, fn in legs.items()}
 
     @staticmethod
     def _unit(v) -> np.ndarray:

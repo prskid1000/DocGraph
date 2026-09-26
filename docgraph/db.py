@@ -284,6 +284,11 @@ class GraphDB:
         self._known_ids: dict[str, set[int]] = {}
         self._props_cache: dict[str, set[str]] = {}
         self.read_only = read_only
+        # Per-thread side connections (see thread_conn) for concurrent reads.
+        import threading as _th
+        self._tls = _th.local()
+        self._side: list = []
+        self._side_lock = _th.Lock()
 
     def init_schema(self) -> None:
         # NODE_DDL templates contain `{dim}` placeholders for embedding columns
@@ -652,12 +657,28 @@ class GraphDB:
         import numpy as np
         if not ids:
             return np.zeros(0, np.int64), np.zeros((0, self.embedding_dim), np.float32)
-        t = self.fetch_arrow(f"MATCH (n:{label}) WHERE n.id IN $ids AND n.embedding IS NOT NULL "
+        # No `embedding IS NOT NULL` predicate: Kuzu would then read the
+        # embedding column of every row of the scan, not just the matches.
+        if len(ids) <= 2000:   # small sets: the row path beats Arrow's list conversion
+            rows = [r for r in self.fetch_all(
+                f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.embedding AS e",
+                {"ids": [int(i) for i in ids]}) if r.get("e") is not None]
+            if not rows:
+                return np.zeros(0, np.int64), np.zeros((0, self.embedding_dim), np.float32)
+            return (np.array([r["id"] for r in rows], dtype=np.int64),
+                    np.array([r["e"] for r in rows], dtype=np.float32))
+        t = self.fetch_arrow(f"MATCH (n:{label}) WHERE n.id IN $ids "
                              f"RETURN n.id AS id, n.embedding AS e", {"ids": [int(i) for i in ids]})
         got = t.column("id").to_numpy().astype(np.int64)
         if len(got) == 0:
             return got, np.zeros((0, self.embedding_dim), np.float32)
         col = t.column("e").combine_chunks()
+        valid = ~np.asarray(col.is_null().to_numpy(zero_copy_only=False), dtype=bool)
+        if not valid.all():
+            got = got[valid]
+            col = col.filter(valid)
+        if len(got) == 0:
+            return got, np.zeros((0, self.embedding_dim), np.float32)
         mat = np.asarray(col.values.to_numpy(zero_copy_only=False), dtype=np.float32)
         return got, mat.reshape(len(got), -1)
 
@@ -871,12 +892,34 @@ class GraphDB:
         result = self.execute(cypher, params)
         return result.get_as_arrow(chunk)
 
+    @contextmanager
+    def thread_conn(self):
+        """Route this thread's queries to its own connection on the same
+        Database (Kuzu runs queries of different connections concurrently;
+        a single connection must never be shared between threads). Used by
+        the search fan-out; every helper method works unchanged inside."""
+        if self.db is None:
+            raise DatabaseBusy(f"graph DB busy: {self.db_path} is closed")
+        c = getattr(self._tls, "conn", None)
+        if c is None:
+            c = kuzu.Connection(self.db)
+            with self._side_lock:
+                self._side.append(c)
+            self._tls.conn = c
+        self._tls.active = True
+        try:
+            yield self
+        finally:
+            self._tls.active = False
+
     def execute(self, cypher: str, params: dict | None = None) -> Any:
         if self.conn is None:
             raise DatabaseBusy(
                 f"graph DB busy: connection to {self.db_path} is closed "
                 "(writer active — retry shortly)"
             )
+        if getattr(self._tls, "active", False):
+            return self._tls.conn.execute(cypher, params or {})
         return self.conn.execute(cypher, params or {})
 
     def fetch_all(self, cypher: str, params: dict | None = None) -> list[dict]:
@@ -1102,6 +1145,13 @@ class GraphDB:
         a write session so a subsequent `read_only=True` open can acquire
         the file lock — GC isn't reliable on Windows + COPY FROM holds extra
         internal references that survive a `del`."""
+        for c in list(getattr(self, "_side", [])):
+            try:
+                c.close()
+            except Exception:
+                pass
+        if getattr(self, "_side", None) is not None:
+            self._side.clear()
         try:
             if self.conn is not None and not self.conn.is_closed:
                 self.conn.close()
