@@ -24,6 +24,9 @@ from concurrent.futures import ThreadPoolExecutor as _TPE
 
 # Shared by every Retriever: search fans its index legs out over it.
 _SEARCH_POOL = _TPE(max_workers=6, thread_name_prefix="docgraph-search")
+# Second level (inside a leg: row fetch || embedding fetch) -- a separate pool
+# so a leg never waits on a worker of its own pool.
+_SEARCH_POOL2 = _TPE(max_workers=8, thread_name_prefix="docgraph-search2")
 
 
 class Retriever:
@@ -43,6 +46,39 @@ class Retriever:
         # Per-label BM25 indexes built on first use. Keyed by label so each
         # search() call only touches the relevant corpus.
         self._bm25: dict[str, tuple[BM25Index, list[int]]] = {}
+        # Keyword index (kwindex.KeywordIndex). The host hands in the root's
+        # live one (kept current by the indexer in-process); otherwise it is
+        # loaded from `.docgraph/kw/` on first use and reloaded when the
+        # files change.
+        self.kw = None
+        self._kw_stamp: tuple | None = None
+        # pending_vectors(label, id) -> vector | None: vectors the host has
+        # deferred (not in the vector index yet), for scoring fresh entities
+        self.pending_vectors = None
+
+    def _kw_index(self):
+        from docgraph.kwindex import KeywordIndex
+        if self.kw is not None and getattr(self, "_kw_owned", False) is False:
+            return self.kw
+        if self.cfg is None:
+            return None
+        d = self.cfg.data_dir / "kw"
+        try:
+            stamp = tuple(sorted((f.name, f.stat().st_mtime_ns) for f in d.iterdir()))
+        except OSError:
+            return None
+        if self.kw is None or stamp != self._kw_stamp:
+            kw = KeywordIndex(self.cfg.data_dir)
+            if not kw.load():
+                return None
+            self.kw, self._kw_stamp, self._kw_owned = kw, stamp, True
+        return self.kw
+
+    def _kw_topk(self, label: str, toks: list[str], k: int) -> list[tuple[int, float]]:
+        kw = self._kw_index()
+        if kw is None or not toks:
+            return []
+        return kw.topk(label, toks, k)
 
     def _reranker_(self) -> Reranker:
         # Prefer the workspace pool so the idle unloader can see it.
@@ -88,14 +124,17 @@ class Retriever:
         """For each parent_qname, the best cosine similarity across its
         sub-chunks. Empty when no chunks exist."""
         try:
-            rows = self.db.fetch_all(
-                "MATCH (c:Chunk) RETURN c.parent_qname AS qname, c.embedding AS embedding"
-            )
+            meta = self.db.fetch_all("MATCH (c:Chunk) RETURN c.id AS id, c.parent_qname AS qname")
+            if not meta:
+                return {}
+            vid, vmat = self.db.embedding_matrix("Chunk")
         except Exception:
             return {}
+        pos = {int(i): j for j, i in enumerate(vid.tolist())}
+        rows = [r for r in meta if int(r["id"]) in pos]
         if not rows:
             return {}
-        mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
+        mat = vmat[[pos[int(r["id"])] for r in rows]]
         qv = np.array(qvec, dtype=np.float32)
         qv = qv / (np.linalg.norm(qv) + 1e-9)
         norms = np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9
@@ -118,10 +157,11 @@ class Retriever:
 
     # ---- search ----------------------------------------------------------
     #
-    # Indexed path (schema v4): candidates come from Kuzu's HNSW vector index
-    # and FTS index per label (+ an exact-name probe and the parents of the
-    # best-matching sub-chunks), so a query touches O(k) rows, never the whole
-    # table. Scoring (cosine + RRF of the vector / keyword ranks + name +
+    # Indexed path (schema v4+): candidates come from Kuzu's HNSW vector
+    # index and the keyword index (kwindex.py; schema v5 -- Kuzu's FTS crashes
+    # on incremental deletes) per label (+ an exact-name probe and the parents
+    # of the best-matching sub-chunks), so a query touches O(k) rows, never
+    # the whole table. Scoring (cosine + RRF of the vector / keyword ranks + name +
     # PageRank / PPR boosts, optional cross-encoder rerank) runs on that
     # candidate set only. Pre-v4 databases (no indexes) use the brute-force
     # path (`_search_brute`) unchanged.
@@ -129,11 +169,11 @@ class Retriever:
     SEARCH_K = 60
 
     def search_backend(self) -> str:
-        """"index" when every vector + FTS index exists, else "brute"."""
+        """"index" when every vector index exists, else "brute"."""
         cached = getattr(self, "_search_backend_cache", None)
         if cached is None:
             have = self.db.list_indexes()
-            need = list(self.db.VECTOR_INDEXES.values()) + [v[0] for v in self.db.FTS_INDEXES.values()]
+            need = list(self.db.VECTOR_INDEXES.values())
             cached = "index" if all(n in have for n in need) else "brute"
             self._search_backend_cache = cached
         return cached
@@ -176,7 +216,7 @@ class Retriever:
         ppr = self._maybe_ppr(focus_file, focus_symbol)
         q_tokens = tokenize(query)
         words = re.findall(r"[A-Za-z0-9_]+", query)
-        fts_q = " ".join(dict.fromkeys(q_tokens + [w.lower() for w in words]))
+        kw_toks = list(dict.fromkeys(q_tokens + [w.lower() for w in words]))
         qlow = query.lower().strip()
         results: list[dict] = []
 
@@ -184,12 +224,11 @@ class Retriever:
         ident = bool(qlow) and not any(ch.isspace() for ch in qlow)
         legs: dict[str, object] = {
             "c_vec": lambda: self._safe(lambda: self.db.vector_topk("Chunk", qv, k * 2), []),
-            "c_kw": lambda: self._safe(lambda: self.db.fts_topk("Chunk", fts_q, k), []) if fts_q else [],
+            "c_kw": lambda: self._safe(lambda: self._kw_topk("Chunk", kw_toks, k), []),
         }
         for label in labels:
             legs[f"{label}_vec"] = (lambda lb: lambda: self._safe(lambda: self.db.vector_topk(lb, qv, k), []))(label)
-            legs[f"{label}_kw"] = (lambda lb: lambda: self._safe(lambda: self.db.fts_topk(lb, fts_q, k), [])
-                                   if fts_q else [])(label)
+            legs[f"{label}_kw"] = (lambda lb: lambda: self._safe(lambda: self._kw_topk(lb, kw_toks, k), []))(label)
             if ident:   # a multi-word query can never equal a symbol name
                 legs[f"{label}_name"] = (lambda lb: lambda: [r["id"] for r in self._safe(lambda: self.db.fetch_all(
                     f"MATCH (n:{lb}) WHERE lower(n.name) = $q RETURN n.id AS id LIMIT 50",
@@ -232,26 +271,53 @@ class Retriever:
             ids = {i for i, _ in vec} | {i for i, _ in kw}
             ids |= set(got.get(f"{label}_name") or ())
             parents = [q for q in chunk_max if q]
-            if parents:
-                ids |= {r["id"] for r in self._safe(lambda: self.db.fetch_all(
-                    f"MATCH (n:{label}) WHERE n.qname IN $qs RETURN n.id AS id",
-                    {"qs": parents}), [])}
-            if not ids:
-                return out
-            rows = self.db.fetch_all(
-                f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.name AS name, "
-                f"n.qname AS qname, n.file AS file, n.line_start AS line_start, "
-                f"substring(n.body, 1, 400) AS body, "
-                f"n.pagerank AS pagerank, n.llm_doc AS llm_doc", {"ids": list(ids)})
-            if not rows:
+            if not ids and not parents:
                 return out
             # cosine of the vector hits comes from the index; only keyword /
-            # name / chunk-parent candidates need their embedding read
+            # name / chunk-parent candidates need their embedding read. The
+            # row scan (ids + chunk parents in ONE pass) and the embedding
+            # read run concurrently.
             sim_of = {i: s_ for i, s_ in vec}
-            need = [r["id"] for r in rows if r["id"] not in sim_of]
-            if need:
-                eids, emat = self._safe(lambda: self.db.embeddings_for(label, need),
-                                        (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
+            need0 = [i for i in ids if i not in sim_of]
+            db = self.db
+            cols = ("n.id AS id, n.name AS name, n.qname AS qname, n.file AS file, "
+                    "n.line_start AS line_start, substring(n.body, 1, 400) AS body, "
+                    "n.pagerank AS pagerank, n.llm_doc AS llm_doc")
+
+            def fetch_rows():
+                with db.thread_conn():
+                    if parents:
+                        return db.fetch_all(f"MATCH (n:{label}) WHERE n.id IN $ids OR n.qname IN $qs "
+                                            f"RETURN {cols}", {"ids": list(ids), "qs": parents})
+                    return db.fetch_all(f"MATCH (n:{label}) WHERE n.id IN $ids RETURN {cols}",
+                                        {"ids": list(ids)})
+
+            def fetch_emb(want):
+                with db.thread_conn():
+                    got = self._safe(lambda: db.embeddings_for(label, want),
+                                     (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
+                # entities whose vectors the host has not written yet
+                pend = self.pending_vectors
+                if pend is not None:
+                    have = set(got[0].tolist())
+                    extra = [(i, v) for i in want if i not in have for v in [pend(label, i)] if v is not None]
+                    if extra:
+                        ids2 = np.array([i for i, _ in extra], dtype=np.int64)
+                        mat2 = np.array([v for _, v in extra], dtype=np.float32)
+                        if len(got[0]):
+                            return np.concatenate([got[0], ids2]), np.concatenate([got[1], mat2])
+                        return ids2, mat2
+                return got
+            f_rows = _SEARCH_POOL2.submit(fetch_rows)
+            f_emb = _SEARCH_POOL2.submit(fetch_emb, need0) if need0 else None
+            rows = f_rows.result()
+            if not rows:
+                return out
+            parts = [f_emb.result()] if f_emb is not None else []
+            late = [r["id"] for r in rows if r["id"] not in sim_of and r["id"] not in ids]
+            if late:                                    # chunk-parent rows
+                parts.append(fetch_emb(late))
+            for eids, emat in parts:
                 if len(eids):
                     en = emat / (np.linalg.norm(emat, axis=1, keepdims=True) + 1e-9)
                     for i, s_ in zip(eids.tolist(), (en @ qv).tolist()):
@@ -277,11 +343,12 @@ class Retriever:
                 })
             return out
 
-        for part in self._parallel({lb: (lambda lb_: lambda: score_label(lb_))(lb) for lb in labels}).values():
-            results.extend(part)
+        legs2 = {lb: (lambda lb_: lambda: score_label(lb_))(lb) for lb in labels}
         # -- file-level hits (plain text, docs, configs, notebook markdown) --
         if want_files:
-            results.extend(self._file_hits(crow, chunk_sim, chunk_kw, chunk_kw_rank, qlow, ppr))
+            legs2["_files"] = lambda: self._file_hits(crow, chunk_sim, chunk_kw, chunk_kw_rank, qlow, ppr)
+        for part in self._parallel(legs2).values():
+            results.extend(part)
 
         results.sort(key=lambda x: x["score"], reverse=True)
         if rerank and results:
@@ -406,11 +473,16 @@ class Retriever:
             rows = self.db.fetch_all(
                 f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.qname AS qname, "
                 f"n.file AS file, n.line_start AS line_start, n.body AS body, "
-                f"n.embedding AS embedding, n.pagerank AS pagerank, n.llm_doc AS llm_doc"
+                f"n.pagerank AS pagerank, n.llm_doc AS llm_doc"
             )
             if not rows:
                 continue
-            mat = np.array([r["embedding"] for r in rows], dtype=np.float32)
+            vid, vmat = self.db.embedding_matrix(label)
+            pos = {int(i): j for j, i in enumerate(vid.tolist())}
+            rows = [r for r in rows if int(r["id"]) in pos]
+            if not rows:
+                continue
+            mat = vmat[[pos[int(r["id"])] for r in rows]]
             qv = np.array(qvec, dtype=np.float32)
             qv = qv / (np.linalg.norm(qv) + 1e-9)
             mat = mat / (np.linalg.norm(mat, axis=1, keepdims=True) + 1e-9)
@@ -596,28 +668,123 @@ class Retriever:
             return []
 
     def _bfs_calls(self, seeds, direction: str, depth: int, min_conf: float = 0.0,
-                   max_nodes: int = 20000) -> tuple[dict[int, int], dict[int, int], list[dict]]:
+                   max_nodes: int = 20000, with_edges: bool = False
+                   ) -> tuple[dict[int, int], dict[int, int], list[dict]]:
         """BFS over CALLS. Returns (dist, parent, edges): dist[id] = hops
-        from the nearest seed, parent[id] = predecessor on that path."""
-        dist: dict[int, int] = {int(s): 0 for s in seeds}
+        from the nearest seed, parent[id] = predecessor on that path.
+
+        Runs on the in-memory CSR of `_mem_graph()` (built once per index
+        generation, ~0.3 s on 2M edges), a level per numpy pass: the old
+        one-query-per-hop walk cost ~5 ms per hop plus the row decoding, and
+        tools like processes() walk hundreds of hops. Ties (several parents
+        at the same depth) go to the smallest parent id, so results are
+        deterministic. `edges` (with line / method) is only fetched when
+        asked for: the CALLS rows among the reached nodes, one query."""
+        mg = self._mem_graph()
+        adj = mg["fwd"] if direction == "out" else mg["rev"]
+        seed_arr = np.unique(np.asarray([int(x) for x in seeds], dtype=np.int64))
+        dist: dict[int, int] = {int(x): 0 for x in seed_arr.tolist()}
         parent: dict[int, int] = {}
-        edges: list[dict] = []
-        frontier = set(dist)
+        seen_sorted = seed_arr
+        frontier = seed_arr
         for d in range(1, max(0, depth) + 1):
-            if not frontier:
+            if not len(frontier):
                 break
-            nxt: set[int] = set()
-            for r in self._call_edges(frontier, direction, min_conf):
-                near, far = (r["src"], r["dst"]) if direction == "out" else (r["dst"], r["src"])
-                edges.append(r)
-                if far not in dist:
-                    dist[far] = d
-                    parent[far] = near
-                    nxt.add(far)
-            frontier = nxt
+            owner, nb, cf = adj.expand(frontier)
+            if min_conf > 0 and len(nb):
+                keep = cf >= min_conf
+                owner, nb = owner[keep], nb[keep]
+            if not len(nb):
+                break
+            pos = np.searchsorted(seen_sorted, nb)
+            pos[pos >= len(seen_sorted)] = 0
+            fresh = seen_sorted[pos] != nb
+            owner, nb = owner[fresh], nb[fresh]
+            if not len(nb):
+                break
+            order = np.lexsort((owner, nb))
+            nb, owner = nb[order], owner[order]
+            first = np.ones(len(nb), dtype=bool)
+            first[1:] = nb[1:] != nb[:-1]
+            nb, owner = nb[first], owner[first]
+            for x, p in zip(nb.tolist(), owner.tolist()):
+                dist[x] = d
+                parent[x] = p
+            seen_sorted = np.union1d(seen_sorted, nb)
+            frontier = nb
             if len(dist) > max_nodes:
                 break
+        edges: list[dict] = []
+        if with_edges and len(dist) > 1:
+            edges = self._call_edges_among(list(dist), min_conf)
         return dist, parent, edges
+
+    def _call_edges_among(self, ids, min_conf: float = 0.0) -> list[dict]:
+        """CALLS rows with both ends in `ids`: {src, dst, conf, method, line}."""
+        ids = list(ids)
+        if not ids:
+            return []
+        has_conf = self._cap("calls_conf")
+        conf = "coalesce(r.confidence, 1.0)" if has_conf else "1.0"
+        meth = "coalesce(r.method, '')" if has_conf else "''"
+        where = "a.id IN $ids AND b.id IN $ids"
+        params: dict = {"ids": ids}
+        if min_conf > 0 and has_conf:
+            where += f" AND {conf} >= $c"
+            params["c"] = float(min_conf)
+        try:
+            return self.db.fetch_all(
+                f"MATCH (a:Function)-[r:CALLS]->(b:Function) WHERE {where} "
+                f"RETURN a.id AS src, b.id AS dst, {conf} AS conf, {meth} AS method, "
+                f"r.line AS line ORDER BY src, dst, line", params)
+        except Exception:
+            return []
+
+    # `_nodes` answers from the in-memory payload table (built once per
+    # generation, ~40 ms / ~30 MB for 220k symbols, prewarmed by the host):
+    # Kuzu's `id IN $list` costs ~27 us per listed id (10k ids = 0.3 s) plus
+    # a ~15 ms floor per label. Above this many ids the table is built on
+    # demand; below it the Cypher path is used until the table exists.
+    NODES_TABLE_MIN = 0
+
+    def _node_table(self):
+        """(sorted ids, Arrow table) of every Function / Class payload,
+        built once per retriever (= per index generation), under a lock."""
+        g = getattr(self, "_node_table_cache", None)
+        if g is not None:
+            return g
+        with self._build_lock:
+            g = getattr(self, "_node_table_cache", None)
+            if g is not None:
+                return g
+            import pyarrow as pa
+            parts = []
+            for label in ("Function", "Class"):
+                test_col = "n.is_test" if label == "Function" else "false"
+                t = self.db.fetch_arrow(
+                    f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.qname AS qname, "
+                    f"n.file AS file, n.line_start AS line, n.line_end AS line_end, "
+                    f"CAST(coalesce(n.pagerank, 0.0) AS DOUBLE) AS pagerank, {test_col} AS is_test, "
+                    f"'{label}' AS kind")
+                parts.append(t.cast(pa.schema([
+                    ("id", pa.int64()), ("name", pa.string()), ("qname", pa.string()),
+                    ("file", pa.string()), ("line", pa.int64()), ("line_end", pa.int64()),
+                    ("pagerank", pa.float64()), ("is_test", pa.bool_()), ("kind", pa.string())])))
+            tbl = pa.concat_tables(parts).combine_chunks()
+            ids = np.asarray(tbl.column("id").to_numpy(zero_copy_only=False), dtype=np.int64)
+            order = np.argsort(ids, kind="stable")
+            tbl = tbl.take(pa.array(order))
+            g = (ids[order], tbl)
+            self._node_table_cache = g
+            return g
+
+    @property
+    def _build_lock(self):
+        lk = self.__dict__.get("_build_lock_obj")
+        if lk is None:
+            import threading
+            lk = self.__dict__.setdefault("_build_lock_obj", threading.RLock())
+        return lk
 
     def _nodes(self, ids) -> dict[int, dict]:
         """Function/Class payloads by id."""
@@ -625,6 +792,19 @@ class Retriever:
         out: dict[int, dict] = {}
         if not ids:
             return out
+        if len(ids) >= self.NODES_TABLE_MIN or getattr(self, "_node_table_cache", None) is not None:
+            try:
+                import pyarrow as pa
+                tids, tbl = self._node_table()
+                q = np.unique(np.asarray(ids, dtype=np.int64))
+                pos = np.searchsorted(tids, q)
+                pos[pos >= len(tids)] = 0
+                hit = pos[tids[pos] == q] if len(tids) else pos[:0]
+                for r in tbl.take(pa.array(hit)).to_pylist():
+                    out[r["id"]] = r
+                return out
+            except Exception:
+                out = {}
         for label in ("Function", "Class"):
             test_col = "n.is_test" if label == "Function" else "false"
             try:
@@ -663,8 +843,20 @@ class Retriever:
         seeds = self._symbol_ids(name)
         if not seeds:
             return {"calls": [], "called_by": [], "edges": []}
-        fdist, _fp, _fe = self._bfs_calls(seeds, "out", depth, min_confidence)
-        bdist, _bp, _be = self._bfs_calls(seeds, "in", depth, min_confidence)
+        db = self.db
+
+        def conn(fn, *a):
+            def run():
+                with db.thread_conn():
+                    return fn(*a)
+            return run
+        # both walks and the 1-hop edge rows are independent: concurrently
+        f_out = _SEARCH_POOL2.submit(conn(self._bfs_calls, seeds, "out", depth, min_confidence))
+        f_in = _SEARCH_POOL2.submit(conn(self._bfs_calls, seeds, "in", depth, min_confidence))
+        f_eo = _SEARCH_POOL2.submit(conn(self._call_edges, seeds, "out", min_confidence))
+        f_ei = _SEARCH_POOL2.submit(conn(self._call_edges, seeds, "in", min_confidence))
+        fdist, _fp, _fe = f_out.result()
+        bdist, _bp, _be = f_in.result()
         nodes = self._nodes(set(fdist) | set(bdist))
 
         def row(i: int, d: int) -> dict:
@@ -678,7 +870,7 @@ class Retriever:
         # Direct edges (1 hop) for an actual edge list, with confidence
         edges = []
         seen: set[tuple] = set()
-        for r in self._call_edges(seeds, "out", min_confidence) + self._call_edges(seeds, "in", min_confidence):
+        for r in f_eo.result() + f_ei.result():
             key = (r["src"], r["dst"])
             if key in seen:
                 continue
@@ -719,15 +911,28 @@ class Retriever:
     def neighborhood(self, name: str, limit: int = 10) -> list[dict]:
         out: list[dict] = []
         seen: set[tuple[str, int]] = set()
-        for edge in ("CALLS", "REFERENCES_", "SIMILAR_TO", "INHERITS", "TESTS"):
+        db = self.db
+        EDGES = ("CALLS", "REFERENCES_", "SIMILAR_TO", "INHERITS", "TESTS")
+
+        def q(edge: str):
             try:
-                rows = self.db.fetch_all(
-                    f"MATCH (n)-[r:{edge}]-(other) WHERE n.name = $name AND other.name IS NOT NULL "
-                    f"RETURN DISTINCT other.qname AS qname, other.name AS name, other.file AS file, "
-                    f"other.line_start AS line, label(other) AS kind, "
-                    f"coalesce(other.pagerank, 0.0) AS pagerank",
-                    {"name": name},
-                )
+                with db.thread_conn():
+                    return db.fetch_all(
+                        f"MATCH (n)-[r:{edge}]-(other) WHERE n.name = $name AND other.name IS NOT NULL "
+                        f"RETURN DISTINCT other.qname AS qname, other.name AS name, other.file AS file, "
+                        f"other.line_start AS line, label(other) AS kind, "
+                        f"coalesce(other.pagerank, 0.0) AS pagerank",
+                        {"name": name},
+                    )
+            except Exception:
+                return None
+        # the edge types are independent: one connection each, concurrently
+        futs = [_SEARCH_POOL2.submit(q, edge) for edge in EDGES]
+        for edge, f in zip(EDGES, futs):
+            rows = f.result()
+            if rows is None:
+                continue
+            if True:
                 for r in rows:
                     key = (r["qname"], 0)
                     if key in seen:
@@ -735,8 +940,6 @@ class Retriever:
                     seen.add(key)
                     r["via"] = edge
                     out.append(r)
-            except Exception:
-                pass
         out.sort(key=lambda x: x.get("pagerank") or 0.0, reverse=True)
         return out[:limit]
 
@@ -781,20 +984,26 @@ class Retriever:
                 break
             next_front: set[int] = set()
             ids = list(frontier)
-            for edge in EDGE_TYPES:
-                # Two directed queries (out of / into the frontier) so the
-                # payload keeps each edge's real direction.
-                rows = []
-                for side in ("a", "b"):
-                    try:
-                        rows += self.db.fetch_all(
+            # One directed query per (edge type, side), all run concurrently
+            # on per-thread connections (Kuzu executes reads of different
+            # connections in parallel): out of / into the frontier, so each
+            # edge keeps its real direction.
+            db = self.db
+
+            def q(edge, side, _ids=ids):
+                if not db.has_table(edge):
+                    return edge, []
+                try:
+                    with db.thread_conn():
+                        return edge, db.fetch_all(
                             f"MATCH (a)-[r:{edge}]->(b) WHERE {side}.id IN $ids "
                             f"AND a.id IS NOT NULL AND b.id IS NOT NULL "
-                            f"RETURN a.id AS src, b.id AS dst",
-                            {"ids": ids},
-                        )
-                    except Exception:
-                        continue
+                            f"RETURN a.id AS src, b.id AS dst", {"ids": _ids})
+                except Exception:
+                    return edge, []
+            futs = [_SEARCH_POOL2.submit(q, edge, side) for edge in EDGE_TYPES for side in ("a", "b")]
+            for f in futs:
+                edge, rows = f.result()
                 for row in rows:
                     src, dst = int(row["src"]), int(row["dst"])
                     edge_records.append({"src": src, "dst": dst, "kind": edge})
@@ -854,66 +1063,137 @@ class Retriever:
 
         # Resolve seed names to IDs (Function or Class)
         seed_ids: list[int] = []
+        by_name: dict[str, list[int]] = {}
+        for label in ("Function", "Class"):
+            for r in self.db.fetch_all(f"MATCH (n:{label}) WHERE n.name IN $s RETURN n.id AS id, n.name AS name",
+                                       {"s": list(dict.fromkeys(seeds))}):
+                by_name.setdefault(r["name"], []).append(r["id"])
         for s in seeds:
-            for r in self.db.fetch_all(
-                "MATCH (n) WHERE (label(n) = 'Function' OR label(n) = 'Class') AND n.name = $s "
-                "RETURN n.id AS id",
-                {"s": s},
-            ):
-                seed_ids.append(r["id"])
+            seed_ids.extend(by_name.get(s, ()))
         if not seed_ids:
             return {"nodes": [], "edges": []}
 
-        # BFS — each level we expand via every requested edge type.
-        seen: dict[int, int] = {sid: 0 for sid in seed_ids}  # id → min-distance
-        frontier = set(seed_ids)
-        edge_records: list[dict] = []
+        # BFS on per-edge-type undirected CSRs held in memory (built once per
+        # retriever = per index generation): an IN-list hop query over a
+        # 10^4-node frontier cost ~0.3 s per edge type and level.
+        conf_types = ("CALLS", "INHERITS", "INSTANTIATES")
+        adjs = [(k, self._explore_adj(edge)) for k, edge in enumerate(edges)]
+        seed_arr = np.unique(np.asarray(seed_ids, dtype=np.int64))
+        seen_ids = [seed_arr]
+        seen_dist = [np.zeros(len(seed_arr), dtype=np.int16)]
+        seen_sorted = seed_arr
+        frontier = seed_arr
+        e_src: list[np.ndarray] = []
+        e_dst: list[np.ndarray] = []
+        e_kind: list[np.ndarray] = []
         for d in range(1, hops + 1):
-            if not frontier:
+            if not len(frontier):
                 break
-            next_frontier: set[int] = set()
-            for edge in edges:
-                conf_filter = ""
-                params: dict = {"ids": list(frontier)}
-                if (min_confidence > 0 and edge in ("CALLS", "INHERITS", "INSTANTIATES")
-                        and "confidence" in self.db.table_props(edge)):
-                    conf_filter = " AND coalesce(r.confidence, 1.0) >= $c"
-                    params["c"] = float(min_confidence)
-                try:
-                    rows = self.db.fetch_all(
-                        f"MATCH (a)-[r:{edge}]-(b) WHERE a.id IN $ids{conf_filter} "
-                        f"RETURN a.id AS src, b.id AS dst",
-                        params,
-                    )
-                except Exception:
+            dsts_all = []
+            for k, adj in adjs:
+                if adj is None:
                     continue
-                for row in rows:
-                    edge_records.append({"src": row["src"], "dst": row["dst"], "kind": edge})
-                    if row["dst"] not in seen:
-                        seen[row["dst"]] = d
-                        next_frontier.add(row["dst"])
-            frontier = next_frontier
+                src_a, dst_a, cf = adj.expand(frontier)
+                if min_confidence > 0 and edges[k] in conf_types and len(src_a):
+                    keep = cf >= min_confidence
+                    src_a, dst_a = src_a[keep], dst_a[keep]
+                if len(src_a):
+                    e_src.append(src_a)
+                    e_dst.append(dst_a)
+                    e_kind.append(np.full(len(src_a), k, dtype=np.int8))
+                    dsts_all.append(dst_a)
+            if not dsts_all:
+                break
+            cand = np.unique(np.concatenate(dsts_all))
+            pos = np.searchsorted(seen_sorted, cand)
+            pos[pos >= len(seen_sorted)] = 0
+            fresh = cand[seen_sorted[pos] != cand]
+            seen_ids.append(fresh)
+            seen_dist.append(np.full(len(fresh), d, dtype=np.int16))
+            seen_sorted = np.union1d(seen_sorted, fresh)
+            frontier = fresh
 
-        if not seen:
-            return {"nodes": [], "edges": []}
-
-        rows = self.db.fetch_all(
-            "MATCH (n) WHERE n.id IN $ids AND (label(n) = 'Function' OR label(n) = 'Class') "
-            "RETURN n.id AS id, n.name AS name, n.qname AS qname, n.file AS file, "
-            "n.line_start AS line, label(n) AS kind, "
-            "coalesce(n.pagerank, 0.0) AS pagerank",
-            {"ids": list(seen.keys())},
-        )
+        all_ids = np.concatenate(seen_ids)
+        all_dist = np.concatenate(seen_dist)
+        # Rank every reached Function / Class from an in-memory (id, pagerank)
+        # table, then fetch the payload of the top `limit` only (an IN over
+        # 10^5 reached ids cost seconds).
+        pr_ids, pr_val = self._symbol_pagerank()
+        pos = np.searchsorted(pr_ids, all_ids)
+        pos[pos >= len(pr_ids)] = 0
+        is_sym = (pr_ids[pos] == all_ids) if len(pr_ids) else np.zeros(len(all_ids), bool)
+        sym_ids, sym_d = all_ids[is_sym], all_dist[is_sym]
+        sym_pr = pr_val[pos[is_sym]] if len(pr_ids) else np.zeros(0)
+        score = 1.0 / (sym_d.astype(np.float64) + 1.0) + sym_pr * 0.5
+        top = np.lexsort((sym_ids, -score))[:max(0, int(limit))]
+        top_ids = sym_ids[top].tolist()
+        info = self._nodes(top_ids)
         nodes = []
-        for r in rows:
-            d = seen[r["id"]]
-            # Higher score = closer + more central
-            score = (1.0 / (d + 1)) + (r["pagerank"] or 0.0) * 0.5
-            r["distance"] = d
-            r["score"] = score
-            nodes.append(r)
-        nodes.sort(key=lambda x: x["score"], reverse=True)
-        return {"nodes": nodes[:limit], "edges": edge_records}
+        for i, d, sc in zip(top_ids, sym_d[top].tolist(), score[top].tolist()):
+            n = info.get(i)
+            if not n:
+                continue
+            nodes.append({"id": i, "name": n["name"], "qname": n["qname"], "file": n["file"],
+                          "line": n["line"], "kind": n["kind"], "pagerank": n["pagerank"],
+                          "distance": d, "score": sc})
+        # Edges of the returned subgraph (both ends among the returned nodes),
+        # deduplicated; the walk's full edge count is reported alongside.
+        edge_records: list[dict] = []
+        total = 0
+        if e_src:
+            src_c = np.concatenate(e_src)
+            dst_c = np.concatenate(e_dst)
+            kind_c = np.concatenate(e_kind)
+            total = int(len(src_c))
+            keep_ids = np.asarray(sorted(n["id"] for n in nodes), dtype=np.int64)
+            m = np.isin(src_c, keep_ids) & np.isin(dst_c, keep_ids)
+            seen_e: set = set()
+            for a_, b_, k_ in zip(src_c[m].tolist(), dst_c[m].tolist(), kind_c[m].tolist()):
+                key = (a_, b_, k_)
+                if key in seen_e:
+                    continue
+                seen_e.add(key)
+                edge_records.append({"src": a_, "dst": b_, "kind": edges[k_]})
+        return {"nodes": nodes, "edges": edge_records, "edges_walked": total,
+                "reached": int(len(all_ids))}
+
+    def _explore_adj(self, rel: str):
+        """Undirected CSR over one rel table (both directions), cached."""
+        cache = getattr(self, "_explore_adj_cache", None)
+        if cache is None:
+            cache = self._explore_adj_cache = {}
+        if rel in cache:
+            return cache[rel]
+        adj = None
+        if self.db.has_table(rel):
+            with_conf = "confidence" in self.db.table_props(rel)
+            a, b, c, _k = self.db.edge_endpoints((rel,), with_conf=with_conf)
+            if c is None:
+                c = np.ones(len(a), dtype=np.float32)
+            adj = _CSRAdj(np.concatenate([a, b]), np.concatenate([b, a]), np.concatenate([c, c]))
+        cache[rel] = adj
+        return adj
+
+    def _symbol_pagerank(self):
+        """(sorted ids, pagerank) of every Function and Class, cached."""
+        g = getattr(self, "_symbol_pr_cache", None)
+        if g is not None:
+            return g
+        ids, prs = [], []
+        for label in ("Function", "Class"):
+            d = self.db.node_columns(label, {"id": "n.id", "p": "coalesce(n.pagerank, 0.0)"})
+            if d.get("id") is not None and len(d["id"]):
+                ids.append(np.asarray(d["id"], dtype=np.int64))
+                prs.append(np.asarray(d["p"], dtype=np.float64))
+        if ids:
+            i = np.concatenate(ids)
+            p = np.concatenate(prs)
+            o = np.argsort(i, kind="stable")
+            g = (i[o], p[o])
+        else:
+            g = (np.zeros(0, np.int64), np.zeros(0, np.float64))
+        self._symbol_pr_cache = g
+        return g
 
     def _callers_rows(self, seed_ids: list[int], depth: int, limit: int,
                       min_conf: float) -> list[dict]:
@@ -1094,14 +1374,16 @@ class Retriever:
             out.append(r)
         return out
 
-    def _flow_for(self, entry: dict, max_chain_len: int, min_confidence: float = 0.0,
-                  max_nodes: int = 50) -> dict | None:
-        dist, parent, edges = self._bfs_calls([entry["id"]], "out", max_chain_len,
-                                              min_confidence, max_nodes=max_nodes * 4)
+    def _flow_walk(self, entry: dict, max_chain_len: int, min_confidence: float = 0.0,
+                   max_nodes: int = 50):
+        dist, parent, _e = self._bfs_calls([entry["id"]], "out", max_chain_len,
+                                           min_confidence, max_nodes=max_nodes * 4)
         ids = [i for i, d in sorted(dist.items(), key=lambda t: (t[1], t[0])) if d > 0][:max_nodes]
+        return ids, dist, parent
+
+    def _flow_build(self, entry: dict, ids, dist, parent, nodes: dict, edges: list[dict]) -> dict | None:
         if not ids:
             return None
-        nodes = self._nodes(ids + [entry["id"]])
         keep = set(ids) | {entry["id"]}
         chain = []
         for i in ids:
@@ -1133,6 +1415,37 @@ class Retriever:
             "fanout": len(chain),
         }
 
+    def _flows(self, entries: list[dict], max_chain_len: int, min_confidence: float,
+               max_nodes: int, limit: int) -> list[dict]:
+        """Flows for `entries` (up to `limit` non-empty ones): in-memory walks,
+        then one node fetch and one edge fetch for all of them."""
+        walks = []
+        for e in entries:
+            ids, dist, parent = self._flow_walk(e, max_chain_len, min_confidence, max_nodes)
+            if ids:
+                walks.append((e, ids, dist, parent))
+                if len(walks) >= limit:
+                    break
+        if not walks:
+            return []
+        every: set[int] = set()
+        for e, ids, _d, _p in walks:
+            every.update(ids)
+            every.add(e["id"])
+        nodes = self._nodes(sorted(every))
+        edges = self._call_edges_among(sorted(every), min_confidence)
+        out = []
+        for e, ids, dist, parent in walks:
+            flow = self._flow_build(e, ids, dist, parent, nodes, edges)
+            if flow:
+                out.append(flow)
+        return out
+
+    def _flow_for(self, entry: dict, max_chain_len: int, min_confidence: float = 0.0,
+                  max_nodes: int = 50) -> dict | None:
+        flows = self._flows([entry], max_chain_len, min_confidence, max_nodes, 1)
+        return flows[0] if flows else None
+
     def processes(self, limit: int = 25, max_chain_len: int = 8,
                   min_confidence: float = 0.0) -> list[dict]:
         """Detect 'processes' = top-level execution flows. Entry points are
@@ -1150,14 +1463,7 @@ class Retriever:
             return memo[key]
         if len(memo) > 16:
             memo.clear()
-        out: list[dict] = []
-        for e in self._entry_points(limit):
-            flow = self._flow_for(e, max_chain_len, min_confidence)
-            if not flow:
-                continue
-            out.append(flow)
-            if len(out) >= limit:
-                break
+        out = self._flows(self._entry_points(limit), max_chain_len, min_confidence, 50, int(limit))
         memo[key] = out
         return out
 
@@ -1672,71 +1978,102 @@ class Retriever:
         if primary["kind"] == "Class":
             seeds += [r["id"] for r in self.db.fetch_all(
                 "MATCH (c:Class)-[:CONTAINS]->(f:Function) WHERE c.id = $id RETURN f.id AS id", {"id": pid})]
-        direct_in = {}
-        for r in self._call_edges(seeds, "in", min_confidence):
-            direct_in[r["src"]] = max(direct_in.get(r["src"], 0.0), float(r["conf"] or 0.0))
-        bdist, _bp, _be = self._bfs_calls(seeds, "in", 2, min_confidence)
-        cnodes = self._nodes([i for i, d in bdist.items() if d > 0])
-        callers = []
-        for i, n in cnodes.items():
-            conf = direct_in.get(i, 0.5)
-            callers.append(dict(n, depth=bdist[i], confidence=round(conf, 2),
+        db = self.db
+
+        # The sections below are independent: they run concurrently, each on
+        # its own connection (and the git log in its own process).
+        def conn(fn):
+            def run():
+                with db.thread_conn():
+                    return fn()
+            return run
+
+        def do_callers():
+            direct_in = {}
+            for r in self._call_edges(seeds, "in", min_confidence):
+                direct_in[r["src"]] = max(direct_in.get(r["src"], 0.0), float(r["conf"] or 0.0))
+            bdist, _bp, _be = self._bfs_calls(seeds, "in", 2, min_confidence)
+            cnodes = self._nodes([i for i, d in bdist.items() if d > 0])
+            out = []
+            for i, n in cnodes.items():
+                conf = direct_in.get(i, 0.5)
+                out.append(dict(n, depth=bdist[i], confidence=round(conf, 2),
                                 score=(n["pagerank"] or 0.0) * conf / bdist[i]))
-        callers.sort(key=lambda n: (-n["score"], n["depth"], n["name"]))
-        callees = []
-        out_rows = self._call_edges(seeds, "out", min_confidence)
-        onodes = self._nodes({r["dst"] for r in out_rows})
-        seen_c: set[int] = set()
-        for r in sorted(out_rows, key=lambda r: (r.get("line") or 0)):
-            n = onodes.get(r["dst"])
-            if not n or n["id"] in seen_c or n["id"] in seeds:
-                continue
-            seen_c.add(n["id"])
-            callees.append(dict(n, confidence=round(float(r["conf"] or 0.0), 2), method=r["method"]))
-        tests = self._tests_for(seeds, 3, min_confidence)
-        # flows it participates in: ancestors that are route/tool handlers or entry points
-        adist, _ap, _ae = self._bfs_calls(seeds, "in", 6, min_confidence)
-        anc = list(adist)
-        flows = [dict(h, depth=adist.get(h["fid"], 0)) for h in self._handlers_among(anc)]
-        entries = self._no_inbound([i for i in anc if i not in seeds])
-        enodes = self._nodes(entries)
-        for i in entries:
-            n = enodes.get(i)
-            if n:
-                flows.append({"kind": "entry", "name": n["name"], "handler": n["name"],
-                              "fid": i, "file": n["file"], "depth": adist[i]})
-        flows.sort(key=lambda f: (f["kind"] == "entry", f["depth"], f["name"]))
-        cluster = None
-        if self._cap("community"):
-            rows = self.db.fetch_all(
+            out.sort(key=lambda n: (-n["score"], n["depth"], n["name"]))
+            return out
+
+        def do_callees():
+            out = []
+            out_rows = self._call_edges(seeds, "out", min_confidence)
+            onodes = self._nodes({r["dst"] for r in out_rows})
+            seen_c: set[int] = set()
+            for r in sorted(out_rows, key=lambda r: (r.get("line") or 0)):
+                n = onodes.get(r["dst"])
+                if not n or n["id"] in seen_c or n["id"] in seeds:
+                    continue
+                seen_c.add(n["id"])
+                out.append(dict(n, confidence=round(float(r["conf"] or 0.0), 2), method=r["method"]))
+            return out
+
+        def do_flows():
+            # flows it participates in: ancestors that are route/tool handlers or entry points
+            adist, _ap, _ae = self._bfs_calls(seeds, "in", 6, min_confidence)
+            anc = list(adist)
+            out = [dict(h, depth=adist.get(h["fid"], 0)) for h in self._handlers_among(anc)]
+            entries = self._no_inbound([i for i in anc if i not in seeds])
+            enodes = self._nodes(entries)
+            for i in entries:
+                n = enodes.get(i)
+                if n:
+                    out.append({"kind": "entry", "name": n["name"], "handler": n["name"],
+                                "fid": i, "file": n["file"], "depth": adist[i]})
+            out.sort(key=lambda f: (f["kind"] == "entry", f["depth"], f["name"]))
+            return out
+
+        def do_cluster():
+            if not self._cap("community"):
+                return None
+            rows = db.fetch_all(
                 "MATCH (n)-[:MEMBER_OF]->(c:Community) WHERE n.id = $id "
                 "RETURN c.id AS id, c.name AS name, c.size AS size, c.cohesion AS cohesion",
                 {"id": pid})
-            cluster = rows[0] if rows else None
-        similar = []
-        try:
-            similar = self.db.fetch_all(
-                f"MATCH (a:{primary['kind']})-[r:SIMILAR_TO]-(b) WHERE a.id = $id "
-                f"RETURN DISTINCT b.name AS name, b.file AS file, b.line_start AS line, r.score AS score "
-                f"ORDER BY score DESC LIMIT 8", {"id": pid})
-        except Exception:
-            similar = []
-        commits: list[dict] = []
-        if self.cfg is not None:
+            return rows[0] if rows else None
+
+        def do_similar():
+            try:
+                return db.fetch_all(
+                    f"MATCH (a:{primary['kind']})-[r:SIMILAR_TO]-(b) WHERE a.id = $id "
+                    f"RETURN DISTINCT b.name AS name, b.file AS file, b.line_start AS line, r.score AS score "
+                    f"ORDER BY score DESC LIMIT 8", {"id": pid})
+            except Exception:
+                return []
+
+        def do_commits():
+            if self.cfg is None:
+                return []
             try:
                 from docgraph import history as _h
                 own = self._owner_of(primary["file"])
                 if own:
-                    commits = _h.symbol_log(own[0], own[1], primary["line"] or 1,
-                                            primary.get("line_end") or primary["line"] or 1, limit=5)
+                    return _h.symbol_log(own[0], own[1], primary["line"] or 1,
+                                         primary.get("line_end") or primary["line"] or 1, limit=5)
             except Exception:
-                commits = []
-        rules = []
-        try:
-            rules = [{"name": r.get("name") or r.get("path"), "description": r.get("description", "")}
-                     for r in (self.rules_for(primary["file"]) or [])][:6]
-        except Exception:
-            rules = []
+                return []
+            return []
+
+        def do_rules():
+            try:
+                return [{"name": r.get("name") or r.get("path"), "description": r.get("description", "")}
+                        for r in (self.rules_for(primary["file"]) or [])][:6]
+            except Exception:
+                return []
+        jobs = {"callers": do_callers, "callees": do_callees, "tests": lambda: self._tests_for(seeds, 3, min_confidence),
+                "flows": do_flows, "cluster": do_cluster, "similar": do_similar,
+                "commits": do_commits, "rules": do_rules}
+        futs = {k: _SEARCH_POOL2.submit(conn(fn)) for k, fn in jobs.items()}
+        res_ = {k: f.result() for k, f in futs.items()}
+        callers, callees, tests, flows = res_["callers"], res_["callees"], res_["tests"], res_["flows"]
+        cluster, similar, commits, rules = res_["cluster"], res_["similar"], res_["commits"], res_["rules"]
 
         def loc(n: dict) -> str:
             return f"{n['file']}:{n.get('line') or '?'}"
@@ -1810,6 +2147,13 @@ class Retriever:
         g = getattr(self, "_mem_graph_cache", None)
         if g is not None:
             return g
+        with self._build_lock:
+            g = getattr(self, "_mem_graph_cache", None)
+            if g is not None:
+                return g
+            return self._mem_graph_build()
+
+    def _mem_graph_build(self) -> dict:
         from collections import defaultdict as _dd
         src, dst, conf, _k = self.db.edge_endpoints(("CALLS",), with_conf=self._cap("calls_conf"),
                                                     from_label="Function", to_label="Function")
@@ -1864,7 +2208,6 @@ class Retriever:
                        min_confidence: float = 0.0, max_symbols: int = 200) -> dict:
         """Diff -> changed symbols -> callers, affected flows, tests to run,
         and an explainable risk score."""
-        import bisect
         from docgraph.insights import overall_risk, overlaps, parse_unified_diff, symbol_risk
 
         depth = max(1, min(int(depth), 6))
@@ -1881,14 +2224,18 @@ class Retriever:
         else:
             return {"ref": ref, "source": source, "error": "no diff and no repo config", "files": []}
 
-        # PageRank percentile table
-        prs = sorted(float(r["p"] or 0.0) for r in self.db.fetch_all(
-            "MATCH (f:Function) RETURN coalesce(f.pagerank, 0.0) AS p"))
+        # PageRank percentile table (one Arrow column, cached per retriever
+        # -- i.e. per index generation)
+        prs = getattr(self, "_pr_sorted", None)
+        if prs is None:
+            col = self.db.fetch_arrow("MATCH (f:Function) RETURN coalesce(f.pagerank, 0.0) AS p").column("p")
+            prs = np.sort(np.asarray(col.to_numpy(zero_copy_only=False), dtype=np.float64))
+            self._pr_sorted = prs
 
         def pct(p: float) -> float:
-            if not prs:
+            if not len(prs):
                 return 0.0
-            return bisect.bisect_left(prs, p) / len(prs)
+            return float(np.searchsorted(prs, float(p), "left")) / len(prs)
 
         changed: list[dict] = []
         for f in files:
@@ -2264,47 +2611,72 @@ class Retriever:
             out["error"] = "unknown symbol: " + (a if not A else b)
             return out
 
-        def expand(frontier: set[int]) -> list[tuple[int, int, str, float]]:
-            res = [(r["src"], r["dst"], "CALLS", float(r["conf"] or 0.0))
-                   for r in self._call_edges(frontier, "out", min_confidence)]
-            ids = list(frontier)
-            try:
-                for r in self.db.fetch_all(
-                    "MATCH (c:Class)-[:CONTAINS]->(f:Function) WHERE c.id IN $ids "
-                    "RETURN c.id AS s, f.id AS d", {"ids": ids}):
-                    res.append((r["s"], r["d"], "CONTAINS", 1.0))
-                conf = ("coalesce(r.confidence, 1.0)" if "confidence" in self.db.table_props("INSTANTIATES")
-                        else "1.0")
-                for r in self.db.fetch_all(
-                    f"MATCH (f:Function)-[r:INSTANTIATES]->(c:Class) WHERE f.id IN $ids "
-                    f"RETURN f.id AS s, c.id AS d, {conf} AS c", {"ids": ids}):
-                    if float(r["c"] or 0.0) >= min_confidence:
-                        res.append((r["s"], r["d"], "INSTANTIATES", float(r["c"] or 0.0)))
-            except Exception:
-                pass
-            return res
+        # Level-synchronous BFS on an in-memory CSR of CALLS + Class-CONTAINS->
+        # Function + INSTANTIATES (built once per retriever, i.e. per index
+        # generation): an unreachable target used to walk the whole graph with
+        # three IN-list queries per hop (seconds); here a hop is a few numpy ops.
+        tg = self._trace_graph()
+        KIND = ("CALLS", "CONTAINS", "INSTANTIATES")
 
         def search(src: list[int], dst: set[int]):
+            ids = tg["ids"]
+            n = len(ids)
             parent: dict[int, tuple[int, str, float]] = {}
-            seen = set(src)
-            frontier = set(src)
+            if n == 0:
+                return None, parent, len(src)
+            def dense(xs) -> np.ndarray:
+                q = np.asarray(sorted(set(xs)), dtype=np.int64)
+                pos = np.searchsorted(ids, q)
+                ok = pos < n
+                pos, q = pos[ok], q[ok]
+                return pos[ids[pos] == q]
+            srcd = dense(src)
+            dstm = np.zeros(n, dtype=bool)
+            dstm[dense(dst)] = True
+            seen = np.zeros(n, dtype=bool)
+            seen[srcd] = True
+            n_seen = len(set(src))
+            par = np.full(n, -1, dtype=np.int64)
+            pk = np.zeros(n, dtype=np.int8)
+            pc = np.zeros(n, dtype=np.float32)
+            frontier = np.unique(srcd)
+            indptr, nbr, kind, conf = tg["indptr"], tg["nbr"], tg["kind"], tg["conf"]
             for _ in range(max_depth):
-                if not frontier:
+                if not len(frontier):
                     break
-                nxt = set()
-                for s, d, kind, c in expand(frontier):
-                    if d in seen:
-                        continue
-                    seen.add(d)
-                    parent[d] = (s, kind, c)
-                    if d in dst:
-                        path = [d]
-                        while path[-1] in parent:
-                            path.append(parent[path[-1]][0])
-                        return path[::-1], parent, len(seen)
-                    nxt.add(d)
-                frontier = nxt
-            return None, parent, len(seen)
+                starts = indptr[frontier]
+                counts = indptr[frontier + 1] - starts
+                total = int(counts.sum())
+                if not total:
+                    break
+                owner = np.repeat(frontier, counts)
+                offs = np.repeat(starts - np.concatenate(([0], np.cumsum(counts)[:-1])), counts)
+                e = offs + np.arange(total, dtype=np.int64)
+                nb, kd, cf = nbr[e], kind[e], conf[e]
+                keep = (cf >= min_confidence) | (kd == 1)
+                owner, nb, kd, cf = owner[keep], nb[keep], kd[keep], cf[keep]
+                fresh = ~seen[nb]
+                owner, nb, kd, cf = owner[fresh], nb[fresh], kd[fresh], cf[fresh]
+                if not len(nb):
+                    break
+                u, first = np.unique(nb, return_index=True)
+                first.sort()
+                nb, owner, kd, cf = nb[first], owner[first], kd[first], cf[first]
+                seen[nb] = True
+                n_seen += len(nb)
+                par[nb], pk[nb], pc[nb] = owner, kd, cf
+                hit = np.nonzero(dstm[nb])[0]
+                if len(hit):
+                    d = int(nb[hit[0]])
+                    path = [d]
+                    while par[path[-1]] >= 0:
+                        path.append(int(par[path[-1]]))
+                    path = path[::-1]
+                    for x in path[1:]:
+                        parent[int(ids[x])] = (int(ids[par[x]]), KIND[int(pk[x])], float(pc[x]))
+                    return [int(ids[x]) for x in path], parent, n_seen
+                frontier = nb
+            return None, parent, n_seen
 
         path, parent, explored = search(A, B)
         direction = "forward"
@@ -2323,6 +2695,42 @@ class Retriever:
                          "confidence": round(parent[d][2], 3)} for d in path[1:]]
         return out
 
+    def _trace_graph(self) -> dict:
+        """CSR over CALLS (with confidence) + Class-CONTAINS->Function +
+        Function-INSTANTIATES->Class, dense ids sorted; cached per retriever."""
+        g = getattr(self, "_trace_graph_cache", None)
+        if g is not None:
+            return g
+        with self._build_lock:
+            if getattr(self, "_trace_graph_cache", None) is None:
+                self._trace_graph_cache = self._trace_graph_build()
+            return self._trace_graph_cache
+
+    def _trace_graph_build(self) -> dict:
+        parts = []
+        has_conf = self._cap("calls_conf")
+        a, b, c, _k = self.db.edge_endpoints(("CALLS",), with_conf=has_conf,
+                                             from_label="Function", to_label="Function")
+        parts.append((a, b, 0, c if c is not None else np.ones(len(a), np.float32)))
+        a, b, _c, _k = self.db.edge_endpoints(("CONTAINS",), from_label="Class", to_label="Function")
+        parts.append((a, b, 1, np.ones(len(a), np.float32)))
+        inst_conf = "confidence" in self.db.table_props("INSTANTIATES") if self.db.has_table("INSTANTIATES") else False
+        a, b, c, _k = self.db.edge_endpoints(("INSTANTIATES",), with_conf=inst_conf,
+                                             from_label="Function", to_label="Class")
+        parts.append((a, b, 2, c if c is not None else np.ones(len(a), np.float32)))
+        src = np.concatenate([p[0] for p in parts]).astype(np.int64)
+        dst = np.concatenate([p[1] for p in parts]).astype(np.int64)
+        kind = np.concatenate([np.full(len(p[0]), p[2], np.int8) for p in parts])
+        conf = np.concatenate([np.asarray(p[3], dtype=np.float32) for p in parts])
+        ids = np.unique(np.concatenate([src, dst])) if len(src) else np.zeros(0, np.int64)
+        s_d = np.searchsorted(ids, src)
+        d_d = np.searchsorted(ids, dst)
+        order = np.argsort(s_d, kind="stable")
+        indptr = np.zeros(len(ids) + 1, dtype=np.int64)
+        np.add.at(indptr, s_d + 1, 1)
+        np.cumsum(indptr, out=indptr)
+        return {"ids": ids, "indptr": indptr, "nbr": d_d[order], "kind": kind[order], "conf": conf[order]}
+
     # ---- health ----------------------------------------------------------
 
     # Above these sizes health() bounds its two super-linear parts: sampled
@@ -2331,18 +2739,82 @@ class Retriever:
     HEALTH_BRIDGE_NODES = 20_000
     HEALTH_TEXT_SCAN_FILES = 5_000
 
-    def health(self, limit: int = 15, min_confidence: float = 0.5) -> dict:
+    def health(self, limit: int = 15, min_confidence: float = 0.5, refresh: bool = False) -> dict:
         """Hubs, bridges, dead code, import cycles, large functions and
-        untested hotspots. Computed on demand from Arrow arrays, cached per
-        retriever (which is rebuilt after every reindex)."""
-        import re as _re
-        from collections import Counter as _Counter
-        import networkx as nx
-
+        untested hotspots. Served from (in order) the per-retriever cache,
+        `.docgraph/health.json` when it belongs to the current index
+        generation, or -- right after a reindex -- the previous generation's
+        report marked `refreshing: true` while the host recomputes it in the
+        background. Computed from Arrow arrays otherwise."""
         key = (int(limit), float(min_confidence))
+        if not refresh and self.workspace is not None and self.cfg is not None:
+            try:
+                self.workspace.note_health_use(self.cfg.repo_root, key)
+            except Exception:
+                pass
         cache = getattr(self, "_health_cache", {})
         if key in cache:
             return cache[key]
+        if not refresh:
+            stale = (getattr(self, "_health_stale", None) or {}).get(key)
+            if stale is not None and self.workspace is not None and self.cfg is not None:
+                try:
+                    self.workspace.schedule_maintenance(self.cfg.repo_root)
+                except Exception:
+                    pass
+                return dict(stale, refreshing=True)
+            disk = self._health_disk(key)
+            if disk is not None:
+                cache[key] = disk
+                self._health_cache = cache
+                return disk
+        result = self._health_compute(limit, min_confidence)
+        cache[key] = result
+        self._health_cache = cache
+        self._health_disk(key, result)
+        return result
+
+    def _health_stamp(self):
+        if self.cfg is None:
+            return None
+        try:
+            import json as _json
+            return _json.loads((self.cfg.data_dir / "state.json").read_text()).get("last_indexed_at")
+        except Exception:
+            return None
+
+    def _health_disk(self, key: tuple, result: dict | None = None) -> dict | None:
+        """Read (result=None) or write the persisted report for `key`."""
+        if self.cfg is None:
+            return None
+        import json as _json
+        path = self.cfg.data_dir / "health.json"
+        k = f"{key[0]}:{key[1]}"
+        stamp = self._health_stamp()
+        if stamp is None:
+            return None
+        try:
+            doc = _json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        except Exception:
+            doc = {}
+        if doc.get("stamp") != stamp:
+            doc = {"stamp": stamp, "reports": {}}
+        if result is None:
+            return (doc.get("reports") or {}).get(k)
+        doc.setdefault("reports", {})[k] = result
+        try:
+            tmp = path.with_name(path.name + ".tmp")
+            tmp.write_text(_json.dumps(doc), encoding="utf-8")
+            import os as _os
+            _os.replace(tmp, path)
+        except Exception:
+            pass
+        return result
+
+    def _health_compute(self, limit: int = 15, min_confidence: float = 0.5) -> dict:
+        import re as _re
+        from collections import Counter as _Counter
+
         fcols = self.db.node_columns("Function", {
             "id": "n.id", "name": "n.name", "qname": "n.qname", "file": "n.file",
             "line": "coalesce(n.line_start, 0)", "line_end": "coalesce(n.line_end, 0)",
@@ -2422,15 +2894,22 @@ class Retriever:
             sel[best] = True
             m2 = sel[ua] & sel[ub]
             ua, ub = ua[m2], ub[m2]
-        ug = nx.Graph()
-        ug.add_edges_from(zip(ua.tolist(), ub.tolist()))
-        if ug.number_of_nodes() > 2:
-            k = min(ug.number_of_nodes(), 200 if ug.number_of_nodes() < 20000 else 32)
-            bc = nx.betweenness_centrality(ug, k=k, seed=7, normalized=True)
+        # same sampling / normalisation as networkx.betweenness_centrality,
+        # on arrays (graphalgo.py): node order = first appearance in the edges
+        if len(ua):
+            inter = np.empty(len(ua) * 2, dtype=np.int64)
+            inter[0::2], inter[1::2] = ua, ub
+            _u, first = np.unique(inter, return_index=True)
+            nodes_ug = inter[np.sort(first)].tolist()
+        else:
+            nodes_ug = []
+        if len(nodes_ug) > 2:
+            from docgraph.graphalgo import sampled_betweenness
+            k = min(len(nodes_ug), 200 if len(nodes_ug) < 20000 else 32)
+            bc = sampled_betweenness(nodes_ug, ua, ub, k, seed=7)
             for i, s in sorted(bc.items(), key=lambda t: -t[1])[:limit]:
                 if s > 0:
                     bridges_out.append(row(int(i), betweenness=round(s, 4)))
-        del ug
         # text references (callbacks, module-level calls, registrations)
         tokens: _Counter = _Counter()
         texts: dict[str, list[str]] = {}
@@ -2471,22 +2950,16 @@ class Retriever:
             dead.append(row(i, reason="no inbound calls/references and name not referenced elsewhere"
                             if texts else "no inbound calls/references"))
         dead.sort(key=lambda r: (r["file"] or "", r["line"] or 0))
-        # import cycles
-        ig = nx.DiGraph()
-        for r in self.db.fetch_all("MATCH (a:File)-[:IMPORTS]->(b:File) RETURN a.path AS a, b.path AS b"):
-            if r["a"] != r["b"]:
-                ig.add_edge(r["a"], r["b"])
-        cycles = []
-        try:
-            for cyc in nx.simple_cycles(ig, length_bound=6):
-                cycles.append(cyc)
-                if len(cycles) >= max(limit, 25):
-                    break
-        except TypeError:
-            for comp in nx.strongly_connected_components(ig):
-                if len(comp) > 1:
-                    cycles.append(sorted(comp))
-        cycles.sort(key=lambda c: (len(c), c))
+        # import cycles: shortest cycles through each strongly connected
+        # component (scipy SCC + bounded BFS, graphalgo.short_cycles)
+        from docgraph.graphalgo import short_cycles
+        ia, ib = [], []
+        t_imp = self.db.fetch_arrow("MATCH (a:File)-[:IMPORTS]->(b:File) RETURN a.path AS a, b.path AS b")
+        for x, y in zip(t_imp.column("a").to_pylist(), t_imp.column("b").to_pylist()):
+            if x != y:
+                ia.append(x)
+                ib.append(y)
+        cycles = short_cycles(ia, ib, max(limit, 25), max_len=6)
         # large functions
         span = line_end - lines if n else np.zeros(0, np.int64)
         sizes = prod[np.argsort(-span[prod], kind="stable")] if len(prod) else prod
@@ -2530,8 +3003,6 @@ class Retriever:
             "large_functions": large,
             "untested_hotspots": untested,
         }
-        cache[key] = result
-        self._health_cache = cache
         return result
 
     # ---- history ---------------------------------------------------------
@@ -2738,3 +3209,25 @@ class _CSRAdj:
 
     def __len__(self) -> int:
         return len(self.keys)
+
+    def expand(self, frontier: np.ndarray):
+        """(owner, neighbour, confidence) arrays of every row of `frontier`,
+        rows in frontier order, each row in CSR order."""
+        f = np.asarray(frontier, dtype=np.int64)
+        if not len(f) or not len(self.keys):
+            z = np.zeros(0, np.int64)
+            return z, z, np.zeros(0, np.float32)
+        i = np.searchsorted(self.keys, f)
+        i[i >= len(self.keys)] = 0
+        hit = self.keys[i] == f
+        f, i = f[hit], i[hit]
+        starts = self.start[i]
+        counts = self.start[i + 1] - starts
+        total = int(counts.sum())
+        if not total:
+            z = np.zeros(0, np.int64)
+            return z, z, np.zeros(0, np.float32)
+        owner = np.repeat(f, counts)
+        base = np.repeat(starts - (np.cumsum(counts) - counts), counts)
+        e = base + np.arange(total, dtype=np.int64)
+        return owner, self.nbr[e], self.conf[e]
