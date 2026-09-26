@@ -10,7 +10,7 @@
   DocGraph web UI. One self-contained file served by `docgraph host` at "/" (read fresh on every
   request, no build step, no external assets). Every call goes through api()/withRoot(), which
   appends ?root=<slug> for the active root.
-  Pages (hash routes): #/graph  #/search  #/wiki  #/flows  #/changes  #/ask  #/index
+  Pages (hash routes): #/graph  #/search  #/wiki  #/flows  #/changes  #/insights  #/ask  #/index
   Responsive: >=1180 three panes (drag handles) | 820-1180 detail becomes a drawer |
   <820 bottom tab bar, explorer drawer, detail bottom sheet | 44 px touch targets on coarse pointers.
   Graph engine: ForceAtlas2-style layout + label-propagation communities in a Web Worker,
@@ -511,6 +511,50 @@ body.resizing, body.resizing * { cursor: col-resize !important; user-select: non
   .pv-frame { height: 55vh; }
   .big-search { flex-wrap: wrap; } .big-search .search-box { flex-basis: 100%; }
 }
+/* ── Analysis features (confidence, clusters, context, risk, flows, insights) ── */
+.risk-b { display: inline-flex; align-items: center; gap: 4px; height: 19px; padding: 0 7px; border-radius: 99px; font: 600 10.5px/1 var(--mono); text-transform: uppercase; letter-spacing: .03em; white-space: nowrap; }
+.risk-b.low { background: var(--ok-soft); color: var(--ok); } .risk-b.medium { background: var(--warn-soft); color: var(--warn); }
+.risk-b.high { background: color-mix(in srgb, var(--orange) 16%, transparent); color: var(--orange); } .risk-b.critical { background: var(--err-soft); color: var(--err); }
+.risk-big { display: flex; align-items: center; gap: 14px; flex-wrap: wrap; }
+.risk-big .score { font: 700 30px/1 var(--mono); }
+.factors { margin: 6px 0 2px 22px; font-size: 11.5px; color: var(--muted); display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; }
+.factors b { font: 600 11px var(--mono); color: var(--text); text-align: right; }
+details.sym-risk { border-bottom: 1px solid var(--border); padding: 6px 0; } details.sym-risk:last-child { border-bottom: 0; }
+details.sym-risk summary { cursor: pointer; display: flex; align-items: center; gap: 8px; font: 12px var(--mono); list-style: none; }
+details.sym-risk summary::-webkit-details-marker { display: none; }
+.conf { font: 500 10.5px var(--mono); color: var(--faint); } .conf.lo { color: var(--warn); }
+.range-row { display: flex; align-items: center; gap: 10px; } .range-row input[type=range] { flex: 1; accent-color: var(--accent); }
+.range-row .v { font: 600 11.5px var(--mono); width: 34px; text-align: right; }
+.ov-chip { display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 6px 0 10px; font-size: 12px; }
+.ov-chip .sw { width: 9px; height: 9px; border-radius: 50%; }
+.ctx-md { font-size: 12.5px; } .ctx-md h2 { font-size: 13px; margin: 14px 0 4px; } .ctx-md p, .ctx-md li { font-size: 12.5px; line-height: 1.55; }
+.ctx-md pre { font-size: 11.5px; }
+.flows > .flow { min-width: 0; }
+@media (max-width: 820px) { .flows { grid-template-columns: minmax(0, 1fr); } }
+.seq-wrap { overflow: auto; border: 1px solid var(--border); border-radius: var(--r); background: var(--well); max-height: 70vh; }
+.seq-wrap svg { display: block; }
+.seq-wrap text { font-family: var(--mono); }
+.seq-head { cursor: pointer; }
+.fl-tabs { margin-bottom: 12px; }
+.method { display: inline-flex; min-width: 46px; justify-content: center; height: 18px; padding: 0 5px; border-radius: 4px; font: 700 10px/18px var(--mono); background: var(--accent-soft); color: var(--accent); }
+.method.POST { background: var(--ok-soft); color: var(--ok); } .method.DELETE { background: var(--err-soft); color: var(--err); }
+.method.PUT, .method.PATCH { background: var(--warn-soft); color: var(--warn); } .method.tool { background: color-mix(in srgb, var(--violet) 15%, transparent); color: var(--violet); }
+.tbl tr.on td { background: var(--accent-soft); } .tbl tr.click { cursor: pointer; }
+.ins-grid { display: grid; grid-template-columns: repeat(12, 1fr); gap: 14px; }
+.stat-tiles { display: grid; grid-template-columns: repeat(auto-fill, minmax(120px, 1fr)); gap: 8px; }
+.stat-tiles > div { background: var(--panel2); border: 1px solid var(--border); border-radius: var(--r); padding: 9px 11px; }
+.stat-tiles .v { font: 650 18px var(--mono); } .stat-tiles .l { font-size: 11px; color: var(--faint); }
+.mono-block { font: 11.5px/1.55 var(--mono); background: var(--well); border: 1px solid var(--border); border-radius: var(--r); padding: 10px 12px; white-space: pre; overflow: auto; max-height: 520px; margin: 0; }
+.trace-path { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.plan-file { border: 1px solid var(--border); border-radius: var(--r); margin-bottom: 8px; overflow: hidden; }
+.plan-file .ph { padding: 6px 9px; background: var(--panel2); font: 600 11.5px var(--mono); display: flex; gap: 6px; align-items: center; }
+.plan-edit { padding: 5px 9px; border-top: 1px solid var(--border); font: 11px/1.5 var(--mono); }
+.plan-edit .b { color: var(--err); white-space: pre-wrap; word-break: break-all; } .plan-edit .a { color: var(--ok); white-space: pre-wrap; word-break: break-all; }
+.res-bars .rb { display: grid; grid-template-columns: 130px 1fr 60px; gap: 8px; align-items: center; font-size: 11.5px; padding: 2px 0; }
+.res-bars .rb .n { font: 11px var(--mono); color: var(--faint); text-align: right; }
+@media (max-width: 1180px) { .ins-grid > .span-6, .ins-grid > .span-4, .ins-grid > .span-8 { grid-column: span 12; } }
+@media (max-width: 820px) { details.sym-risk summary { flex-wrap: wrap; } details.sym-risk summary > .faint { flex-basis: 100%; order: 5; padding-left: 2px; } details.sym-risk summary > .ellipsis { min-width: 90px; } }
+@media (max-width: 820px) { .res-bars .rb { grid-template-columns: 100px 1fr 44px; } .risk-big .score { font-size: 24px; } }
 </style>
 </head>
 <body>
@@ -582,6 +626,10 @@ Object.assign(I, {
   alert: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M12 3 2 20h20L12 3Z"/><path d="M12 10v4M12 17.5v.5"/></svg>',
   info: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7.5v.5"/></svg>',
   expand: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/></svg>',
+  pulse: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 12h4l3-7 4 14 3-7h4"/></svg>',
+  edit: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 20h4L19 9l-4-4L4 16v4ZM13.5 6.5l4 4"/></svg>',
+  dots: '<svg viewBox="0 0 24 24" fill="currentColor"><circle cx="5" cy="12" r="2"/><circle cx="12" cy="12" r="2"/><circle cx="19" cy="12" r="2"/></svg>',
+  route: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="6" cy="19" r="2.5"/><circle cx="18" cy="5" r="2.5"/><path d="M8.5 19H15a3.5 3.5 0 0 0 0-7H9a3.5 3.5 0 0 1 0-7h6.5"/></svg>',
 });
 const ic = (n, s) => `<span class="ic"${s ? ` style="width:${s}px;height:${s}px"` : ''}>${I[n] || ''}</span>`;
 const esc = (s) => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
@@ -1046,7 +1094,14 @@ const G = {
   focusHops: 0, visibleIds: null, colorMode: 'kind', lodMode: 'all',
   level0: new Set(), revealed: new Set(), expanded: new Set(), nb: { id: null, set: new Set() },
   status: 'idle', error: null, token: 0, pending: null, communities: [],
+  minConf: 0, hasConf: false, hasServerClusters: false, clusterNames: new Map(), hulls: false, hullCache: null, hullAt: 0,
+  overlay: null,
 };
+// Canvas edge visibility: kind filter + the min-confidence floor on CALLS edges.
+const edgeOn = (e) => G.edgeFilter.has(e.kind) && !(G.minConf > 0 && e.kind === 'CALLS' && e.confidence != null && e.confidence < G.minConf);
+// Community of a node: server Louvain cluster when the index has them, else the worker's label propagation.
+const commOf = (n) => G.hasServerClusters ? n.cluster : n.community;
+const commColor = (c) => COMMUNITY_PALETTE[Math.abs(Number(c) || 0) % COMMUNITY_PALETTE.length];
 
 function hexA(hex, a) {
   const h = String(hex || '').trim().replace('#', '');
@@ -1058,7 +1113,7 @@ function hexA(hex, a) {
 function readTheme() {
   const cs = getComputedStyle(document.documentElement), v = (n) => cs.getPropertyValue(n).trim();
   return {
-    bg: v('--well'), text: v('--text'), faint: v('--faint'), accent: v('--accent'), mono: v('--mono') || 'monospace', sans: v('--sans') || 'sans-serif',
+    bg: v('--well'), text: v('--text'), faint: v('--faint'), accent: v('--accent'), err: v('--err'), warn: v('--warn'), mono: v('--mono') || 'monospace', sans: v('--sans') || 'sans-serif',
     kind: Object.fromEntries(NODE_KINDS.map(k => [k.id, v(k.tok)])),
     edge: Object.fromEntries(EDGE_KINDS.map(k => [k.id, hexA(v(k.tok), k.a)])),
   };
@@ -1084,7 +1139,7 @@ function onWorkerMessage(ev) {
     summarizeCommunities();
     G.needsRender = true;
   } else if (m.type === 'done') {
-    G.layoutRunning = false; updateLayoutUI();
+    G.layoutRunning = false; G.hullCache = null; G.needsRender = true; updateLayoutUI();
   }
 }
 function postLayoutInit() {
@@ -1156,7 +1211,7 @@ async function loadGraph(mode = G.lodMode) {
   else if (G.selectedId != null) { lazyExpand(G.selectedId); }
 }
 function makeLayoutNode(n, maxPR, x, y) {
-  return { id: n.id, name: n.name, kind: n.kind, file: n.file, x, y, r: 2.5 + Math.sqrt((n.pagerank || 0) / maxPR) * 12, pagerank: n.pagerank || 0, community: null, idx: 0 };
+  return { id: n.id, name: n.name, kind: n.kind, file: n.file, x, y, r: 2.5 + Math.sqrt((n.pagerank || 0) / maxPR) * 12, pagerank: n.pagerank || 0, community: null, cluster: n.cluster ?? null, idx: 0 };
 }
 function buildLayout() {
   const nodes = G.graph.nodes, N = Math.max(1, nodes.length);
@@ -1168,23 +1223,29 @@ function buildLayout() {
   });
   G.byId = new Map(G.layout.map(n => [n.id, n]));
   G.level0 = new Set(G.layout.filter(n => n.kind === 'File').map(n => n.id));
-  G.revealed = new Set(); G.communities = [];
+  G.revealed = new Set(); G.communities = []; G.hullCache = null;
+  G.hasServerClusters = G.layout.some(n => n.cluster != null);
+  G.hasConf = G.graph.edges.some(e => e.kind === 'CALLS' && e.confidence != null);
+  if (G.hasServerClusters) loadClusterNames();
   sortLabels();
 }
 function sortLabels() { G.labelOrder = [...G.layout].sort((a, b) => b.pagerank - a.pagerank); }
 function summarizeCommunities() {
   const m = new Map();
   for (const n of G.layout) {
-    if (n.community == null) continue;
-    let c = m.get(n.community); if (!c) { c = { id: n.community, size: 0, dirs: new Map() }; m.set(n.community, c); }
+    const cm = commOf(n);
+    if (cm == null) continue;
+    let c = m.get(cm); if (!c) { c = { id: cm, size: 0, dirs: new Map() }; m.set(cm, c); }
     c.size++;
     const d = n.file ? dirname(n.file) : '';
     if (d) c.dirs.set(d, (c.dirs.get(d) || 0) + 1);
   }
   G.communities = [...m.values()].sort((a, b) => b.size - a.size).map(c => {
     let best = '', bn = 0; for (const [d, k] of c.dirs) if (k > bn) { bn = k; best = d; }
-    return { id: c.id, size: c.size, label: best === '.' ? '(root)' : (best.split('/').slice(-2).join('/') || `#${c.id}`) };
+    const srv = G.hasServerClusters ? G.clusterNames.get(c.id) : null;
+    return { id: c.id, size: c.size, server: !!srv, label: srv ? srv.name : best === '.' ? '(root)' : (best.split('/').slice(-2).join('/') || `#${c.id}`) };
   });
+  G.hullCache = null;
   renderLegend();
 }
 
@@ -1199,7 +1260,7 @@ function computeVisible() {
   if (focus) {
     const adj = new Map();
     for (const e of G.graph.edges) {
-      if (!G.edgeFilter.has(e.kind)) continue;
+      if (!edgeOn(e)) continue;
       (adj.get(e.src) || adj.set(e.src, []).get(e.src)).push(e.dst);
       (adj.get(e.dst) || adj.set(e.dst, []).get(e.dst)).push(e.src);
     }
@@ -1209,13 +1270,13 @@ function computeVisible() {
     }
     const r = new Set(); for (const id of seen) if (allowed.has(id)) r.add(id); allowed = r;
   }
-  G.visibleIds = allowed;
+  G.visibleIds = allowed; G.hullCache = null;
   const vc = $('#vis-count'); if (vc) vc.innerHTML = allowed.size < G.layout.length ? `<b>${fmtNum(allowed.size)}</b> visible` : '';
 }
 function isNeighbor(id, sel) {
   if (G.nb.id !== sel) {
     const s = new Set();
-    for (const e of G.graph.edges) { if (!G.edgeFilter.has(e.kind)) continue; if (e.src === sel) s.add(e.dst); if (e.dst === sel) s.add(e.src); }
+    for (const e of G.graph.edges) { if (!edgeOn(e)) continue; if (e.src === sel) s.add(e.dst); if (e.dst === sel) s.add(e.src); }
     G.nb = { id: sel, set: s };
   }
   return G.nb.set.has(id);
@@ -1234,8 +1295,9 @@ function render() {
   const vMinX = -vp.tx / vp.scale, vMinY = -vp.ty / vp.scale, vMaxX = vMinX + w / vp.scale, vMaxY = vMinY + h / vp.scale;
   ctx.lineWidth = 0.7 / vp.scale;
   const byCol = new Map();
+  if (G.hulls) drawHulls(ctx, T, vp);
   for (const e of G.graph.edges) {
-    if (!G.edgeFilter.has(e.kind)) continue;
+    if (!edgeOn(e)) continue;
     if (vis && !(vis.has(e.src) && vis.has(e.dst))) continue;
     const a = G.byId.get(e.src), b = G.byId.get(e.dst); if (!a || !b) continue;
     if ((a.x < vMinX && b.x < vMinX) || (a.x > vMaxX && b.x > vMaxX) || (a.y < vMinY && b.y < vMinY) || (a.y > vMaxY && b.y > vMaxY)) continue;
@@ -1253,7 +1315,7 @@ function render() {
   if (sel !== null) {
     ctx.lineWidth = 1.7 / vp.scale; ctx.strokeStyle = T.accent; ctx.beginPath();
     for (const e of G.graph.edges) {
-      if ((e.src !== sel && e.dst !== sel) || !G.edgeFilter.has(e.kind)) continue;
+      if ((e.src !== sel && e.dst !== sel) || !edgeOn(e)) continue;
       if (vis && !(vis.has(e.src) && vis.has(e.dst))) continue;
       const a = G.byId.get(e.src), b = G.byId.get(e.dst); if (!a || !b) continue;
       ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
@@ -1264,8 +1326,10 @@ function render() {
   for (const n of G.layout) {
     if (vis && !vis.has(n.id)) continue;
     if (n.x < vMinX - 30 || n.x > vMaxX + 30 || n.y < vMinY - 30 || n.y > vMaxY + 30) continue;
-    const isDim = sel !== null && n.id !== sel && !isNeighbor(n.id, sel);
-    const col = (G.colorMode === 'community' && n.community != null) ? COMMUNITY_PALETTE[n.community % COMMUNITY_PALETTE.length] : kindColor(n.kind);
+    const ov = G.overlay;
+    const isDim = (sel !== null && n.id !== sel && !isNeighbor(n.id, sel)) || (ov && sel === null && !ov.changed.has(n.id) && !ov.affected.has(n.id));
+    const cm = commOf(n);
+    const col = (G.colorMode === 'community' && cm != null) ? commColor(cm) : kindColor(n.kind);
     const m = isDim ? dim : full; let arr = m.get(col); if (!arr) { arr = []; m.set(col, arr); }
     arr.push(n.x, n.y, n.r);
   }
@@ -1279,6 +1343,10 @@ function render() {
   };
   drawBatch(dim, 0.22); drawBatch(full, 1); ctx.globalAlpha = 1;
   const ring = (id, width, color, pad) => { const n = G.byId.get(id); if (!n) return; ctx.lineWidth = width / vp.scale; ctx.strokeStyle = color; ctx.beginPath(); ctx.arc(n.x, n.y, n.r + pad / vp.scale, 0, Math.PI * 2); ctx.stroke(); };
+  if (G.overlay) {
+    for (const id of G.overlay.affected) if (!vis || vis.has(id)) ring(id, 1.6, hexA(T.warn, .85), 2);
+    for (const id of G.overlay.changed) if (!vis || vis.has(id)) ring(id, 3, T.err, 3.5);
+  }
   if (sel !== null) ring(sel, 2.5, T.accent, 3);
   if (G.hoverId !== null && G.hoverId !== sel) ring(G.hoverId, 1.6, T.text, 2);
   // Labels: top-N by PageRank inside the viewport (N grows with zoom), + selection neighbours + hover.
@@ -1303,6 +1371,7 @@ function render() {
     for (const id of G.nb.set) { if (k++ > 60) break; const n = G.byId.get(id); if (n && (!vis || vis.has(id))) lab(n, 500, T.text, 0.85); }
     const s = G.byId.get(sel); if (s) lab(s, 650, T.text, 1);
   }
+  if (G.overlay && sel === null) { let k = 0; for (const id of G.overlay.changed) { if (k++ > 40) break; const n = G.byId.get(id); if (n && (!vis || vis.has(id))) lab(n, 650, T.text, 1); } }
   if (G.hoverId !== null) { const n = G.byId.get(G.hoverId); if (n) lab(n, 600, T.text, 1); }
   ctx.globalAlpha = 1;
   ctx.restore();
@@ -1356,6 +1425,70 @@ function resetLayout() {
   G.fitNext = true; postLayoutInit(); startLayout(); G.needsRender = true;
 }
 
+/* Cluster names (server Louvain) + convex hulls */
+const clustersList = () => cached('clusters', () => api('/api/clusters?limit=500'));
+function loadClusterNames() {
+  clustersList().then(d => {
+    G.clusterNames = new Map((d.clusters || []).map(c => [c.id, c]));
+    summarizeCommunities(); G.needsRender = true;
+    if (S.page === 'graph' && S.sel && S.detTab === 'overview') renderDetail();
+  }).catch(() => { /* names optional: legend falls back to directories */ });
+}
+function convexHull(pts) {
+  if (pts.length < 3) return pts.slice();
+  pts.sort((a, b) => a[0] - b[0] || a[1] - b[1]);
+  const cross = (o, a, b) => (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0]);
+  const lo = [], up = [];
+  for (const p of pts) { while (lo.length >= 2 && cross(lo[lo.length - 2], lo[lo.length - 1], p) <= 0) lo.pop(); lo.push(p); }
+  for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
+  up.pop(); lo.pop(); return lo.concat(up);
+}
+// Hulls are recomputed at most every 400 ms (layout ticks arrive far more often); top 40 clusters only.
+function computeHulls() {
+  const groups = new Map(), vis = G.visibleIds;
+  for (const n of G.layout) {
+    if (vis && !vis.has(n.id)) continue;
+    const c = commOf(n); if (c == null) continue;
+    let g = groups.get(c); if (!g) { g = []; groups.set(c, g); } g.push([n.x, n.y]);
+  }
+  const out = [];
+  for (const [c, pts] of groups) {
+    if (pts.length < 3) continue;
+    let cx = 0, cy = 0, minY = Infinity; for (const p of pts) { cx += p[0]; cy += p[1]; if (p[1] < minY) minY = p[1]; }
+    out.push({ c, n: pts.length, hull: convexHull(pts), cx: cx / pts.length, cy: cy / pts.length, top: minY });
+  }
+  out.sort((a, b) => b.n - a.n);
+  return out.slice(0, 40);
+}
+function drawHulls(ctx, T, vp) {
+  const now = performance.now();
+  if (!G.hullCache || now - G.hullAt > 400) { G.hullCache = computeHulls(); G.hullAt = now; }
+  const pad = 14 / vp.scale;
+  for (const h of G.hullCache) {
+    const col = commColor(h.c);
+    ctx.beginPath();
+    h.hull.forEach((p, i) => {
+      // Push each hull vertex `pad` away from the centroid so the outline clears the node discs.
+      const dx = p[0] - h.cx, dy = p[1] - h.cy, len = Math.hypot(dx, dy) || 1;
+      const x = p[0] + (dx / len) * pad, y = p[1] + (dy / len) * pad;
+      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
+    });
+    ctx.closePath();
+    ctx.globalAlpha = 0.07; ctx.fillStyle = col; ctx.fill();
+    ctx.globalAlpha = 0.45; ctx.lineWidth = 1.2 / vp.scale; ctx.strokeStyle = col; ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+  const fs = 12 / vp.scale; ctx.font = `600 ${fs}px ${T.sans}`; ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+  for (const h of G.hullCache.slice(0, 24)) {
+    const info = G.communities.find(x => x.id === h.c);
+    const t = info ? info.label : '#' + h.c;
+    const y = h.top - pad - 4 / vp.scale;
+    ctx.lineWidth = 3 / vp.scale; ctx.strokeStyle = T.bg; ctx.strokeText(t, h.cx, y);
+    ctx.fillStyle = commColor(h.c); ctx.fillText(t, h.cx, y);
+  }
+  ctx.textAlign = 'left';
+}
+
 /* Lazy 1-hop (or N-hop in focus mode) expansion via /api/node_neighbors */
 async function lazyExpand(id) {
   const hops = Math.max(1, Math.min(G.focusHops || 1, 3)), key = `${id}:${hops}`;
@@ -1386,8 +1519,8 @@ function mergeNeighbors(nodes, edges) {
     if (n.kind === 'File') G.level0.add(n.id);
     nAdd++;
   }
-  for (const e of edges) { const k = `${e.src}:${e.dst}:${e.kind}`; if (eKeys.has(k)) continue; eKeys.add(k); G.graph.edges.push(e); eAdd++; }
-  if (nAdd) sortLabels();
+  for (const e of edges) { const k = `${e.src}:${e.dst}:${e.kind}`; if (eKeys.has(k)) continue; eKeys.add(k); G.graph.edges.push(e); eAdd++; if (e.kind === 'CALLS' && e.confidence != null) G.hasConf = true; }
+  if (nAdd) { sortLabels(); if (!G.hasServerClusters && G.layout.some(n => n.cluster != null)) { G.hasServerClusters = true; loadClusterNames(); } if (G.hasServerClusters) summarizeCommunities(); }
   return { nodes: nAdd, edges: eAdd };
 }
 
@@ -1395,6 +1528,9 @@ function mergeNeighbors(nodes, edges) {
 const S = {
   page: 'graph', sel: null, detTab: 'overview', leftTab: 'explore', exploreKind: '', exploreQ: '', explore: null,
   wiki: null, change: null, changesRef: '', flowsLimit: 25, flowsChain: 8, cgDepth: 2,
+  minConf: 0, ctxTokens: 2000, rename: null, flowsTab: 'flows', flowSel: null, routeSel: null, routesQ: '',
+  chDepth: 3, chConf: 0, chDiff: '', chPaste: false, insCluster: null, healthConf: 0.5,
+  traceA: '', traceB: '', mapFocus: '', mapTokens: 1024,
   search: { q: '', kind: '', mode: 'hybrid', rerank: null, results: null, ms: 0, near: false, sel: 0, cypher: '' },
   thread: null,
 };
@@ -1414,7 +1550,7 @@ function selectNode(id, opts = {}) {
   if (opts.tab) S.detTab = opts.tab;
   if (G.lodMode === 'levels') {
     G.revealed.add(id);
-    for (const e of G.graph.edges) { if (!G.edgeFilter.has(e.kind)) continue; if (e.src === id) G.revealed.add(e.dst); else if (e.dst === id) G.revealed.add(e.src); }
+    for (const e of G.graph.edges) { if (!edgeOn(e)) continue; if (e.src === id) G.revealed.add(e.dst); else if (e.dst === id) G.revealed.add(e.src); }
   }
   computeVisible(); G.needsRender = true;
   lazyExpand(id).then(() => {
@@ -1482,6 +1618,7 @@ function buildGraphPage() {
       <button class="btn mobile-only glass" data-act="left-open" style="height:40px">${ic('menu')} Explore</button>
       <div class="glass stats-strip"><span><b id="st-nodes">0</b> nodes</span><span><b id="st-edges">0</b> edges</span><span id="vis-count"></span></div>
       <div class="glass layout-pill hidden" id="layout-pill"><span class="spinner"></span>Layout settling…</div>
+      <div class="glass ov-chip hidden" id="ov-chip"></div>
     </div>
     <div class="float tr">
       <div class="glass sel-chip hidden" id="sel-chip"></div>
@@ -1677,14 +1814,24 @@ function renderFilters(b) {
     <div class="group"><h4>Focus depth</h4><p>Keep only nodes within N hops of the selection.</p>
       <div class="seg full" id="hops">${[[0, 'All'], [1, '1'], [2, '2'], [3, '3'], [5, '5']].map(([h, l]) => `<button data-h="${h}" class="${G.focusHops === h ? 'on' : ''}">${l}${h ? (h > 1 ? ' hops' : ' hop') : ''}</button>`).join('')}</div>
       ${G.focusHops && !S.sel ? '<div class="lod-note">Select a node to apply the focus.</div>' : ''}</div>
+    <div class="group"><h4>Call confidence</h4><p>Hide <code>CALLS</code> edges resolved below this confidence (0.95 import map … 0.3 fuzzy).</p>
+      ${G.hasConf ? `<div class="range-row"><input type="range" id="minconf" min="0" max="1" step="0.05" value="${G.minConf}"/><span class="v" id="minconf-v">${G.minConf.toFixed(2)}</span></div>
+      <div class="lod-note">${G.minConf > 0 ? `${fmtNum(G.graph.edges.filter(e => e.kind === 'CALLS' && e.confidence != null && e.confidence < G.minConf).length)} call edges hidden` : 'All call edges shown.'}</div>`
+        : '<div class="lod-note">This index has no edge confidences (built before schema v3) — run a full rebuild from the Index page.</div>'}</div>
     <div class="group"><h4>Color by</h4><p>Node size is always PageRank.</p>
-      <div class="seg full" id="cmode"><button data-c="kind" class="${G.colorMode === 'kind' ? 'on' : ''}">Kind</button><button data-c="community" class="${G.colorMode === 'community' ? 'on' : ''}">Community</button></div></div>
+      <div class="seg full" id="cmode"><button data-c="kind" class="${G.colorMode === 'kind' ? 'on' : ''}">Kind</button><button data-c="community" class="${G.colorMode === 'community' ? 'on' : ''}">${G.hasServerClusters ? 'Cluster' : 'Community'}</button></div>
+      <div class="lod-note">${G.hasServerClusters ? 'Clusters come from the server (Louvain at index time).' : 'Communities are estimated in the browser (label propagation); a schema-v3 index provides server clusters.'}</div>
+      <label class="toggle-row" style="margin-top:6px">${sw(G.hulls, 'id="hulls"')}Named cluster hulls<span class="n">${fmtNum(G.communities.length)}</span></label></div>
     <div class="group"><h4>Level of detail</h4><p>Level 0 = every file; clicking a node reveals its 1-hop neighbours.</p>
       <div class="seg full" id="lod"><button data-lod="all" class="${G.lodMode === 'all' ? 'on' : ''}">All nodes</button><button data-lod="levels" class="${G.lodMode === 'levels' ? 'on' : ''}">Files first, expand on click</button></div>
       <div class="lod-note">${G.lodMode === 'all' ? `Top ${fmtNum(ALL_NODES_CAP)} nodes by PageRank.` : 'Loaded from /api/files — every file, no cap.'}</div></div>`;
   hydrateIcons(b);
+  const mc = $('#minconf', b);
+  if (mc) mc.oninput = () => { G.minConf = +mc.value; $('#minconf-v', b).textContent = G.minConf.toFixed(2); G.nb = { id: null, set: new Set() }; computeVisible(); G.needsRender = true; };
   b.onchange = e => {
     const t = e.target;
+    if (t.id === 'minconf') { renderFilters(b); return; }
+    if (t.id === 'hulls') { G.hulls = t.checked; G.hullCache = null; G.needsRender = true; return; }
     if (t.dataset.nk) { t.checked ? G.nodeFilter.add(t.dataset.nk) : G.nodeFilter.delete(t.dataset.nk); computeVisible(); }
     if (t.dataset.et) { t.checked ? G.edgeFilter.add(t.dataset.et) : G.edgeFilter.delete(t.dataset.et); G.nb = { id: null, set: new Set() }; computeVisible(); }
     G.needsRender = true;
@@ -1716,7 +1863,7 @@ function renderLegend() {
   const l = $('#legend'); if (!l) return;
   if (G.colorMode === 'kind') { l.innerHTML = NODE_KINDS.map(k => `<span><i style="background:var(${k.tok})"></i>${k.label}</span>`).join(''); return; }
   const top = G.communities.slice(0, 8);
-  l.innerHTML = top.length ? top.map(c => `<span title="${fmtNum(c.size)} nodes"><i style="background:${COMMUNITY_PALETTE[c.id % COMMUNITY_PALETTE.length]}"></i>${esc(c.label)}</span>`).join('') + (G.communities.length > 8 ? `<span class="faint">+${G.communities.length - 8} more</span>` : '') : '<span class="faint">Detecting communities…</span>';
+  l.innerHTML = top.length ? top.map(c => `<span title="${fmtNum(c.size)} nodes"><i style="background:${commColor(c.id)}"></i>${esc(c.label)}</span>`).join('') + (G.communities.length > 8 ? `<span class="faint">+${G.communities.length - 8} more</span>` : '') : `<span class="faint">${G.hasServerClusters ? 'Loading clusters…' : 'Detecting communities…'}</span>`;
 }
 function renderSelChip() {
   const chip = $('#sel-chip'); if (!chip) return;
@@ -1727,12 +1874,47 @@ function renderSelChip() {
   chip.innerHTML = `${kindTag(n.kind)}<span class="nm ellipsis" title="${esc(n.name)}">${esc(n.kind === 'File' ? basename(n.name) : n.name)}</span><button class="btn quiet sm icon" title="Clear selection" data-act="sel-clear">${ic('x')}</button>`;
 }
 
+/* Diff overlay (Changes -> Show on graph): changed nodes ringed strongly, affected callers softly. */
+async function showOverlay(ov, label) {
+  G.overlay = { changed: new Set(ov.changed || []), affected: new Set(ov.affected || []), label: label || 'diff' };
+  go('graph'); renderOverlayChip(); G.needsRender = true;
+  const missing = [...G.overlay.changed].filter(id => !G.byId.has(id)).slice(0, 30);
+  for (const id of missing) {
+    try {
+      const d = await api(`/api/node_neighbors?id=${q(id)}&hops=1`);
+      if (d && d.nodes && mergeNeighbors(d.nodes, d.edges || []).nodes) { postLayoutInit(); if (!G.layoutRunning) startLayout(); }
+    } catch { /* node may be gone after a reindex */ }
+  }
+  if (missing.length) { computeVisible(); renderGraphChrome(); }
+  const first = [...G.overlay.changed].find(id => G.byId.has(id));
+  if (first != null) centerOn(first);
+  renderOverlayChip(); G.needsRender = true;
+}
+function clearOverlay() { G.overlay = null; renderOverlayChip(); G.needsRender = true; }
+function renderOverlayChip() {
+  const c = $('#ov-chip'); if (!c) return;
+  const ov = G.overlay; c.classList.toggle('hidden', !ov);
+  if (!ov) { c.innerHTML = ''; return; }
+  const shown = [...ov.changed].filter(id => G.byId.has(id)).length;
+  c.innerHTML = `<span class="sw" style="background:var(--err)"></span>${fmtNum(shown)}/${fmtNum(ov.changed.size)} changed<span class="sw" style="background:var(--warn);margin-left:4px"></span>${fmtNum(ov.affected.size)} affected<button class="btn quiet sm icon" data-act="overlay-clear" title="Clear diff overlay">${ic('x')}</button>`;
+}
+
 /* ─────────────────────────── Detail pane ─────────────────────────── */
 function detTabs(kind) {
-  if (kind === 'Function') return [['overview', 'Overview'], ['code', 'Code'], ['calls', 'Calls'], ['impact', 'Impact'], ['git', 'History']];
-  if (kind === 'Module') return [['overview', 'Overview'], ['impact', 'Impact']];
-  return [['overview', 'Overview'], ['code', 'Code'], ['impact', 'Impact'], ['git', 'History']];
+  let t;
+  if (kind === 'Function') t = [['overview', 'Overview'], ['context', 'Context'], ['code', 'Code'], ['calls', 'Calls'], ['impact', 'Impact'], ['git', 'History']];
+  else if (kind === 'Module') t = [['overview', 'Overview'], ['impact', 'Impact']];
+  else if (kind === 'Class') t = [['overview', 'Overview'], ['context', 'Context'], ['code', 'Code'], ['impact', 'Impact'], ['git', 'History']];
+  else t = [['overview', 'Overview'], ['code', 'Code'], ['impact', 'Impact'], ['git', 'History']];
+  if (S.rename && S.sel && S.rename.id === S.sel.id) t = [...t, ['rename', 'Rename']];
+  return t;
 }
+const confSeg = (id) => `<span class="faint" style="font-size:12px">Min conf</span><div class="seg sm" id="${id}" title="Ignore CALLS edges resolved below this confidence">${[[0, 'any'], [0.5, '0.5'], [0.75, '0.75'], [0.9, '0.9']].map(([v, l]) => `<button data-mc="${v}" class="${S.minConf === v ? 'on' : ''}">${l}</button>`).join('')}</div>`;
+function wireConfSeg(id, reload) {
+  const seg = $('#' + id); if (!seg) return;
+  seg.onclick = e => { const b = e.target.closest('[data-mc]'); if (!b) return; S.minConf = +b.dataset.mc; $$('button', seg).forEach(x => x.classList.toggle('on', x === b)); reload(); };
+}
+const confTag = (c, m) => c == null ? '' : `<span class="conf${c < 0.5 ? ' lo' : ''}" title="${esc(m || '')}">${Number(c).toFixed(2)}${m ? ' ' + esc(m) : ''}</span>`;
 const isFileSel = () => S.sel && S.sel.kind === 'File';
 const selFile = () => S.sel ? (isFileSel() ? (S.sel.file || S.sel.name) : S.sel.file) : null;
 function loadDef() {
@@ -1772,6 +1954,7 @@ function renderDetail() {
         <button class="btn sm" data-act="ask-about"${isFileSel() ? '' : ''}>${ic('sparkle')} Ask about this</button>
         <button class="btn sm" data-act="focus">${ic('target')} Focus</button>
         <button class="btn sm quiet" data-act="copy-ref">${ic('link')} Copy ref</button>
+        ${n.kind === 'Function' || n.kind === 'Class' ? `<button class="btn sm quiet" data-act="rename-plan" title="Plan a rename (dry run; nothing is written)">${ic('edit')} Rename…</button>` : ''}
       </div>
     </div>
     <div class="metrics" id="det-metrics"></div>
@@ -1781,7 +1964,7 @@ function renderDetail() {
   renderMetrics();
   if (!isFileSel()) loadDef().then(def => { const l = $('#det-loc'); if (l && def && S.sel && S.sel.id === n.id) l.textContent = `${def.file}:${def.line}`; }).catch(() => {});
   const body = $('#det-body');
-  ({ overview: detOverview, code: detCode, calls: detCalls, impact: detImpact, git: detHistory }[S.detTab] || detOverview)(body, n);
+  ({ overview: detOverview, context: detContext, code: detCode, calls: detCalls, impact: detImpact, git: detHistory, rename: detRename }[S.detTab] || detOverview)(body, n);
   hydrateIcons(d);
 }
 const sect = (title, id, count) => `<div class="section-label">${esc(title)}${count != null ? ` <span class="faint">${count}</span>` : ''}</div><div id="${id}">${loadingHTML()}</div>`;
@@ -1808,9 +1991,12 @@ function detOverview(body, n) {
     fill($('#ov-rel'), () => dget('neigh', () => api(`/api/neighborhood?name=${q(n.name)}&limit=20`)), rows => (rows || []).length ? rows.map(r => relRow({ name: r.name, kind: r.kind, file: r.file, meta: `${EDGE_LABELS[r.via] || r.via} · ${basename(r.file)}` })).join('') : noneHTML('No related entities.'), { after: wireRels });
   }
   const ln = G.byId.get(n.id), cm = $('#ov-comm');
-  if (cm && ln && ln.community != null) {
+  if (cm && ln && ln.cluster != null) {
+    const sc = G.clusterNames.get(ln.cluster);
+    cm.innerHTML = `<div class="section-label">Cluster</div><button class="pill" style="cursor:pointer" data-act="open-cluster" data-cid="${esc(ln.cluster)}" title="Open the cluster in Insights"><span class="dot" style="color:${commColor(ln.cluster)}"></span>${esc(sc ? sc.name : '#' + ln.cluster)}${sc ? ` · ${fmtNum(sc.size)} members · cohesion ${Number(sc.cohesion || 0).toFixed(2)}` : ''}</button>`;
+  } else if (cm && ln && ln.community != null) {
     const c = G.communities.find(x => x.id === ln.community);
-    cm.innerHTML = `<div class="section-label">Community</div><span class="pill"><span class="dot" style="color:${COMMUNITY_PALETTE[ln.community % COMMUNITY_PALETTE.length]}"></span>${esc(c ? c.label : '#' + ln.community)}${c ? ` · ${fmtNum(c.size)} nodes` : ''}</span>`;
+    cm.innerHTML = `<div class="section-label">Community <span class="faint">estimated in the browser</span></div><span class="pill"><span class="dot" style="color:${commColor(ln.community)}"></span>${esc(c ? c.label : '#' + ln.community)}${c ? ` · ${fmtNum(c.size)} nodes` : ''}</span>`;
   }
   const rl = $('#ov-rules');
   if (rl && file) fill(rl, () => dget('rules', () => api(`/api/rules_for?file=${q(file)}`)), rules => (rules || []).length ? `<div class="rules">${rules.map(r => `<details><summary>${ic('lock', 12)} ${esc(r.name)} <span class="faint">${esc(r.description || '')}${r.always_apply ? ' · always' : ''}</span></summary><div class="body md">${md(r.body || '')}</div></details>`).join('')}</div>` : noneHTML('No rules match this file.'));
@@ -1858,16 +2044,91 @@ function detCode(body, n) {
   showCode();
 }
 function detCalls(body, n) {
-  body.innerHTML = `<div class="row" style="margin-bottom:4px"><span class="faint" style="font-size:12px">Depth</span><div class="seg sm" id="cg-depth">${[1, 2, 3].map(d => `<button data-d="${d}" class="${S.cgDepth === d ? 'on' : ''}">${d}</button>`).join('')}</div></div><div id="cg-box"></div>`;
+  body.innerHTML = `<div class="row wrap" style="margin-bottom:4px;gap:6px"><span class="faint" style="font-size:12px">Depth</span><div class="seg sm" id="cg-depth">${[1, 2, 3].map(d => `<button data-d="${d}" class="${S.cgDepth === d ? 'on' : ''}">${d}</button>`).join('')}</div>${confSeg('cg-conf')}</div><div id="cg-box"></div>`;
   const box = $('#cg-box');
-  const load = () => fill(box, () => dget('cg' + S.cgDepth, () => api(`/api/call_graph?name=${q(n.name)}&depth=${S.cgDepth}`)), g => {
+  const load = () => fill(box, () => dget(`cg${S.cgDepth}:${S.minConf}`, () => Promise.all([api(`/api/call_graph?name=${q(n.name)}&depth=${S.cgDepth}&min_confidence=${S.minConf}`), loadDef().catch(() => null)])), ([g, def]) => {
     const me = (x) => x.name === n.name && (!n.file || x.file === n.file);
-    const calls = (g.calls || []).filter(x => !me(x)), by = (g.called_by || []).filter(x => !me(x));
-    return `<div class="section-label">Calls <span class="faint">${calls.length}</span></div>${calls.length ? calls.map(x => relRow({ ...x, kind: 'Function' })).join('') : noneHTML()}
-      <div class="section-label">Called by <span class="faint">${by.length}</span></div>${by.length ? by.map(x => relRow({ ...x, kind: 'Function' })).join('') : noneHTML()}`;
+    const selfQ = def && def.qname;
+    const conf = new Map(); // other-end qname -> {c, m}
+    for (const e of g.edges || []) {
+      const other = selfQ ? (e.src === selfQ ? e.dst : e.dst === selfQ ? e.src : null) : (String(e.src).endsWith('::' + n.name) ? e.dst : e.src);
+      if (other) conf.set(other, { c: e.confidence, m: e.method });
+    }
+    const row = (x) => { const c = conf.get(x.qname); return relRow({ ...x, kind: 'Function', meta: `${c ? '' : 'depth ' + (x.depth ?? '')}` }).replace('<span class="meta">', `<span class="meta">${c ? confTag(c.c, c.m) + ' · ' : ''}`); };
+    const calls = (g.calls || []).filter(x => !me(x) && x.depth !== 0), by = (g.called_by || []).filter(x => !me(x));
+    return `<div class="section-label">Calls <span class="faint">${calls.length}</span></div>${calls.length ? calls.map(row).join('') : noneHTML()}
+      <div class="section-label">Called by <span class="faint">${by.length}</span></div>${by.length ? by.map(row).join('') : noneHTML()}
+      ${(g.edges || []).length ? `<div class="lod-note">Confidence + method shown for direct (1-hop) calls; deeper rows show their depth.</div>` : ''}`;
   }, { after: wireRels, loading: 'Walking the call graph…' });
   $('#cg-depth').onclick = e => { const b = e.target.closest('[data-d]'); if (!b) return; S.cgDepth = +b.dataset.d; $$('#cg-depth button').forEach(x => x.classList.toggle('on', x === b)); load(); };
+  wireConfSeg('cg-conf', load);
   load();
+}
+function detContext(body, n) {
+  body.innerHTML = `<div class="row wrap" style="gap:6px;margin-bottom:6px"><span class="faint" style="font-size:12px">Budget</span><div class="seg sm" id="ctx-tok">${[500, 1000, 2000, 4000, 8000].map(t => `<button data-t="${t}" class="${S.ctxTokens === t ? 'on' : ''}">${t >= 1000 ? t / 1000 + 'k' : t}</button>`).join('')}</div>${confSeg('ctx-conf')}</div><div id="ctx-box"></div>`;
+  const box = $('#ctx-box');
+  const load = () => fill(box, async () => {
+    const def = await loadDef().catch(() => null);
+    const sym = def && def.qname ? def.qname : n.name;
+    return dget(`ctx:${S.ctxTokens}:${S.minConf}`, () => api(`/api/context?symbol=${q(sym)}${def && def.qname ? '' : (n.file ? `&file=${q(n.file)}` : '')}&tokens=${S.ctxTokens}&min_confidence=${S.minConf}`));
+  }, c => {
+    if (!c || !c.found) return `${noneHTML('No context: the symbol is not in the index.')}${(c && c.suggestions || []).length ? `<div class="section-label">Did you mean</div>${c.suggestions.map(x => relRow({ name: x.name, file: x.file, kind: x.kind })).join('')}` : ''}`;
+    const pct = Math.min(100, Math.round((c.tokens || 0) / (c.budget || 1) * 100));
+    return `<div class="row" style="margin-bottom:8px"><div class="bar grow ${pct > 95 ? 'warn' : ''}"><i style="width:${pct}%"></i></div><span class="mono faint" style="font-size:11px">${fmtNum(c.tokens)} / ${fmtNum(c.budget)} tokens</span><button class="btn sm" data-copy-ctx>${ic('copy')} Copy</button></div>
+      ${(c.truncated || []).length ? `<div class="note" style="margin-bottom:8px">${ic('info')}<span>Trimmed to fit: ${c.truncated.map(t => `<span class="pill">${esc(t)}</span>`).join(' ')}</span></div>` : ''}
+      <div class="md ctx-md">${md(c.text || '')}</div>
+      ${(c.alternatives || []).length ? `<div class="section-label">Other symbols with this name</div>${c.alternatives.map(a => relRow({ ...a, kind: a.kind || 'Function' })).join('')}` : ''}`;
+  }, { loading: 'Assembling context…', after: (el, c) => { wireRels(el); linkSymbols(el); const b = $('[data-copy-ctx]', el); if (b) b.onclick = (e) => { e.stopPropagation(); copyText(c.text || ''); }; } });
+  $('#ctx-tok').onclick = e => { const b = e.target.closest('[data-t]'); if (!b) return; S.ctxTokens = +b.dataset.t; $$('#ctx-tok button').forEach(x => x.classList.toggle('on', x === b)); load(); };
+  wireConfSeg('ctx-conf', load);
+  load();
+}
+function promptDialog({ title, body = '', value = '', placeholder = '', confirmLabel = 'OK', validate }) {
+  return new Promise(resolve => {
+    const m = $('#modal'), scrim = $('#scrim');
+    m.className = 'modal open';
+    m.innerHTML = `<div class="mh">${esc(title)}</div><div class="mb">${body}<input class="input" id="m-in" style="margin-top:8px" autocomplete="off" spellcheck="false" placeholder="${esc(placeholder)}" value="${esc(value)}"/><div class="faint" id="m-err" style="margin-top:6px;font-size:11.5px"></div></div>
+      <div class="mf"><button class="btn" id="m-no">Cancel</button><button class="btn primary" id="m-yes">${esc(confirmLabel)}</button></div>`;
+    scrim.classList.add('open');
+    const inp = $('#m-in');
+    const done = (v) => { m.className = 'modal'; scrim.classList.remove('open'); document.removeEventListener('keydown', onKey, true); resolve(v); };
+    const ok = () => { const v = inp.value.trim(); const err = validate ? validate(v) : ''; if (err) { $('#m-err').textContent = err; $('#m-err').style.color = 'var(--err)'; return; } done(v); };
+    const onKey = (e) => { if (e.key === 'Escape') { e.stopPropagation(); done(null); } else if (e.key === 'Enter' && document.activeElement === inp) { e.preventDefault(); ok(); } };
+    document.addEventListener('keydown', onKey, true);
+    $('#m-no').onclick = () => done(null); scrim.onclick = () => done(null); $('#m-yes').onclick = ok;
+    setTimeout(() => { inp.focus(); inp.select(); }, 30);
+  });
+}
+async function planRename() {
+  const s = S.sel; if (!s) return;
+  const nn = await promptDialog({ title: `Rename ${s.name}`, body: 'DocGraph builds an edit plan from the graph plus a word-boundary text search. <b>Nothing is written</b> unless you apply it afterwards.', value: s.name, confirmLabel: 'Plan rename', validate: v => !/^[A-Za-z_$][\w$]*$/.test(v) ? 'Not a valid identifier.' : v === s.name ? 'Pick a different name.' : '' });
+  if (!nn) return;
+  S.rename = { id: s.id, name: s.name, newName: nn, file: s.file, plan: null };
+  S.detTab = 'rename'; renderDetail();
+}
+function detRename(body, n) {
+  const r = S.rename; if (!r) { body.innerHTML = noneHTML(); return; }
+  body.innerHTML = `<div id="rn-box"></div>`;
+  fill($('#rn-box'), () => r.plan ? Promise.resolve(r.plan) : apiPost('/api/rename', { symbol: r.name, new_name: r.newName, file: r.file || null, include_text: true }).then(p => (r.plan = p)), p => {
+    if (p.error) return `<div class="err-box">${ic('alert')}<span class="grow">${esc(p.error)}</span></div>`;
+    const byFile = new Map(); for (const e of p.edits || []) { if (!byFile.has(e.file)) byFile.set(e.file, []); byFile.get(e.file).push(e); }
+    const nGraph = (p.counts || {}).graph || 0, nText = (p.counts || {}).text || 0;
+    return `<div class="row wrap" style="margin-bottom:8px"><b class="mono">${esc(p.symbol)}</b><span class="faint">→</span><b class="mono" style="color:var(--accent)">${esc(p.new_name)}</b><span class="grow"></span><span class="pill ok">${nGraph} graph</span><span class="pill warn">${nText} text</span><span class="pill">${byFile.size} files</span></div>
+      ${p.applied ? `<div class="note" style="margin-bottom:8px">${ic('info')}<span>Applied ${p.applied.applied} edit(s) in ${p.applied.files_written.length} file(s); ${p.applied.skipped.length} skipped. Reindex to refresh the graph.</span></div>` : `<div class="note" style="margin-bottom:8px">${ic('info')}<span>Dry run — nothing has been written. <b>graph</b> edits are confirmed by definitions and CALLS edges; <b>text</b> edits are name matches that may be unrelated.</span></div>`}
+      ${(p.warnings || []).map(w => `<div class="err-box" style="background:var(--warn-soft);color:var(--warn)">${ic('alert')}<span class="grow">${esc(w)}</span></div>`).join('')}
+      ${[...byFile].map(([f, es]) => `<div class="plan-file"><div class="ph">${ic('code', 12)}<span class="ellipsis grow" title="${esc(f)}">${esc(f)}</span><span class="faint">${es.length}</span></div>${es.slice(0, 40).map(e => `<div class="plan-edit"><div class="row"><span class="faint">L${e.line}</span><span class="pill ${e.source === 'graph' ? 'ok' : 'warn'}" style="height:16px">${esc(e.source)}</span><span class="conf">${Number(e.confidence || 0).toFixed(2)}</span></div><div class="b">- ${esc(e.before.trim())}</div><div class="a">+ ${esc(e.after.trim())}</div></div>`).join('')}${es.length > 40 ? `<div class="plan-edit faint">+${es.length - 40} more</div>` : ''}</div>`).join('') || noneHTML('No edits found.')}
+      <div class="row wrap" style="margin-top:10px"><button class="btn sm quiet" data-act="rename-close">${ic('x')} Discard plan</button><span class="grow"></span>${!p.applied && nGraph ? `<button class="btn sm danger" data-act="rename-apply">Apply ${nGraph} graph edit${nGraph === 1 ? '' : 's'}…</button>` : ''}</div>`;
+  }, { loading: 'Planning the rename…' });
+}
+async function applyRename() {
+  const r = S.rename; if (!r || !r.plan) return;
+  const n = (r.plan.counts || {}).graph || 0;
+  if (!(await confirmDialog({ title: `Write ${n} edit${n === 1 ? '' : 's'} to disk?`, body: `Renames <code>${esc(r.name)}</code> to <code>${esc(r.newName)}</code> on the graph-confirmed lines only (text matches are not applied). Each line is re-checked against the file first; changed lines are skipped. This modifies your source files.`, confirmLabel: 'Apply edits', danger: true, typeToConfirm: 'apply' }))) return;
+  try {
+    const p = await apiPost('/api/rename', { symbol: r.name, new_name: r.newName, file: r.file || null, include_text: true, dry_run: false, apply: true, sources: ['graph'] });
+    r.plan = p; toast(p.applied ? `Applied ${p.applied.applied} edit(s)` : 'Nothing applied', p.applied ? 'ok' : '');
+  } catch (e) { toast('Rename failed: ' + errText(e), 'err'); }
+  if (S.detTab === 'rename') renderDetail();
 }
 function pytestCmd(tests) {
   const py = (tests || []).filter(t => /\.py$/.test(t.file || '') && t.name && /^test/.test(t.name));
@@ -1895,14 +2156,25 @@ function wireImpact(el) {
 }
 function detImpact(body, n) {
   const target = isFileSel() ? selFile() : n.name;
-  body.innerHTML = `<div id="imp-box"></div>`;
-  fill($('#imp-box'), () => dget('impact', () => Promise.all([api(`/api/impact_of?target=${q(target)}&depth=3&limit=50`), api(`/api/test_impact?target=${q(target)}&limit=25`)])),
+  body.innerHTML = `<div class="row wrap" style="margin-bottom:6px;gap:6px">${confSeg('imp-conf')}</div><div id="imp-box"></div>`;
+  const load = () => fill($('#imp-box'), () => dget('impact:' + S.minConf, () => Promise.all([api(`/api/impact_of?target=${q(target)}&depth=3&limit=50&min_confidence=${S.minConf}`), api(`/api/test_impact?target=${q(target)}&limit=25&min_confidence=${S.minConf}`)])),
     ([imp, tests]) => impactHTML(imp, tests), { after: wireImpact, loading: 'Computing blast radius…' });
+  wireConfSeg('imp-conf', load);
+  load();
 }
 function detHistory(body, n) {
   const file = selFile();
   if (!file) { body.innerHTML = noneHTML('No file to show history for.'); return; }
-  body.innerHTML = sect('Recent commits', 'h-recent') + (isFileSel() ? '' : sect('Blame for this definition', 'h-blame'));
+  body.innerHTML = (isFileSel() ? '' : sect('Symbol history', 'h-sym')) + sect('Recent commits', 'h-recent') + (isFileSel() ? '' : sect('Blame for this definition', 'h-blame'));
+  if (!isFileSel()) fill($('#h-sym'), () => dget('symhist', () => api(`/api/symbol_history?name=${q(n.name)}${n.file ? `&file=${q(n.file)}` : ''}&limit=10`)), h => {
+    const syms = h.symbols || [];
+    if (!h.history_indexed) return `<div class="note">${ic('info')}<span>This index has no symbol history (built before schema v3). A full rebuild records when each symbol was introduced and last changed.</span></div>`;
+    const cur = syms.find(x => x.id === n.id) || syms[0];
+    const commit = (c) => c ? (c === 'uncommitted' ? '<span class="pill warn" style="height:16px">uncommitted</span>' : `<span class="sha">${esc(String(c).slice(0, 8))}</span>`) : '<span class="faint">—</span>';
+    return (cur ? `<dl class="kv"><dt>Introduced</dt><dd>${commit(cur.first_seen_commit)} ${esc(cur.first_seen || '')}</dd><dt>Last changed</dt><dd>${commit(cur.last_changed_commit)} ${esc(cur.last_changed || '')}</dd><dt>Lines</dt><dd>${esc(cur.line || '?')}–${esc(cur.line_end || '?')}</dd></dl>
+      ${(cur.log || []).length ? `<div class="section-label">Commits touching this symbol <span class="faint">git log -L</span></div>${cur.log.map(c => `<div class="blame"><span class="sha" title="${esc(c.commit)}">${esc(String(c.commit).slice(0, 8))}</span><span class="ellipsis" title="${esc(c.subject)}">${esc(c.subject)}</span><span class="faint" style="font-size:11px" title="${esc(c.author)}">${esc(c.date || '')}</span></div>`).join('')}` : ''}` : noneHTML('No history for this symbol.'))
+      + ((h.removed || []).length ? `<div class="section-label">Removed symbols with this name</div>${h.removed.map(r => `<div class="blame"><span class="sha">${esc(String(r.head || '').slice(0, 8))}</span><span class="mono ellipsis" style="font-size:11.5px" title="${esc(r.qname)}">${esc(r.qname)}</span><span class="faint" style="font-size:11px">${esc(r.removed || '')}</span></div>`).join('')}` : '');
+  });
   fill($('#h-recent'), () => dget('recent', () => api(`/api/git_recent?file=${q(file)}&limit=20`)), rows => (rows || []).length ? rows.map(c => `<div class="blame"><span class="sha" title="${esc(c.commit)}">${esc(String(c.commit).slice(0, 8))}</span><span class="ellipsis" title="${esc(c.subject)}">${esc(c.subject)}</span><span class="faint" style="font-size:11px">${esc(c.date || '')}</span></div>`).join('') : noneHTML('No commits touch this file (or it is not in a git repo).'));
   if (!isFileSel()) fill($('#h-blame'), async () => {
     const d = await loadDef(); if (!d) return [];
@@ -1923,19 +2195,23 @@ async function askAboutSelection() {
 /* ─────────────────────────── Router & shell ─────────────────────────── */
 const PAGES = [
   ['graph', 'Graph', 'graph'], ['search', 'Search', 'search'], ['wiki', 'Wiki', 'wiki'], ['flows', 'Flows', 'flow'],
-  ['changes', 'Changes', 'git'], ['ask', 'Ask', 'chat'], ['index', 'Index', 'db'],
+  ['changes', 'Changes', 'git'], ['insights', 'Insights', 'pulse'], ['ask', 'Ask', 'chat'], ['index', 'Index', 'db'],
 ];
 const PHONE_TABS = ['graph', 'search', 'ask', 'changes', 'index'];
+// Pages without a phone tab live behind "More".
+const MORE_PAGES = () => PAGES.filter(p => !PHONE_TABS.includes(p[0]));
 const VIEWS = {}, MOUNT = {};
 let PAGE_TIMERS = [];
 function pageTimer(fn, ms) { const h = setInterval(fn, ms); PAGE_TIMERS.push(h); return h; }
 function go(p) { if (location.hash !== '#/' + p) location.hash = '#/' + p; else route(); }
 function buildNav() {
   $('#appswitch').innerHTML = '<span class="ind"></span>' + PAGES.map(([id, lbl, i]) => `<a href="#/${id}" data-p="${id}">${ic(i)}<span class="lbl">${lbl}</span></a>`).join('');
-  $('#tabbar').innerHTML = PHONE_TABS.map(id => { const p = PAGES.find(x => x[0] === id); return `<a href="#/${id}" data-p="${id}">${ic(p[2])}<span>${p[1]}</span></a>`; }).join('');
+  $('#tabbar').innerHTML = PHONE_TABS.map(id => { const p = PAGES.find(x => x[0] === id); return `<a href="#/${id}" data-p="${id}">${ic(p[2])}<span>${p[1]}</span></a>`; }).join('')
+    + `<a href="#" id="tab-more" data-act="more-pages" title="Wiki, Flows, Insights">${ic('dots')}<span>More</span></a>`;
 }
 function markNav() {
   $$('[data-p]').forEach(a => a.dataset.p === S.page ? a.setAttribute('aria-current', 'page') : a.removeAttribute('aria-current'));
+  const more = $('#tab-more'); if (more) { if (MORE_PAGES().some(p => p[0] === S.page)) more.setAttribute('aria-current', 'page'); else more.removeAttribute('aria-current'); }
   const cur = $('#appswitch a[aria-current]'), ind = $('#appswitch .ind');
   if (cur && ind) { ind.style.left = cur.offsetLeft + 'px'; ind.style.width = cur.offsetWidth + 'px'; }
 }
@@ -2235,31 +2511,44 @@ async function cancelJob(id) {
 /* ─────────────────────────── Flows ─────────────────────────── */
 VIEWS.flows = () => `
 <div class="page"><div class="page-inner">
-  <div class="page-head"><div><h1>Flows</h1><div class="sub">Entry points — functions nothing calls, ranked by PageRank — traced forward through <code>CALLS</code>.</div></div>
+  <div class="page-head"><div><h1>Flows</h1><div class="sub">Execution flows start at HTTP routes, MCP tools and entry points (functions nothing calls), traced forward through <code>CALLS</code>. Routes lists every detected route and tool with what it reaches.</div></div>
     <div class="actions">
-      <div class="search-box" style="width:200px"><span class="ic" data-i="search"></span><input class="input" id="fl-q" placeholder="Filter flows…"/></div>
-      <select class="input" id="fl-lim" style="width:auto" title="How many entry points">${[10, 25, 50, 100].map(n => `<option value="${n}"${S.flowsLimit === n ? ' selected' : ''}>${n} flows</option>`).join('')}</select>
+      <div class="seg" id="fl-tab"><button data-ft="flows" class="${S.flowsTab === 'flows' ? 'on' : ''}">${ic('flow', 13)} Flows</button><button data-ft="routes" class="${S.flowsTab === 'routes' ? 'on' : ''}">${ic('route', 13)} Routes &amp; tools</button></div>
+      <div class="search-box" style="width:200px"><span class="ic" data-i="search"></span><input class="input" id="fl-q" placeholder="Filter…" value="${esc(S.flowsTab === 'routes' ? S.routesQ : '')}"/></div>
+      <span id="fl-ctl" class="row" style="gap:6px">
+      <select class="input" id="fl-lim" style="width:auto" title="How many flows">${[10, 25, 50, 100].map(n => `<option value="${n}"${S.flowsLimit === n ? ' selected' : ''}>${n} flows</option>`).join('')}</select>
       <select class="input" id="fl-len" style="width:auto" title="Max chain depth">${[3, 5, 8, 12].map(n => `<option value="${n}"${S.flowsChain === n ? ' selected' : ''}>depth ${n}</option>`).join('')}</select>
-      <button class="btn primary" id="fl-go">${ic('refresh')} Re-detect</button></div></div>
+      <select class="input" id="fl-conf" style="width:auto" title="Ignore CALLS edges below this confidence">${[[0, 'any conf'], [0.5, 'conf 0.5+'], [0.75, 'conf 0.75+'], [0.9, 'conf 0.9+']].map(([v, l]) => `<option value="${v}"${S.minConf === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
+      <button class="btn primary" id="fl-go">${ic('refresh')} Re-detect</button></span></div></div>
   <div id="fl-body"></div>
 </div></div>`;
 MOUNT.flows = () => {
+  const key = () => `flows:${S.flowsLimit}:${S.flowsChain}:${S.minConf}`;
   const load = (force) => {
-    const key = `flows:${S.flowsLimit}:${S.flowsChain}`; if (force) delete RC[key];
-    fill($('#fl-body'), () => cached(key, () => api(`/api/processes?limit=${S.flowsLimit}&max_chain_len=${S.flowsChain}`)), drawFlows, { loading: 'Detecting entry points…', after: wireFlows });
+    $('#fl-ctl').classList.toggle('hidden', S.flowsTab !== 'flows');
+    if (S.flowsTab === 'routes') { drawRoutesTab(force); return; }
+    if (force) delete RC[key()];
+    fill($('#fl-body'), () => cached(key(), () => api(`/api/processes?limit=${S.flowsLimit}&max_chain_len=${S.flowsChain}&min_confidence=${S.minConf}`)), drawFlows, { loading: 'Detecting flows…', after: wireFlows });
   };
-  $('#fl-q').oninput = () => { const d = RC[`flows:${S.flowsLimit}:${S.flowsChain}`]; if (d) d.then(x => { const b = $('#fl-body'); if (b) { b.innerHTML = drawFlows(x); hydrateIcons(b); wireFlows(b, x); } }); };
+  $('#fl-tab').onclick = e => { const b = e.target.closest('[data-ft]'); if (!b) return; S.flowsTab = b.dataset.ft; $$('#fl-tab button').forEach(x => x.classList.toggle('on', x === b)); $('#fl-q').value = S.flowsTab === 'routes' ? S.routesQ : ''; load(); };
+  $('#fl-q').oninput = debounce(() => {
+    if (S.flowsTab === 'routes') { S.routesQ = $('#fl-q').value.trim(); drawRoutesTab(); return; }
+    const d = RC[key()]; if (d) d.then(x => { const b = $('#fl-body'); if (b) { b.innerHTML = drawFlows(x); hydrateIcons(b); wireFlows(b, x); } });
+  }, 180);
   $('#fl-lim').onchange = e => { S.flowsLimit = +e.target.value; load(); };
   $('#fl-len').onchange = e => { S.flowsChain = +e.target.value; load(); };
+  $('#fl-conf').onchange = e => { S.minConf = +e.target.value; load(); };
   $('#fl-go').onclick = () => load(true);
   load();
 };
+const KIND_PILL = { route: 'accent', tool: 'warn', entry: '' };
 function drawFlows(data) {
-  if (!data || !data.length) return emptyHTML('No clean entry points found.', 'Either everything is called from somewhere, or PageRank has not propagated yet — reindex and try again.');
+  if (!data || !data.length) return emptyHTML('No flows found.', 'No route, tool or clean entry point reaches anything — reindex and try again.');
   const fq = ($('#fl-q')?.value || '').toLowerCase();
-  const list = data.map((p, i) => ({ p, i })).filter(({ p }) => !fq || p.entry.name.toLowerCase().includes(fq) || (p.entry.file || '').toLowerCase().includes(fq) || p.chain.some(c => c.name.toLowerCase().includes(fq)));
+  const list = data.map((p, i) => ({ p, i })).filter(({ p }) => !fq || p.entry.name.toLowerCase().includes(fq) || String(p.via || '').toLowerCase().includes(fq) || (p.entry.file || '').toLowerCase().includes(fq) || p.chain.some(c => c.name.toLowerCase().includes(fq)));
   if (!list.length) return emptyHTML('No flow matches the filter.');
-  return `<div class="flows">${list.map(({ p, i }) => {
+  const sel = S.flowSel != null ? data.find(p => p.id === S.flowSel) : null;
+  return `<div class="card${sel ? '' : ' hidden'}" id="fl-seq" style="margin-bottom:14px">${sel ? seqCardHTML(sel, true) : ''}</div><div class="flows">${list.map(({ p, i }) => {
     const e = p.entry, byD = new Map();
     for (const c of p.chain) { const d = c.depth || 1; if (!byD.has(d)) byD.set(d, []); byD.get(d).push(c); }
     const depths = [...byD.keys()].sort((a, b) => a - b);
@@ -2269,33 +2558,152 @@ function drawFlows(data) {
       return `<span class="arrow" title="depth ${d}">→</span>${items}`;
     }).join('');
     const files = new Set([e.file, ...p.chain.map(c => c.file)].filter(Boolean)).size;
-    return `<div class="card flow"><div class="card-body">
-      <div class="row"><span class="pill accent">${ic('flow', 11)} entry</span><b class="ellipsis" title="${esc(e.name)}">${esc(e.name)}</b><span class="grow"></span><span class="faint mono" style="font-size:11px">#${i + 1}</span></div>
-      <div class="faint mono ellipsis" style="font-size:11.5px;margin-top:4px">${esc(e.file)}:${e.line || 0} · pr ${Number(e.pagerank || 0).toFixed(4)}</div>
+    const kind = p.kind || 'entry';
+    return `<div class="card flow${S.flowSel === p.id ? ' on' : ''}" style="${S.flowSel === p.id ? 'border-color:var(--accent-line)' : ''}"><div class="card-body">
+      <div class="row"><span class="pill ${KIND_PILL[kind] || ''}">${ic(kind === 'route' ? 'route' : kind === 'tool' ? 'cpu' : 'flow', 11)} ${esc(kind)}</span><b class="ellipsis" title="${esc(p.via || e.name)}">${esc(p.via || e.name)}</b><span class="grow"></span><span class="faint mono" style="font-size:11px">#${i + 1}</span></div>
+      <div class="faint mono ellipsis" style="font-size:11.5px;margin-top:4px">${p.via ? esc(e.name) + ' · ' : ''}${esc(e.file)}:${e.line || 0} · pr ${Number(e.pagerank || 0).toFixed(4)}</div>
       <div class="chain"><span class="step" data-n="${esc(e.name)}" data-f="${esc(e.file || '')}" style="border-color:var(--accent-line)">${esc(e.name)}</span>${steps}${p.chain.length > LIM ? `<span class="more" data-more>+${p.chain.length - LIM} more</span>` : ''}</div>
-      <div class="meta"><span>${p.chain.length} steps</span><span>${files} files</span><span>depth ${depths[depths.length - 1] || 0}</span><span>fan-out ${p.fanout}</span><span class="grow"></span><a href="#/graph" data-n="${esc(e.name)}" data-f="${esc(e.file || '')}">Show in graph →</a></div>
+      <div class="meta"><span>${p.chain.length} steps</span><span>${files} files</span><span>depth ${depths[depths.length - 1] || 0}</span><span class="grow"></span><a href="#" data-seq="${esc(p.id)}">Sequence ↓</a><a href="#/graph" data-n="${esc(e.name)}" data-f="${esc(e.file || '')}">Show in graph →</a></div>
     </div></div>`;
   }).join('')}</div>`;
 }
-function wireFlows(el) {
+function wireFlows(el, data) {
   el.onclick = e => {
     const m = e.target.closest('[data-more]'); if (m) { $$('.step.hidden', m.parentElement).forEach(s => s.classList.remove('hidden')); m.remove(); return; }
+    const sq = e.target.closest('[data-seq]');
+    if (sq) { e.preventDefault(); openSequence(Number(sq.dataset.seq), data); return; }
+    if (e.target.closest('[data-act="seq-close"]')) { S.flowSel = null; const c = $('#fl-seq'); if (c) { c.classList.add('hidden'); c.innerHTML = ''; } return; }
+    const deeper = e.target.closest('[data-act="seq-deeper"]');
+    if (deeper) { loadDeeperFlow(Number(deeper.dataset.id)); return; }
     const s = e.target.closest('[data-n]'); if (!s) return; e.preventDefault();
     openSymbol({ name: s.dataset.n, file: s.dataset.f || null, kind: 'Function' });
   };
+}
+function openSequence(id, data) {
+  S.flowSel = id;
+  const p = (data || []).find(x => x.id === id), c = $('#fl-seq'); if (!p || !c) return;
+  c.classList.remove('hidden'); c.innerHTML = seqCardHTML(p, true); hydrateIcons(c);
+  c.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+}
+async function loadDeeperFlow(id) {
+  const c = $('#fl-seq'); if (!c) return;
+  const body = $('.seq-wrap', c); if (body) body.innerHTML = loadingHTML('Loading the full flow…');
+  try {
+    const f = await cached(`flow:${id}:${S.minConf}`, () => api(`/api/flow?id=${q(id)}&max_chain_len=12&min_confidence=${S.minConf}`));
+    if (!c.isConnected) return;
+    c.innerHTML = seqCardHTML(f, false); hydrateIcons(c);
+  } catch (e) { if (body) body.innerHTML = errorHTML(e, false); }
+}
+function seqCardHTML(p, canDeepen) {
+  const e = p.entry;
+  return `<div class="card-head">${ic('flow')} Sequence · <span class="mono ellipsis" style="font-weight:500">${esc(p.via || e.name)}</span><span class="grow"></span>
+    ${canDeepen ? `<button class="btn sm" data-act="seq-deeper" data-id="${esc(p.id)}" title="Fetch this flow with /api/flow (depth 12, up to 120 steps)">Load full flow</button>` : ''}
+    <button class="btn sm quiet icon" data-act="seq-close" title="Close">${ic('x')}</button></div>
+    <div class="card-body"><div class="seq-wrap">${sequenceSVG(p)}</div></div>`;
+}
+// Sequence diagram: one lifeline per participant (entry first, then BFS order), one arrow per
+// call edge ordered by the caller's BFS depth then call line. Capped for readability.
+function sequenceSVG(p) {
+  const MAXP = 12, MAXM = 45;
+  const e = p.entry, depth = new Map([[e.qname, 0]]), name = new Map([[e.qname, e.name]]), file = new Map([[e.qname, e.file]]);
+  for (const c of p.chain || []) { depth.set(c.qname, c.depth); name.set(c.qname, c.name); file.set(c.qname, c.file); }
+  const order = [e.qname, ...(p.chain || []).slice().sort((a, b) => a.depth - b.depth || (a.line || 0) - (b.line || 0)).map(c => c.qname)];
+  const parts = [...new Set(order)];
+  const shownP = parts.slice(0, MAXP), idx = new Map(shownP.map((q2, i) => [q2, i]));
+  const msgs = (p.edges || []).filter(m => idx.has(m.src) && idx.has(m.dst))
+    .sort((a, b) => (depth.get(a.src) ?? 99) - (depth.get(b.src) ?? 99) || (a.line || 0) - (b.line || 0));
+  const shownM = msgs.slice(0, MAXM);
+  const colW = 150, top = 46, rowH = 30, left = 20;
+  const W = left * 2 + shownP.length * colW, H = top + 20 + shownM.length * rowH + 16;
+  const cx = (i) => left + i * colW + colW / 2;
+  const T = G.T || readTheme();
+  let s = `<svg xmlns="http://www.w3.org/2000/svg" width="${W}" height="${H}" viewBox="0 0 ${W} ${H}" role="img" aria-label="Sequence diagram">
+    <defs><marker id="sq-arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M0 0L10 5L0 10z" fill="${esc(T.accent)}"/></marker></defs>`;
+  shownP.forEach((q2, i) => {
+    const x = cx(i), nm = String(name.get(q2) || q2.split('::').pop());
+    const label = nm.length > 18 ? nm.slice(0, 17) + '…' : nm;
+    s += `<line x1="${x}" y1="${top}" x2="${x}" y2="${H - 8}" stroke="${esc(T.faint)}" stroke-dasharray="3 4" stroke-width="1"/>
+      <g class="seq-head" data-n="${esc(nm)}" data-f="${esc(file.get(q2) || '')}"><title>${esc(q2)}</title><rect x="${x - colW / 2 + 8}" y="8" width="${colW - 16}" height="28" rx="6" fill="${i === 0 ? hexA(T.accent, .16) : hexA(T.faint, .12)}" stroke="${i === 0 ? esc(T.accent) : hexA(T.faint, .5)}"/>
+      <text x="${x}" y="26" text-anchor="middle" font-size="11.5" fill="${esc(T.text)}">${esc(label)}</text></g>`;
+  });
+  shownM.forEach((m, k) => {
+    const a = idx.get(m.src), b = idx.get(m.dst), y = top + 24 + k * rowH;
+    const low = m.confidence != null && m.confidence < 0.5;
+    const col = low ? T.warn : T.accent;
+    const lbl = `${String(name.get(m.dst) || '').slice(0, 20)}${m.line ? ' :' + m.line : ''}${m.confidence != null ? ' (' + Number(m.confidence).toFixed(2) + ')' : ''}`;
+    if (a === b) {
+      const x = cx(a);
+      s += `<path d="M${x} ${y - 6} h26 v12 h-24" fill="none" stroke="${esc(col)}" stroke-width="1.3" marker-end="url(#sq-arr)"/><text x="${x + 32}" y="${y + 4}" font-size="10.5" fill="${esc(T.faint)}">${esc(lbl)}</text>`;
+    } else {
+      const x1 = cx(a), x2 = cx(b);
+      s += `<line x1="${x1}" y1="${y}" x2="${x2 + (x2 > x1 ? -3 : 3)}" y2="${y}" stroke="${esc(col)}" stroke-width="1.3"${low ? ' stroke-dasharray="5 3"' : ''} marker-end="url(#sq-arr)"><title>${esc(m.src)} -> ${esc(m.dst)}${m.method ? ' [' + esc(m.method) + ']' : ''}</title></line>
+        <text x="${(x1 + x2) / 2}" y="${y - 5}" text-anchor="middle" font-size="10.5" fill="${esc(T.faint)}">${esc(lbl)}</text>`;
+    }
+  });
+  s += '</svg>';
+  const cut = [];
+  if (parts.length > MAXP) cut.push(`${parts.length - MAXP} more participant${parts.length - MAXP === 1 ? '' : 's'}`);
+  if (msgs.length > MAXM) cut.push(`${msgs.length - MAXM} more call${msgs.length - MAXM === 1 ? '' : 's'}`);
+  const hidden = (p.edges || []).length - msgs.length;
+  if (hidden > 0) cut.push(`${hidden} call${hidden === 1 ? '' : 's'} to hidden participants`);
+  return (shownM.length ? s : `<div class="empty">No call edges between the flow's steps.</div>`) + (cut.length ? `<div class="lod-note" style="padding:6px 10px">Truncated: ${cut.join(', ')}. Dashed amber arrows are low-confidence calls.</div>` : `<div class="lod-note" style="padding:6px 10px">Dashed amber arrows are low-confidence calls (&lt; 0.5).</div>`);
+}
+function drawRoutesTab(force) {
+  const body = $('#fl-body'); if (!body) return;
+  const key = 'routes'; if (force) delete RC[key];
+  fill(body, () => cached(key, () => api('/api/routes?limit=2000')), d => {
+    if (d.reindex_required) return `<div class="note">${ic('info')}<span>This index predates route detection (schema v3). Run a full rebuild from the Index page.</span></div>`;
+    const fq = S.routesQ.toLowerCase();
+    const m = (r) => !fq || [r.name, r.handler, r.file, r.framework].some(x => String(x || '').toLowerCase().includes(fq));
+    const routes = (d.routes || []).filter(m), tools = (d.tools || []).filter(m);
+    const row = (r, kind) => `<tr class="click${S.routeSel === r.name ? ' on' : ''}" data-route="${esc(r.name)}"><td><span class="method ${kind === 'tool' ? 'tool' : esc(String(r.method || '').split(',')[0])}">${esc(kind === 'tool' ? (r.tool_kind || 'tool') : r.method || 'ANY')}</span></td><td class="mono" style="font-size:12px;word-break:break-all">${esc(kind === 'tool' ? r.name : r.path || r.name)}</td><td class="mono ellipsis" style="font-size:12px;max-width:220px" title="${esc(r.handler_qname || r.handler || '')}">${esc(r.handler || '—')}</td><td class="hide-sm faint">${esc(r.framework || '')}</td><td class="hide-sm mono faint" style="font-size:11px">${esc(basename(r.file))}:${esc(r.line)}</td><td class="num mono">${esc(r.reach ?? 0)}</td></tr>`;
+    const tbl = (title, rows, kind) => `<div class="card" style="margin-bottom:14px"><div class="card-head">${ic(kind === 'tool' ? 'cpu' : 'route')} ${title} <span class="sub">${rows.length}</span></div>${rows.length ? `<div class="tbl-wrap"><table class="tbl"><tr><th>${kind === 'tool' ? 'Kind' : 'Method'}</th><th>${kind === 'tool' ? 'Name' : 'Path'}</th><th>Handler</th><th class="hide-sm">Framework</th><th class="hide-sm">Where</th><th class="num" title="Functions reachable within 2 hops">Reach</th></tr>${rows.map(r => row(r, kind)).join('')}</table></div>` : `<div class="card-body">${noneHTML(fq ? 'Nothing matches the filter.' : 'None detected.')}</div>`}</div>`;
+    return `<div class="ch-grid"><div style="min-width:0">${tbl('HTTP routes', routes, 'route')}${tbl('MCP tools / resources / prompts', tools, 'tool')}</div><div class="card" id="api-imp" style="min-width:0;position:sticky;top:0"><div class="card-body">${emptyHTML('Pick a route or tool to see what it touches.')}</div></div></div>`;
+  }, { loading: 'Loading routes…', after: (el) => {
+    el.onclick = e => { const tr = e.target.closest('[data-route]'); if (tr) { S.routeSel = tr.dataset.route; $$('[data-route]', el).forEach(x => x.classList.toggle('on', x === tr)); showApiImpact(tr.dataset.route); return; } };
+    if (S.routeSel) showApiImpact(S.routeSel);
+  } });
+}
+function showApiImpact(route) {
+  const card = $('#api-imp'); if (!card) return;
+  card.innerHTML = `<div class="card-head">${ic('target')} Impact of <span class="mono ellipsis" style="font-weight:500">${esc(route)}</span></div><div class="card-body" id="api-imp-b"></div>`;
+  hydrateIcons(card);
+  fill($('#api-imp-b'), () => cached('apiimp:' + route + ':' + S.minConf, () => api(`/api/api_impact?route=${q(route)}&depth=4&min_confidence=${S.minConf}`)), d => {
+    if (!d.found) return noneHTML('Route not found (index changed?).');
+    const h = d.handler, reach = d.reachable || [], files = d.files || [], tests = d.tests || [];
+    const byD = new Map(); for (const r of reach) { if (!byD.has(r.depth)) byD.set(r.depth, []); byD.get(r.depth).push(r); }
+    return `<div class="risk"><div><div class="v">${reach.length}</div><div class="l">functions reached</div></div><div><div class="v">${files.length}</div><div class="l">files</div></div><div><div class="v" style="color:${tests.length ? 'var(--ok)' : 'var(--warn)'}">${tests.length}</div><div class="l">tests</div></div></div>
+      <div class="section-label" style="margin-top:0">Handler</div>${h ? relRow({ ...h, kind: 'Function' }) : noneHTML('No handler resolved.')}
+      ${[...byD].sort((a, b) => a[0] - b[0]).map(([dd, rows]) => `<div class="section-label">Depth ${dd} <span class="faint">${rows.length}</span></div>${rows.slice(0, 25).map(r => relRow({ ...r, kind: 'Function' })).join('')}${rows.length > 25 ? noneHTML(`+${rows.length - 25} more`) : ''}`).join('')}
+      ${files.length ? `<div class="section-label">Files</div>${files.slice(0, 20).map(f => relRow({ name: f.file, file: f.file, kind: 'File', meta: `${f.symbols} symbol${f.symbols === 1 ? '' : 's'}` })).join('')}` : ''}
+      <div class="section-label">Tests</div>${tests.length ? tests.slice(0, 20).map(t => `<div class="rel" data-name="${esc(t.name)}" data-file="${esc(t.file || '')}" data-kind="Function">${ic('test', 13)}<span class="ellipsis">${esc(t.file)}::${esc(t.name)}</span><span class="meta">${esc(t.via || '')}</span></div>`).join('') : noneHTML('No test reaches this route.')}
+      ${(d.shared_with || []).length ? `<div class="section-label">Shares dependencies with</div>${d.shared_with.map(s => `<div class="rel" data-route-go="${esc(s.name)}"><span class="ellipsis">${esc(s.name)}</span><span class="meta">${esc(s.shared)} shared</span></div>`).join('')}` : ''}`;
+  }, { loading: 'Walking from the handler…', after: el => {
+    wireRels(el); hydrateIcons(el);
+    $$('.rel[data-kind="File"]', el).forEach(r => r.onclick = (e) => { e.stopPropagation(); openSymbol({ name: r.dataset.name, file: r.dataset.file, kind: 'File' }); });
+    $$('[data-route-go]', el).forEach(r => r.onclick = (e) => { e.stopPropagation(); S.routeSel = r.dataset.routeGo; showApiImpact(r.dataset.routeGo); });
+  } });
 }
 
 /* ─────────────────────────── Changes ─────────────────────────── */
 VIEWS.changes = () => `
 <div class="page"><div class="page-inner">
-  <div class="page-head"><div><h1>Changes</h1><div class="sub">Git diff for <b>${esc(ROOT.slug)}</b> joined to the graph — what the edits touch and which tests to run.</div></div>
+  <div class="page-head"><div><h1>Changes</h1><div class="sub">A diff for <b>${esc(ROOT.slug)}</b> joined to the graph — changed symbols, their callers, affected flows, the tests to run and an explainable risk score.</div></div>
     <div class="actions">
-      <div class="seg" id="ch-ref"><button data-ref="">Working tree</button><button data-ref="HEAD">Last commit</button><button data-ref="main">vs main</button></div>
+      <div class="seg" id="ch-ref"><button data-ref="">Working tree</button><button data-ref="HEAD">Last commit</button><button data-ref="main">vs main</button><button data-ref="__paste">Paste diff</button></div>
       <input class="input" id="ch-custom" placeholder="ref or sha" style="width:120px" value=""/>
+      <select class="input" id="ch-depth" style="width:auto" title="Caller depth">${[1, 2, 3, 4, 6].map(d => `<option value="${d}"${S.chDepth === d ? ' selected' : ''}>depth ${d}</option>`).join('')}</select>
+      <select class="input" id="ch-conf" style="width:auto" title="Ignore CALLS edges below this confidence">${[[0, 'any conf'], [0.5, 'conf 0.5+'], [0.75, 'conf 0.75+'], [0.9, 'conf 0.9+']].map(([v, l]) => `<option value="${v}"${S.chConf === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
       <button class="btn icon" id="ch-reload" title="Refresh">${ic('refresh')}</button></div></div>
+  <div class="card hidden" id="ch-paste" style="margin-bottom:14px"><div class="card-head">${ic('code')} Unified diff <span class="sub">git diff / patch text — analysed against the current index</span></div><div class="card-body">
+    <textarea class="input mono" id="ch-diff" rows="8" spellcheck="false" placeholder="diff --git a/src/x.py b/src/x.py&#10;@@ -10,3 +10,4 @@ ...">${esc(S.chDiff)}</textarea>
+    <div class="row" style="margin-top:8px"><button class="btn primary sm" id="ch-analyse">${ic('play')} Analyse diff</button><span class="faint" style="font-size:11.5px">Nothing is applied; the diff is only parsed.</span></div></div></div>
+  <div class="card" id="ch-risk" style="margin-bottom:14px"></div>
   <div class="ch-grid">
     <div class="col" style="display:flex;flex-direction:column;gap:14px;min-width:0">
       <div class="card"><div class="card-head">${ic('git')} Changed files <span class="sub" id="ch-count"></span><span class="grow"></span><span class="mono faint" style="font-size:11.5px" id="ch-ref-lbl"></span></div><div id="chg"></div></div>
+      <div class="card"><div class="card-head">${ic('test')} Tests to run <span class="sub" id="ch-tcount"></span></div><div class="card-body" id="ch-tests"></div></div>
+      <div class="card"><div class="card-head">${ic('flow')} Affected flows <span class="sub" id="ch-fcount"></span></div><div class="card-body" id="ch-flows"></div></div>
       <div class="card"><div class="card-head">${ic('git')} Recent commits <span class="sub">click one to inspect its diff</span></div><div id="commits"></div></div>
     </div>
     <div class="card" id="impact" style="min-width:0"></div>
@@ -2303,49 +2711,222 @@ VIEWS.changes = () => `
 </div></div>`;
 MOUNT.changes = () => {
   const seg = $('#ch-ref'), custom = $('#ch-custom');
-  const mark = () => { const known = ['', 'HEAD', 'main'].includes(S.changesRef); $$('button', seg).forEach(b => b.classList.toggle('on', known && b.dataset.ref === S.changesRef)); custom.value = known ? '' : S.changesRef; };
-  seg.onclick = e => { const b = e.target.closest('[data-ref]'); if (!b) return; S.changesRef = b.dataset.ref; S.change = null; mark(); loadChanges(); };
-  custom.onkeydown = e => { if (e.key === 'Enter') { S.changesRef = custom.value.trim(); S.change = null; mark(); loadChanges(); } };
-  $('#ch-reload').onclick = () => { delete RC['chg:' + S.changesRef]; delete RC.recent; loadChanges(); drawCommits(true); };
-  mark(); loadChanges(); drawCommits();
+  const mark = () => {
+    const known = ['', 'HEAD', 'main'].includes(S.changesRef);
+    $$('button', seg).forEach(b => b.classList.toggle('on', S.chPaste ? b.dataset.ref === '__paste' : (known && b.dataset.ref === S.changesRef)));
+    custom.value = !S.chPaste && !known ? S.changesRef : '';
+    $('#ch-paste').classList.toggle('hidden', !S.chPaste);
+  };
+  seg.onclick = e => {
+    const b = e.target.closest('[data-ref]'); if (!b) return;
+    if (b.dataset.ref === '__paste') { S.chPaste = true; mark(); $('#ch-diff').focus(); if (S.chDiff.trim()) loadChanges(); else clearChanges('Paste a unified diff and press Analyse.'); return; }
+    S.chPaste = false; S.changesRef = b.dataset.ref; S.change = null; mark(); loadChanges();
+  };
+  custom.onkeydown = e => { if (e.key === 'Enter') { S.chPaste = false; S.changesRef = custom.value.trim(); S.change = null; mark(); loadChanges(); } };
+  $('#ch-depth').onchange = e => { S.chDepth = +e.target.value; loadChanges(); };
+  $('#ch-conf').onchange = e => { S.chConf = +e.target.value; loadChanges(); };
+  $('#ch-analyse').onclick = () => { S.chDiff = $('#ch-diff').value; S.change = null; loadChanges(); };
+  $('#ch-reload').onclick = () => { Object.keys(RC).forEach(k => k.startsWith('dc:') && delete RC[k]); delete RC.recent; loadChanges(); drawCommits(true); };
+  mark(); drawCommits();
+  if (S.chPaste && !S.chDiff.trim()) clearChanges('Paste a unified diff and press Analyse.'); else loadChanges();
 };
 function drawCommits(force) {
   if (force) delete RC.recent;
-  fill($('#commits'), () => cached('recent', () => api('/api/git_recent?limit=20')), rows => (rows || []).length ? rows.map(c => `<div class="commit${S.changesRef === c.commit ? ' on' : ''}" data-sha="${esc(c.commit)}" style="cursor:pointer"><span class="sha">${esc(String(c.commit).slice(0, 8))}</span><div class="grow"><div class="ellipsis" title="${esc(c.subject)}">${esc(c.subject)}</div><div class="faint" style="font-size:11.5px">${esc(c.author || '')} · ${esc(c.date || '')}${c.repo ? ' · ' + esc(c.repo) : ''}</div></div></div>`).join('') : emptyHTML('No commits (not a git repository?).'),
-    { after: el => { el.onclick = e => { const c = e.target.closest('[data-sha]'); if (!c) return; S.changesRef = c.dataset.sha; S.change = null; MOUNT.changes(); }; } });
+  fill($('#commits'), () => cached('recent', () => api('/api/git_recent?limit=20')), rows => (rows || []).length ? rows.map(c => `<div class="commit${!S.chPaste && S.changesRef === c.commit ? ' on' : ''}" data-sha="${esc(c.commit)}" style="cursor:pointer"><span class="sha">${esc(String(c.commit).slice(0, 8))}</span><div class="grow"><div class="ellipsis" title="${esc(c.subject)}">${esc(c.subject)}</div><div class="faint" style="font-size:11.5px">${esc(c.author || '')} · ${esc(c.date || '')}${c.repo ? ' · ' + esc(c.repo) : ''}</div></div></div>`).join('') : emptyHTML('No commits (not a git repository?).'),
+    { after: el => { el.onclick = e => { const c = e.target.closest('[data-sha]'); if (!c) return; S.chPaste = false; S.changesRef = c.dataset.sha; S.change = null; MOUNT.changes(); }; } });
 }
-function fileStatus(f) { const d = f.diff_excerpt || ''; return /^new file mode/m.test(d) ? 'A' : /^deleted file mode/m.test(d) ? 'D' : /^rename from/m.test(d) ? 'R' : 'M'; }
-function diffStats(d) { let a = 0, r = 0; for (const l of String(d || '').split('\n')) { if (l.startsWith('+') && !l.startsWith('+++')) a++; else if (l.startsWith('-') && !l.startsWith('---')) r++; } return [a, r]; }
+const riskBadge = (r) => r ? `<span class="risk-b ${esc(r.level)}" title="risk ${esc(r.score)}">${esc(r.level)} ${Math.round(r.score)}</span>` : '';
+const FST = { added: 'A', deleted: 'D', modified: 'M', renamed: 'R' };
+function clearChanges(msg) {
+  const ids = ['#chg', '#ch-tests', '#ch-flows']; for (const i of ids) { const el = $(i); if (el) el.innerHTML = ''; }
+  $('#ch-risk').innerHTML = `<div class="card-body">${emptyHTML(msg)}</div>`; $('#impact').innerHTML = '';
+  ['#ch-count', '#ch-tcount', '#ch-fcount'].forEach(i => { const el = $(i); if (el) el.textContent = ''; });
+}
+function loadDetectChanges() {
+  if (S.chPaste) {
+    const diff = S.chDiff, key = `dc:paste:${diff.length}:${diff.slice(0, 200)}:${S.chDepth}:${S.chConf}`;
+    return cached(key, () => apiPost('/api/detect_changes', { diff, depth: S.chDepth, min_confidence: S.chConf }));
+  }
+  const ref = S.changesRef;
+  return cached(`dc:${ref}:${S.chDepth}:${S.chConf}`, () => api(`/api/detect_changes?depth=${S.chDepth}&min_confidence=${S.chConf}${ref ? `&ref=${q(ref)}` : ''}`));
+}
 async function loadChanges() {
   const box = $('#chg'), ref = S.changesRef;
-  $('#ch-ref-lbl').textContent = ref ? ref.slice(0, 12) : 'working tree';
+  $('#ch-ref-lbl').textContent = S.chPaste ? 'pasted diff' : ref ? ref.slice(0, 12) : 'working tree';
   $('#impact').innerHTML = `<div class="card-body">${loadingHTML()}</div>`;
-  const data = await fill(box, () => cached('chg:' + ref, () => api(`/api/git_changes${ref ? `?ref=${q(ref)}` : ''}`)), d => {
+  $('#ch-risk').innerHTML = `<div class="card-body">${loadingHTML('Scoring the change set…')}</div>`;
+  $('#ch-tests').innerHTML = loadingHTML(); $('#ch-flows').innerHTML = loadingHTML();
+  const data = await fill(box, loadDetectChanges, d => {
     const files = d.files || [];
     $('#ch-count').textContent = files.length;
     if (d.error) return errorHTML(d.error, false);
-    if (!files.length) return emptyHTML(ref ? `No changes in ${ref}.` : 'Working tree is clean.', ref ? '' : 'Pick "Last commit" or a commit below to inspect earlier changes.');
-    return files.map((f, i) => { const st = fileStatus(f), [a, r] = diffStats(f.diff_excerpt), trunc = (f.diff_excerpt || '').length >= 2000; return `<div class="chg${i === (S.change ?? 0) ? ' on' : ''}" data-i="${i}"><span class="st ${st === 'R' ? 'M' : st}">${st}</span><span class="ellipsis grow mono" style="font-size:12px" title="${esc(f.path)}">${esc(f.path)}</span><span class="add">+${a}${trunc ? '…' : ''}</span><span class="del">−${r}${trunc ? '…' : ''}</span></div>`; }).join('');
+    if (!files.length) return emptyHTML(S.chPaste ? 'The diff has no file sections.' : ref ? `No changes in ${ref}.` : 'Working tree is clean.', S.chPaste || ref ? '' : 'Pick "Last commit" or a commit below to inspect earlier changes.');
+    return files.map((f, i) => {
+      const st = FST[f.status] || 'M', syms = (d.changed_symbols || []).filter(s => s.file === f.path);
+      const worst = syms.reduce((a, s) => (!a || (s.risk && s.risk.score > a.score) ? s.risk : a), null);
+      return `<div class="chg${i === (S.change ?? 0) ? ' on' : ''}" data-i="${i}"><span class="st ${st === 'R' ? 'M' : st}">${st}</span><span class="ellipsis grow mono" style="font-size:12px" title="${esc(f.path)}">${esc(f.path)}</span>${f.indexed === false ? '<span class="pill" title="Not in the index (new or ignored file)">new</span>' : ''}${worst ? riskBadge(worst) : ''}<span class="add">+${f.added || 0}</span><span class="del">−${f.removed || 0}</span></div>`;
+    }).join('');
   }, { loading: 'Reading the diff…' });
   if (!data || !$('#impact')) return;
+  drawRiskSummary(data); drawChangeTests(data); drawChangeFlows(data);
   if (!(data.files || []).length) { $('#impact').innerHTML = `<div class="card-body">${emptyHTML('Nothing to analyse.')}</div>`; return; }
   box.onclick = e => { const c = e.target.closest('.chg'); if (c) showChange(data, +c.dataset.i); };
   showChange(data, S.change ?? 0);
 }
+function drawRiskSummary(d) {
+  const el = $('#ch-risk'); if (!el) return;
+  const r = d.risk || { score: 0, level: 'low', summary: '' }, syms = d.changed_symbols || [];
+  const ov = d.overlay || {};
+  el.innerHTML = `<div class="card-head">${ic('alert')} Risk <span class="sub">${esc(r.summary || '')}</span><span class="grow"></span>
+      <button class="btn sm" data-act="ch-overlay" ${(ov.changed || []).length ? '' : 'disabled title="No indexed symbol changed"'}>${ic('graph')} Show on graph</button></div>
+    <div class="card-body"><div class="risk-big"><span class="score" style="color:var(--${r.level === 'low' ? 'ok' : r.level === 'medium' ? 'warn' : 'err'})">${Math.round(r.score || 0)}</span>${riskBadge(r)}
+      <span class="faint" style="font-size:12px">${fmtNum(syms.length)} changed symbol${syms.length === 1 ? '' : 's'} · ${fmtNum((d.callers || []).length)} transitive caller${(d.callers || []).length === 1 ? '' : 's'} · ${fmtNum((d.flows || []).length)} flow${(d.flows || []).length === 1 ? '' : 's'} · ${fmtNum((d.tests || []).length)} test${(d.tests || []).length === 1 ? '' : 's'}</span></div>
+    ${syms.length ? `<div class="section-label">Riskiest symbols <span class="faint">click a row for the explanation</span></div>${[...syms].sort((a, b) => (b.risk?.score || 0) - (a.risk?.score || 0)).slice(0, 8).map(symRiskRow).join('')}` : ''}</div>`;
+  hydrateIcons(el);
+  const b = $('[data-act="ch-overlay"]', el);
+  if (b) b.onclick = (e) => { e.stopPropagation(); showOverlay(ov, S.chPaste ? 'pasted diff' : (S.changesRef || 'working tree')); };
+  wireSymRisk(el);
+}
+function symRiskRow(s) {
+  const f = (s.risk && s.risk.factors) || [];
+  return `<details class="sym-risk"><summary>${riskBadge(s.risk)}${kindTag(s.kind)}<span class="ellipsis grow" title="${esc(s.qname || s.name)}">${esc(s.name)}</span><span class="faint" style="font-size:11px">${esc(basename(s.file))}:${esc(s.line)} · ${s.changed_lines} ln · ${s.callers ?? 0} callers · ${s.tests ?? 0} tests</span><button class="btn sm quiet icon" data-open-sym="${esc(s.id)}" data-name="${esc(s.name)}" data-file="${esc(s.file)}" data-kind="${esc(s.kind)}" title="Open in graph">${ic('graph', 13)}</button></summary>
+    <div class="factors">${f.map(x => `<b>+${esc(x.points)}</b><span><span class="mono">${esc(x.factor)}</span> — ${esc(x.detail)}</span>`).join('') || '<span></span><span>No factors reported.</span>'}</div></details>`;
+}
+function wireSymRisk(el) {
+  $$('[data-open-sym]', el).forEach(b => b.onclick = (e) => { e.preventDefault(); e.stopPropagation(); openSymbol({ id: Number(b.dataset.openSym), name: b.dataset.name, file: b.dataset.file, kind: b.dataset.kind }); });
+}
+function drawChangeTests(d) {
+  const el = $('#ch-tests'); if (!el) return;
+  const tests = d.tests || [];
+  $('#ch-tcount').textContent = tests.length;
+  el.innerHTML = tests.length ? `${tests.slice(0, 40).map(t => `<div class="rel" data-name="${esc(t.name)}" data-file="${esc(t.file || '')}" data-kind="Function">${ic('test', 13)}<span class="ellipsis">${esc(t.file)}::${esc(t.name)}</span><span class="meta">${esc(t.via || '')}${(t.covers || []).length ? ' · ' + esc(t.covers.slice(0, 3).join(', ')) : ''}</span></div>`).join('')}${tests.length > 40 ? noneHTML(`+${tests.length - 40} more`) : ''}
+    ${d.test_command ? `<div class="code" style="padding:8px 10px;white-space:pre-wrap;word-break:break-all;margin-top:8px" id="ch-tcmd">${esc(d.test_command)}</div><div class="row" style="margin-top:8px"><button class="btn sm" data-copy-tcmd>${ic('term')} Copy command</button></div>` : ''}`
+    : noneHTML('No tests reach the changed symbols.');
+  hydrateIcons(el); wireRels(el);
+  const b = $('[data-copy-tcmd]', el); if (b) b.onclick = (e) => { e.stopPropagation(); copyText(d.test_command); };
+}
+function drawChangeFlows(d) {
+  const el = $('#ch-flows'); if (!el) return;
+  const flows = d.flows || [];
+  $('#ch-fcount').textContent = flows.length;
+  el.innerHTML = flows.length ? flows.slice(0, 40).map(f => `<div class="rel" data-name="${esc(f.handler || f.name)}" data-file="${esc(f.file || '')}" data-kind="Function"><span class="pill ${f.kind === 'entry' ? '' : 'accent'}" style="height:16px">${esc(f.kind)}</span><span class="ellipsis">${esc(f.name)}</span><span class="meta">${f.handler && f.handler !== f.name ? esc(f.handler) + ' · ' : ''}depth ${esc(f.depth)}${(f.via || []).length ? ' · via ' + esc(f.via.slice(0, 2).join(', ')) : ''}</span></div>`).join('') + (flows.length > 40 ? noneHTML(`+${flows.length - 40} more`) : '')
+    : noneHTML('No route, tool or entry point reaches the changed symbols.');
+  wireRels(el);
+}
 function showChange(data, i) {
   S.change = i; $$('#chg .chg').forEach(x => x.classList.toggle('on', +x.dataset.i === i));
   const f = data.files[i], card = $('#impact'); if (!f || !card) return;
-  const syms = (data.entities || []).filter(e => e.file === f.path);
-  const brk = (data.callers_of_changed || []).filter(c => String(c.callee_qname || '').startsWith(f.path + '::'));
-  const diffHTML = String(f.diff_excerpt || '').split('\n').map(l => `<div class="${l.startsWith('@@') ? 'h' : l.startsWith('+') && !l.startsWith('+++') ? 'a' : l.startsWith('-') && !l.startsWith('---') ? 'd' : /^(diff|index|---|\+\+\+|new file|deleted file)/.test(l) ? 'm' : ''}">${esc(l) || ' '}</div>`).join('');
-  card.innerHTML = `<div class="card-head">${ic('target')} Impact of <span class="mono ellipsis" style="font-weight:500" title="${esc(f.path)}">${esc(f.path)}</span><span class="grow"></span><button class="btn sm quiet" data-act="open-file" data-file="${esc(f.path)}">${ic('graph')} Show in graph</button></div><div class="card-body">
-    <div class="section-label" style="margin-top:0">Changed symbols <span class="faint">${syms.length}</span></div>${syms.length ? syms.map(s => relRow({ name: s.name, kind: s.kind, file: s.file, meta: 'line ' + s.line })).join('') : noneHTML('No indexed functions or classes overlap the changed lines (new, non-code or not yet indexed).')}
-    <div class="section-label">Direct callers of the changed functions</div>${brk.length ? brk.map(c => relRow({ name: c.name, kind: 'Function', file: c.file, meta: `${basename(c.file)}:${c.line} → ${String(c.callee_qname).split('::').pop()}` })).join('') : noneHTML('None found.')}
-    <div class="section-label">Blast radius of the file</div><div id="ch-imp">${loadingHTML('Computing impact…')}</div>
-    <div class="section-label">Diff${(f.diff_excerpt || '').length >= 2000 ? ' <span class="faint">(first 2 KB)</span>' : ''} · ${(f.ranges || []).length} hunk${(f.ranges || []).length === 1 ? '' : 's'}</div><div class="diff">${diffHTML}</div></div>`;
-  hydrateIcons(card); wireRels(card);
+  const syms = (data.changed_symbols || []).filter(e => e.file === f.path);
+  const diffHTML = String(f.diff || '').split('\n').map(l => `<div class="${l.startsWith('@@') ? 'h' : l.startsWith('+') && !l.startsWith('+++') ? 'a' : l.startsWith('-') && !l.startsWith('---') ? 'd' : /^(diff|index|---|\+\+\+|new file|deleted file)/.test(l) ? 'm' : ''}">${esc(l) || ' '}</div>`).join('');
+  card.innerHTML = `<div class="card-head">${ic('target')} Impact of <span class="mono ellipsis" style="font-weight:500" title="${esc(f.path)}">${esc(f.path)}</span><span class="grow"></span>${f.indexed !== false ? `<button class="btn sm quiet" data-act="open-file" data-file="${esc(f.path)}">${ic('graph')} Show in graph</button>` : ''}</div><div class="card-body">
+    <div class="section-label" style="margin-top:0">Changed symbols <span class="faint">${syms.length}</span></div>${syms.length ? syms.map(symRiskRow).join('') : noneHTML(f.indexed === false ? 'This file is not in the index (new, non-code or ignored).' : 'No indexed functions or classes overlap the changed lines.')}
+    ${f.indexed !== false ? `<div class="section-label">Blast radius of the file</div><div id="ch-imp">${loadingHTML('Computing impact…')}</div>` : ''}
+    <div class="section-label">Diff${(f.diff || '').length >= 4000 ? ' <span class="faint">(first 4 KB)</span>' : ''} · ${(f.ranges || []).length} hunk${(f.ranges || []).length === 1 ? '' : 's'}</div><div class="diff">${diffHTML}</div></div>`;
+  hydrateIcons(card); wireSymRisk(card);
   const fb = $('[data-act="open-file"]', card); if (fb) fb.onclick = (e) => { e.stopPropagation(); openSymbol({ name: f.path, file: f.path, kind: 'File' }, { tab: 'impact' }); };
-  fill($('#ch-imp'), () => cached('imp:' + f.path, () => Promise.all([api(`/api/impact_of?target=${q(f.path)}&depth=3&limit=50`), api(`/api/test_impact?target=${q(f.path)}&limit=25`)])), ([imp, t]) => impactHTML(imp, t), { after: wireImpact });
+  const ci = $('#ch-imp');
+  if (ci) fill(ci, () => cached(`imp:${f.path}:${S.chConf}`, () => Promise.all([api(`/api/impact_of?target=${q(f.path)}&depth=3&limit=50&min_confidence=${S.chConf}`), api(`/api/test_impact?target=${q(f.path)}&limit=25&min_confidence=${S.chConf}`)])), ([imp, t]) => impactHTML(imp, t), { after: wireImpact });
+}
+
+/* ─────────────────────────── Insights ─────────────────────────── */
+VIEWS.insights = () => `
+<div class="page"><div class="page-inner">
+  <div class="page-head"><div><h1>Insights</h1><div class="sub">Code health, architecture clusters, call paths and a token-budgeted repo map for <b>${esc(ROOT.slug)}</b>.</div></div>
+    <div class="actions"><select class="input" id="ins-conf" style="width:auto" title="Only count CALLS edges at or above this confidence">${[[0, 'any conf'], [0.5, 'conf 0.5+'], [0.75, 'conf 0.75+'], [0.9, 'conf 0.9+']].map(([v, l]) => `<option value="${v}"${S.healthConf === v ? ' selected' : ''}>${l}</option>`).join('')}</select>
+      <button class="btn icon" id="ins-reload" title="Recompute">${ic('refresh')}</button></div></div>
+  <div class="ins-grid">
+    <div class="card span-12"><div class="card-head">${ic('pulse')} Health <span class="sub" id="ins-sum-sub"></span></div><div class="card-body" id="ins-sum"></div></div>
+    <div class="card span-6"><div class="card-head">Hubs <span class="sub">highest fan-in + fan-out</span></div><div id="ins-hubs"></div></div>
+    <div class="card span-6"><div class="card-head">Bridges <span class="sub">approximate betweenness</span></div><div id="ins-bridges"></div></div>
+    <div class="card span-6"><div class="card-head">Untested hotspots <span class="sub">high PageRank, no test reaches them</span></div><div id="ins-untested"></div></div>
+    <div class="card span-6"><div class="card-head">Large functions</div><div id="ins-large"></div></div>
+    <div class="card span-6"><div class="card-head">Dead code candidates <span class="sub">no inbound calls or references</span></div><div id="ins-dead"></div></div>
+    <div class="card span-6"><div class="card-head">Import cycles</div><div class="card-body" id="ins-cycles"></div></div>
+    <div class="card span-12" id="ins-cluster-card"><div class="card-head">${ic('layers')} Clusters <span class="sub" id="ins-cl-sub"></span><span class="grow"></span><span id="ins-cl-act"></span></div><div id="ins-clusters"></div></div>
+    <div class="card span-6"><div class="card-head">${ic('route')} Trace <span class="sub">shortest call path A → B</span></div><div class="card-body">
+      <div class="inline-form"><input class="input" id="tr-a" placeholder="from symbol (e.g. api_search)" value="${esc(S.traceA)}"/><input class="input" id="tr-b" placeholder="to symbol" value="${esc(S.traceB)}"/><button class="btn primary sm" id="tr-go">Trace</button></div>
+      <div id="tr-out" style="margin-top:10px"></div></div></div>
+    <div class="card span-6"><div class="card-head">${ic('wiki')} Repo map <span class="sub">signatures ranked by PageRank around a focus</span></div><div class="card-body">
+      <div class="inline-form"><input class="input" id="rm-focus" placeholder="focus: files or symbols, comma separated (empty = global)" value="${esc(S.mapFocus)}"/>
+        <select class="input narrow" id="rm-tok" style="flex:0 0 96px">${[256, 512, 1024, 2048, 4096].map(t => `<option value="${t}"${S.mapTokens === t ? ' selected' : ''}>${t} tok</option>`).join('')}</select><button class="btn primary sm" id="rm-go">Build</button></div>
+      <div id="rm-out" style="margin-top:10px"></div></div></div>
+  </div>
+</div></div>`;
+MOUNT.insights = () => {
+  const loadHealth = (force) => {
+    const key = `health:${S.healthConf}`; if (force) delete RC[key];
+    const p = cached(key, () => api(`/api/health?limit=15&min_confidence=${S.healthConf}`));
+    const nodeRows = (rows, meta) => (rows || []).length ? rows.map(r => relRow({ ...r, kind: 'Function', meta: meta(r) })).join('') : noneHTML('None.');
+    fill($('#ins-sum'), () => p, h => {
+      const s = h.summary || {};
+      $('#ins-sum-sub').textContent = `CALLS confidence >= ${s.min_confidence ?? S.healthConf}`;
+      return `<div class="stat-tiles">${[['functions', 'Functions'], ['production', 'Production'], ['tests', 'Tests'], ['call_edges', 'Call edges'], ['dead_code', 'Dead code'], ['import_cycles', 'Import cycles'], ['untested_hotspots', 'Untested hotspots']].map(([k, l]) => `<div><div class="v">${fmtNum(s[k])}</div><div class="l">${l}</div></div>`).join('')}</div>`;
+    });
+    fill($('#ins-hubs'), () => p, h => nodeRows(h.hubs, r => `in ${r.fan_in} · out ${r.fan_out} · ${basename(r.file)}`), { after: wireRels });
+    fill($('#ins-bridges'), () => p, h => nodeRows(h.bridges, r => `${Number(r.betweenness || 0).toFixed(3)} · ${basename(r.file)}`), { after: wireRels });
+    fill($('#ins-untested'), () => p, h => nodeRows(h.untested_hotspots, r => `pr ${Number(r.pagerank || 0).toFixed(4)} · ${basename(r.file)}`), { after: wireRels });
+    fill($('#ins-large'), () => p, h => nodeRows(h.large_functions, r => `${r.lines} lines · ${basename(r.file)}`), { after: wireRels });
+    fill($('#ins-dead'), () => p, h => nodeRows(h.dead_code, r => `${basename(r.file)}:${r.line}`), { after: wireRels });
+    fill($('#ins-cycles'), () => p, h => (h.import_cycles || []).length ? h.import_cycles.map(c => `<div class="trace-path" style="margin-bottom:6px">${c.map(f => `<span class="step" style="font:11.5px var(--mono);padding:3px 7px;border-radius:5px;background:var(--panel2);border:1px solid var(--border);cursor:pointer" data-file="${esc(f)}">${esc(basename(f))}</span>`).join('<span class="arrow faint">→</span>')}<span class="arrow faint">↺</span></div>`).join('') : noneHTML('No import cycles.'),
+      { after: el => { el.onclick = e => { const s = e.target.closest('[data-file]'); if (s) openSymbol({ name: s.dataset.file, file: s.dataset.file, kind: 'File' }); }; } });
+  };
+  $('#ins-conf').onchange = e => { S.healthConf = +e.target.value; loadHealth(); };
+  $('#ins-reload').onclick = () => { loadHealth(true); delete RC.clusters; drawClusters(); };
+  loadHealth(); drawClusters();
+  const trace = () => {
+    S.traceA = $('#tr-a').value.trim(); S.traceB = $('#tr-b').value.trim();
+    if (!S.traceA || !S.traceB) return;
+    fill($('#tr-out'), () => api(`/api/trace?a=${q(S.traceA)}&b=${q(S.traceB)}&max_depth=10&min_confidence=0`), t => {
+      if (t.error) return `<div class="err-box">${ic('alert')}<span class="grow">${esc(t.error)}</span></div>`;
+      if (!t.found) return noneHTML(`No call path between them within 10 hops (explored ${fmtNum(t.explored || 0)} nodes).`);
+      const ed = t.edges || [];
+      return `<div class="faint" style="font-size:12px;margin-bottom:6px">${t.hops} hop${t.hops === 1 ? '' : 's'}${t.direction === 'reverse' ? ' · <b style="color:var(--warn)">reverse direction</b>: ' + esc(S.traceB) + ' reaches ' + esc(S.traceA) : ''}</div>` +
+        (t.path || []).map((n, i) => `${i ? `<div class="faint" style="font-size:11px;padding-left:22px">↓ ${esc((ed[i - 1] || {}).kind || '')} ${ed[i - 1] && ed[i - 1].confidence != null ? confTag(ed[i - 1].confidence) : ''}</div>` : ''}${relRow({ ...n, kind: n.kind || 'Function' })}`).join('');
+    }, { loading: 'Searching…', after: wireRels });
+  };
+  $('#tr-go').onclick = trace;
+  ['#tr-a', '#tr-b'].forEach(s => $(s).onkeydown = e => { if (e.key === 'Enter') trace(); });
+  const repoMap = () => {
+    S.mapFocus = $('#rm-focus').value.trim(); S.mapTokens = +$('#rm-tok').value;
+    fill($('#rm-out'), () => api(`/api/repo_map?tokens=${S.mapTokens}${S.mapFocus ? `&focus=${q(S.mapFocus)}` : ''}`), m => `<div class="row" style="margin-bottom:6px"><span class="pill">${esc(m.ranking)}</span><span class="faint" style="font-size:11.5px">${fmtNum(m.symbols)} symbols · ${fmtNum((m.files || []).length)} files · ${fmtNum(m.tokens)} / ${fmtNum(m.budget)} tokens</span><span class="grow"></span><button class="btn sm" data-copy-map>${ic('copy')} Copy</button></div>${m.text ? `<pre class="mono-block">${esc(m.text)}</pre>` : noneHTML('Empty map (nothing fits the budget, or the focus matched nothing).')}`,
+      { loading: 'Ranking…', after: (el, m) => { hydrateIcons(el); const b = $('[data-copy-map]', el); if (b) b.onclick = () => copyText(m.text || ''); } });
+  };
+  $('#rm-go').onclick = repoMap;
+  $('#rm-focus').onkeydown = e => { if (e.key === 'Enter') repoMap(); };
+  repoMap();
+};
+function drawClusters() {
+  const el = $('#ins-clusters'); if (!el) return;
+  fill(el, () => clustersList(), d => {
+    if (d.reindex_required) return `<div class="card-body"><div class="note">${ic('info')}<span>This index has no server clusters (built before schema v3). Run a full rebuild from the Index page; the graph falls back to browser-side communities meanwhile.</span></div></div>`;
+    const cl = d.clusters || [], names = new Map(cl.map(c => [c.id, c.name]));
+    $('#ins-cl-sub').textContent = `${cl.length} detected at index time (Louvain)`;
+    const links = (d.links || []).slice(0, 12);
+    return `<div class="ch-grid" style="padding:0"><div class="tbl-wrap"><table class="tbl"><tr><th>Cluster</th><th class="num">Size</th><th class="num hide-sm">Cohesion</th><th class="hide-sm">Top members</th></tr>
+      ${cl.map(c => `<tr class="click${S.insCluster === c.id ? ' on' : ''}" data-cid="${esc(c.id)}"><td><div class="row"><span class="dot" style="color:${commColor(c.id)}"></span><span class="ellipsis" style="max-width:260px" title="${esc(c.name)}">${esc(c.name)}</span></div></td><td class="num mono">${fmtNum(c.size)}</td><td class="num mono hide-sm">${Number(c.cohesion || 0).toFixed(2)}</td><td class="hide-sm mono faint ellipsis" style="font-size:11px;max-width:280px">${esc((c.top_members || []).slice(0, 4).join(', '))}</td></tr>`).join('')}</table>
+      ${links.length ? `<div class="card-body"><div class="section-label" style="margin-top:0">Strongest links between clusters</div>${links.map(l => `<div class="rel" style="cursor:default"><span class="ellipsis">${esc(names.get(l.src) || '#' + l.src)} <span class="faint">→</span> ${esc(names.get(l.dst) || '#' + l.dst)}</span><span class="meta">${fmtNum(l.count)} calls</span></div>`).join('')}</div>` : ''}</div>
+      <div class="card-body" id="ins-cl-detail" style="min-width:0">${S.insCluster != null ? loadingHTML() : emptyHTML('Pick a cluster for its members, API and dependencies.')}</div></div>`;
+  }, { after: (el2, d) => {
+    el2.onclick = e => { const tr = e.target.closest('[data-cid]'); if (!tr) return; S.insCluster = Number(tr.dataset.cid); $$('[data-cid]', el2).forEach(x => x.classList.toggle('on', x === tr)); drawClusterDetail(); };
+    if (S.insCluster != null) { drawClusterDetail(); $('#ins-cluster-card')?.scrollIntoView({ block: 'start' }); }
+  } });
+}
+function drawClusterDetail() {
+  const el = $('#ins-cl-detail'); if (!el || S.insCluster == null) return;
+  fill(el, () => cached('cluster:' + S.insCluster, () => api(`/api/cluster?id=${q(S.insCluster)}&limit=200`)), c => {
+    const act = $('#ins-cl-act'); if (act) act.innerHTML = '';
+    const other = (rows, lbl) => (rows || []).length ? rows.map(r => `<div class="rel" data-cid-go="${esc(r.id)}"><span class="dot" style="color:${commColor(r.id)}"></span><span class="ellipsis">${esc(r.name)}</span><span class="meta">${fmtNum(r.count)} ${lbl}</span></div>`).join('') : noneHTML('None.');
+    return `<div class="row" style="margin-bottom:6px"><span class="dot" style="color:${commColor(c.id)}"></span><b class="ellipsis">${esc(c.name)}</b><span class="grow"></span><span class="pill">${fmtNum(c.size)} members</span><span class="pill">cohesion ${Number(c.cohesion || 0).toFixed(2)}</span></div>
+      <div class="section-label">API <span class="faint">members called from outside</span></div>${(c.api || []).length ? c.api.slice(0, 12).map(a => relRow({ name: a.name, file: a.file, kind: 'Function', meta: `${a.external_callers} ext. callers` })).join('') : noneHTML('Nothing outside calls into it.')}
+      <div class="section-label">Depends on</div>${other(c.depends_on, 'calls')}
+      <div class="section-label">Used by</div>${other(c.used_by, 'calls')}
+      <div class="section-label">Members <span class="faint">by PageRank</span></div>${(c.members || []).slice(0, 40).map(m => relRow({ name: m.name, file: m.file, kind: m.kind, meta: m.kind === 'File' ? '' : `${basename(m.file)}:${m.line ?? ''}` })).join('')}${(c.members || []).length > 40 ? noneHTML(`+${c.members.length - 40} more`) : ''}`;
+  }, { after: el2 => {
+    el2.onclick = e => {
+      const g = e.target.closest('[data-cid-go]'); if (g) { S.insCluster = Number(g.dataset.cidGo); $$('#ins-clusters [data-cid]').forEach(x => x.classList.toggle('on', Number(x.dataset.cid) === S.insCluster)); drawClusterDetail(); return; }
+      const r = e.target.closest('.rel[data-name]'); if (r) openSymbol({ name: r.dataset.name, file: r.dataset.file || null, kind: r.dataset.kind });
+    };
+  } });
 }
 
 /* ─────────────────────────── Ask (chat) ─────────────────────────── */
@@ -2488,6 +3069,7 @@ VIEWS.index = () => `
       <button class="btn primary" data-act="reindex" data-slug="${esc(ROOT.slug)}">${ic('refresh')} Index changes</button></div></div>
   <div class="ix-grid">
     <div class="card span-12"><div class="card-head">${ic('folder')} Roots <span class="sub">${ROOT.list.length}</span></div><div class="tbl-wrap" id="ix-roots"></div></div>
+    <div class="card span-12"><div class="card-head">${ic('layers')} Index format &amp; resolution <span class="sub">${esc(ROOT.slug)}</span></div><div class="card-body" id="ix-info"></div></div>
     <div class="card span-7"><div class="card-head">${ic('layers')} Jobs <span class="sub" id="ix-jobs-sub"></span><span class="grow"></span><button class="btn sm quiet" data-act="admin-cancel" title="Cancel whatever long operation (index / wiki) is running for ${esc(ROOT.slug)}">${ic('stop')} Cancel ${esc(ROOT.slug)} ops</button></div><div id="ix-jobs"></div></div>
     <div class="card span-5"><div class="card-head">${ic('cpu')} Models</div><div id="ix-models"></div></div>
     <div class="card span-6"><div class="card-head">${ic('link')} Sources <span class="sub">extra repos &amp; fetched links for ${esc(ROOT.slug)}</span></div><div class="card-body" id="ix-sources"></div></div>
@@ -2497,8 +3079,28 @@ VIEWS.index = () => `
       <div class="faint" style="font-size:12px;margin-bottom:10px">Drop the graph, embeddings, cache and wiki of <b>${esc(ROOT.slug)}</b> (its whole <code>.docgraph/</code>). It is rebuilt on the next index.</div><button class="btn danger" data-act="clear-root">Clear ${esc(ROOT.slug)} index…</button></div></div>
   </div>
 </div></div>`;
+const RES_LABEL = { scip: 'SCIP (precise)', import_map: 'import map', same_module: 'same module', import_suffix: 'imported file', unique_global: 'unique name', import_distance: 'import distance', same_module_multi: 'same module (multi)', common_name: 'common name', fuzzy: 'fuzzy', fuzzy_ranked: 'fuzzy (ranked)', ambiguous: 'ambiguous (kept)', ambiguous_fuzzy: 'ambiguous fuzzy', external: 'external', unresolved: 'unresolved' };
+function drawIndexInfo() {
+  fill($('#ix-info'), () => api('/api/index_info'), d => {
+    const res = Object.entries(d.resolution || {}).sort((a, b) => b[1] - a[1]);
+    const tot = res.reduce((a, [, n]) => a + n, 0) || 1, max = res.length ? res[0][1] : 1;
+    const ec = d.embed_cache || {}, sc = d.scan || {}, sp = d.scip || {};
+    const warn = d.reindex_required ? `<div class="err-box" style="margin:0 0 10px">${ic('alert')}<span class="grow">This index was built with schema v${esc(d.schema_version)}; the host expects v${esc(d.current_schema_version)}. Confidence filters, clusters, routes and history stay empty until a <b>full rebuild</b>.</span><button class="btn sm danger" data-act="reindex" data-slug="${esc(ROOT.slug)}" data-full="1">Full rebuild</button></div>` : '';
+    return `${warn}<div class="ch-grid" style="padding:0"><dl class="kv">
+      <dt>Schema</dt><dd>v${esc(d.schema_version ?? '?')} ${d.reindex_required ? '<span class="pill err">outdated</span>' : '<span class="pill ok">current</span>'}</dd>
+      <dt>Embedding model</dt><dd>${esc(d.embedding_model || '—')}</dd>
+      <dt>Embedding cache</dt><dd>${fmtNum(ec.hits || 0)} reused · ${fmtNum(ec.misses || 0)} embedded (last run)</dd>
+      <dt>File scan</dt><dd>${fmtNum(sc.hashed || 0)} hashed · ${fmtNum(sc.reused || 0)} stat-reused</dd>
+      <dt>Clusters</dt><dd>${d.communities != null ? fmtNum(d.communities) : '—'}</dd>
+      <dt>SCIP</dt><dd><span class="pill${sp.status === 'ok' ? ' ok' : ''}">${esc(sp.status || 'n/a')}</span> <span class="faint">${esc(sp.detail || (sp.edges != null ? `${sp.edges} precise edges` : ''))}</span></dd>
+      <dt>History</dt><dd>${fmtNum(d.history_pending || 0)} file(s) awaiting re-blame · ${fmtNum(d.removed_symbols || 0)} removed symbol(s) recorded</dd>
+      <dt>Capabilities</dt><dd>${Object.entries(d.capabilities || {}).map(([k, v]) => `<span class="pill${v ? ' ok' : ''}" style="height:17px">${esc(k)}</span>`).join(' ')}</dd></dl>
+      <div><div class="section-label" style="margin-top:0">Call resolution <span class="faint">last index run, by method</span></div>
+      ${res.length ? `<div class="res-bars">${res.map(([k, n]) => `<div class="rb"><span class="ellipsis" title="${esc(k)}">${esc(RES_LABEL[k] || k)}</span><div class="bar ${/ambig|fuzzy|common/.test(k) ? 'warn' : k === 'unresolved' || k === 'external' ? '' : 'ok'}"><i style="width:${Math.max(2, n / max * 100)}%"></i></div><span class="n">${fmtNum(n)} · ${Math.round(n / tot * 100)}%</span></div>`).join('')}</div>` : noneHTML('No resolution stats yet (index this root).')}</div></div>`;
+  });
+}
 MOUNT.index = () => {
-  drawRoots(); drawJobs(); drawModels(); drawSources(); drawLocks();
+  drawRoots(); drawJobs(); drawModels(); drawSources(); drawLocks(); drawIndexInfo();
   cypherConsole($('#ix-cy'), { key: 'index' });
   attachRunningJob();
   let slow = 0;
@@ -2697,8 +3299,8 @@ function popMenu(anchor, items) {
   const m = document.createElement('div'); m.className = 'menu pop';
   m.innerHTML = items.map(([l, , d], i) => `<div class="it" data-i="${i}">${esc(l)}${d ? `<span class="d">${esc(d)}</span>` : ''}</div>`).join('');
   document.body.appendChild(m);
-  const r = anchor.getBoundingClientRect(), w = m.offsetWidth;
-  m.style.top = (r.bottom + 6) + 'px'; m.style.left = Math.max(8, Math.min(innerWidth - w - 8, r.right - w)) + 'px'; m.style.position = 'fixed';
+  const r = anchor.getBoundingClientRect(), w = m.offsetWidth, h = m.offsetHeight;
+  m.style.top = (r.bottom + 6 + h > innerHeight ? Math.max(8, r.top - h - 6) : r.bottom + 6) + 'px'; m.style.left = Math.max(8, Math.min(innerWidth - w - 8, r.right - w)) + 'px'; m.style.position = 'fixed';
   m.onclick = e => { const it = e.target.closest('.it'); if (!it) return; m.remove(); items[+it.dataset.i][1](); };
   setTimeout(() => document.addEventListener('click', function off(e) { if (!m.contains(e.target)) { m.remove(); document.removeEventListener('click', off); } }), 0);
 }
@@ -2861,6 +3463,12 @@ const ACTS = {
   'ask-ctx': () => openPalette('attach'),
   'ctx-clear': () => { const t = curThread(); if (t) { t.ctx = null; saveAsk(); drawCtx(); } },
   'ask-side-open': () => $('#ask-side')?.classList.add('open'), 'ask-side-close': () => $('#ask-side')?.classList.remove('open'),
+  'more-pages': (el) => popMenu(el, MORE_PAGES().map(p => [p[1], () => go(p[0]), ''])),
+  'overlay-clear': () => clearOverlay(),
+  'open-cluster': (el) => { S.insCluster = Number(el.dataset.cid); go('insights'); },
+  'rename-plan': () => planRename(),
+  'rename-apply': () => applyRename(),
+  'rename-close': () => { S.rename = null; S.detTab = 'overview'; renderDetail(); },
 };
 async function adminCancel(slug) {
   try { await request(`/api/admin/cancel?root=${q(slug)}`, { method: 'POST', body: {}, root: false }); toast(`Cancel requested for ${slug}`); }
