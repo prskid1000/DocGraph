@@ -271,8 +271,9 @@ def make_app(workspace: Workspace) -> FastAPI:
         return _r(root).references(name)
 
     @app.get("/api/call_graph")
-    async def api_call_graph(name: str, depth: int = 2, root: RootSlug = DEFAULT):
-        return _r(root).call_graph(name, depth=depth)
+    async def api_call_graph(name: str, depth: int = 2, min_confidence: float = 0.0,
+                             root: RootSlug = DEFAULT):
+        return _r(root).call_graph(name, depth=depth, min_confidence=min_confidence)
 
     @app.get("/api/file_map")
     async def api_file_map(file: str, root: RootSlug = DEFAULT):
@@ -284,23 +285,119 @@ def make_app(workspace: Workspace) -> FastAPI:
 
     @app.get("/api/explore")
     async def api_explore(seeds: str, hops: int = 3, limit: int = 25,
-                           root: RootSlug = DEFAULT):
+                           min_confidence: float = 0.0, root: RootSlug = DEFAULT):
         seed_list = [s.strip() for s in seeds.split(",") if s.strip()]
-        return _r(root).explore(seeds=seed_list, hops=hops, limit=limit)
+        return _r(root).explore(seeds=seed_list, hops=hops, limit=limit,
+                                min_confidence=min_confidence)
 
     @app.get("/api/impact_of")
     async def api_impact_of(target: str, depth: int = 3, limit: int = 50,
-                             root: RootSlug = DEFAULT):
-        return _r(root).impact_of(target, depth=depth, limit=limit)
+                             min_confidence: float = 0.0, root: RootSlug = DEFAULT):
+        return _r(root).impact_of(target, depth=depth, limit=limit,
+                                  min_confidence=min_confidence)
 
     @app.get("/api/test_impact")
-    async def api_test_impact(target: str, limit: int = 25, root: RootSlug = DEFAULT):
-        return _r(root).test_impact(target, limit=limit)
+    async def api_test_impact(target: str, limit: int = 25, min_confidence: float = 0.0,
+                              root: RootSlug = DEFAULT):
+        return _r(root).test_impact(target, limit=limit, min_confidence=min_confidence)
 
     @app.get("/api/processes")
     async def api_processes(limit: int = 25, max_chain_len: int = 8,
+                             min_confidence: float = 0.0, root: RootSlug = DEFAULT):
+        return _r(root).processes(limit=limit, max_chain_len=max_chain_len,
+                                  min_confidence=min_confidence)
+
+    @app.get("/api/flow")
+    async def api_flow(id: int, max_chain_len: int = 8, min_confidence: float = 0.0,
+                       root: RootSlug = DEFAULT):
+        out = _r(root).flow(int(id), max_chain_len=max_chain_len, min_confidence=min_confidence)
+        if not out:
+            raise HTTPException(404, "flow not found")
+        return out
+
+    # --- analysis tools (context / changes / map / clusters / routes / ...) ---
+    @app.get("/api/context")
+    async def api_context(symbol: str, file: str | None = None, tokens: int = 2000,
+                          min_confidence: float = 0.0, root: RootSlug = DEFAULT):
+        return await asyncio.to_thread(_r(root).context, symbol, file, tokens, min_confidence)
+
+    @app.get("/api/detect_changes")
+    async def api_detect_changes(ref: str | None = None, depth: int = 3,
+                                 min_confidence: float = 0.0, root: RootSlug = DEFAULT):
+        return await asyncio.to_thread(_r(root).detect_changes, ref, None, depth, min_confidence)
+
+    @app.post("/api/detect_changes")
+    async def api_detect_changes_post(payload: dict, root: RootSlug = DEFAULT):
+        p = payload or {}
+        return await asyncio.to_thread(
+            _r(root).detect_changes, p.get("ref"), p.get("diff"),
+            int(p.get("depth", 3) or 3), float(p.get("min_confidence", 0.0) or 0.0))
+
+    @app.get("/api/repo_map")
+    async def api_repo_map(focus: str | None = None, tokens: int = 1024,
+                           exclude_tests: bool = True, root: RootSlug = DEFAULT):
+        items = [f.strip() for f in (focus or "").split(",") if f.strip()]
+        return await asyncio.to_thread(_r(root).repo_map, items, tokens, exclude_tests)
+
+    @app.get("/api/clusters")
+    async def api_clusters(limit: int = 100, root: RootSlug = DEFAULT):
+        return _r(root).list_clusters(limit=limit)
+
+    @app.get("/api/cluster")
+    async def api_cluster(id: int | None = None, name: str | None = None, limit: int = 200,
+                          root: RootSlug = DEFAULT):
+        out = _r(root).cluster(id=id, name=name, limit=limit)
+        if not out.get("found") and not out.get("reindex_required"):
+            raise HTTPException(404, "cluster not found")
+        return out
+
+    @app.get("/api/routes")
+    async def api_routes(filter: str | None = None, limit: int = 500, root: RootSlug = DEFAULT):
+        return await asyncio.to_thread(_r(root).route_map, filter, limit)
+
+    @app.get("/api/api_impact")
+    async def api_api_impact(route: str, depth: int = 4, min_confidence: float = 0.0,
                              root: RootSlug = DEFAULT):
-        return _r(root).processes(limit=limit, max_chain_len=max_chain_len)
+        return _r(root).api_impact(route, depth=depth, min_confidence=min_confidence)
+
+    @app.get("/api/trace")
+    async def api_trace(a: str, b: str, max_depth: int = 8, min_confidence: float = 0.0,
+                        root: RootSlug = DEFAULT):
+        return _r(root).trace(a, b, max_depth=max_depth, min_confidence=min_confidence)
+
+    @app.get("/api/health")
+    async def api_health(limit: int = 15, min_confidence: float = 0.5, root: RootSlug = DEFAULT):
+        return await asyncio.to_thread(_r(root).health, limit, min_confidence)
+
+    @app.get("/api/symbol_history")
+    async def api_symbol_history(name: str, file: str | None = None, limit: int = 10,
+                                 root: RootSlug = DEFAULT):
+        return await asyncio.to_thread(_r(root).symbol_history, name, file, limit)
+
+    @app.post("/api/rename")
+    async def api_rename(payload: dict, root: RootSlug = DEFAULT):
+        """Plan a rename; write it only with dry_run=false AND apply=true."""
+        p = payload or {}
+        symbol = str(p.get("symbol") or "").strip()
+        new_name = str(p.get("new_name") or "").strip()
+        if not symbol or not new_name:
+            raise HTTPException(400, "symbol and new_name are required")
+        slot = _slot(root)
+        plan = await asyncio.to_thread(
+            slot.retriever.rename_plan, symbol, new_name, p.get("file") or None,
+            bool(p.get("include_text", True)))
+        dry_run = p.get("dry_run", True) is not False
+        if dry_run or p.get("apply") is not True or plan.get("error"):
+            return plan
+        from docgraph.rename import apply_plan
+        sources = tuple(p.get("sources") or ("graph",))
+        result = await asyncio.to_thread(apply_plan, slot.cfg, plan, sources)
+        plan.update(dry_run=False, applied=result)
+        return plan
+
+    @app.get("/api/index_info")
+    async def api_index_info(root: RootSlug = DEFAULT):
+        return _r(root).index_info()
 
     @app.get("/api/wiki/list")
     async def api_wiki_list(root: RootSlug = DEFAULT):

@@ -73,6 +73,28 @@ def _diff_for_file(root: Path, rel: str, ref: str | None) -> str:
     return _git(["show", ref, "--", rel], root)
 
 
+def diff_text(cfg: Config, ref: str | None) -> list[tuple[str, str]]:
+    """Full unified diff per root: [(logical_prefix, diff_text)].
+
+    ref semantics match `_changed_files`: None = working tree vs HEAD,
+    "main"/"master"/"a..b" = branch diff, anything else = that commit."""
+    out: list[tuple[str, str]] = []
+    for root, prefix in cfg.roots_with_prefix():
+        if root == getattr(cfg, "external_dir", None):
+            continue
+        if ref is None:
+            args = ["diff", "--no-color", "-U0", "HEAD"]
+        elif ".." in ref or ref in ("main", "master"):
+            rng = ref if ".." in ref else f"{ref}...HEAD"
+            args = ["diff", "--no-color", "-U0", rng]
+        else:
+            args = ["show", "--no-color", "-U0", "--format=", ref]
+        text = _git(args, root)
+        if text:
+            out.append((prefix, text))
+    return out
+
+
 # Hunk header regex: @@ -a,b +c,d @@
 _HUNK_RE = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@", re.MULTILINE)
 
