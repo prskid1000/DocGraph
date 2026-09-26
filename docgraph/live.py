@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import threading
 import zlib
 from collections import defaultdict
@@ -265,16 +266,93 @@ def _decode_shard(data: bytes) -> list:
 
 # ---------------------------------------------------------- symbol table ----
 
+_LABEL_CODE = {"Function": 0, "Class": 1, "Variable": 2, "File": 3}
+_CODE_LABEL = {v: k for k, v in _LABEL_CODE.items()}
+
+
+class _PackedQnames(dict):
+    """qname -> (label, id), stored as one int (id * 4 + label code) per
+    entry instead of a tuple + an int: ~40 % of the dict's memory at 200k
+    symbols. Reads return the (label, id) tuple like the plain dict did."""
+
+    __slots__ = ()
+
+    def __setitem__(self, key, value) -> None:
+        label, i = value
+        code = _LABEL_CODE.get(label)
+        dict.__setitem__(self, key, (int(i) * 4 + code) if code is not None else (label, int(i)))
+
+    def __getitem__(self, key):
+        return _unpack(dict.__getitem__(self, key))
+
+    def get(self, key, default=None):
+        v = dict.get(self, key)
+        return default if v is None else _unpack(v)
+
+    def items(self):
+        return ((k, _unpack(v)) for k, v in dict.items(self))
+
+    def values(self):
+        return (_unpack(v) for v in dict.values(self))
+
+
+def _unpack(v):
+    if isinstance(v, tuple):
+        return v
+    return _CODE_LABEL[v & 3], v >> 2
+
+
+class _NamesById:
+    """id -> name, derived from the qname's last `::` part; only names
+    that differ from it are stored."""
+
+    __slots__ = ("_q", "_extra")
+
+    def __init__(self, id_qname: dict[int, str]) -> None:
+        self._q = id_qname
+        self._extra: dict[int, str] = {}
+
+    def set(self, i: int, name: str, qname: str) -> None:
+        if qname.rsplit("::", 1)[-1] != name:
+            self._extra[i] = name
+        else:
+            self._extra.pop(i, None)
+
+    def get(self, i, default=None):
+        n = self._extra.get(i)
+        if n is not None:
+            return n
+        q = self._q.get(i)
+        return default if q is None else q.rsplit("::", 1)[-1]
+
+    def __getitem__(self, i):
+        n = self.get(i)
+        if n is None:
+            raise KeyError(i)
+        return n
+
+    def __contains__(self, i) -> bool:
+        return i in self._q
+
+    def pop(self, i, default=None):
+        n = self.get(i, default)
+        self._extra.pop(i, None)
+        return n
+
+    def __len__(self) -> int:
+        return len(self._q)
+
+
 class SymbolTable:
     """In-memory symbol table, updated per changed file."""
 
     def __init__(self) -> None:
         self.name_index: dict[str, list[tuple[str, int, str]]] = defaultdict(list)
-        self.qname_index: dict[str, tuple[str, int]] = {}
+        self.qname_index: dict[str, tuple[str, int]] = _PackedQnames()
         self.file_index: dict[str, int] = {}
-        self.by_file: dict[str, list[tuple[str, int, str, str]]] = {}   # rel -> [(label, id, name, qname)]
+        self.by_file: dict[str, tuple[tuple[str, int, str, str], ...]] = {}   # rel -> ((label, id, name, qname), ...)
         self.id_qname: dict[int, str] = {}
-        self.id_names: dict[int, str] = {}
+        self.id_names = _NamesById(self.id_qname)
         self.method_ids: set[int] = set()
         self._norm: dict[str, list[tuple[str, int, str]]] | None = None
         self.loaded = False
@@ -287,7 +365,7 @@ class SymbolTable:
 
     def add_file(self, rel: str, file_id: int | None, ents: Iterable[tuple[str, int, str, str]],
                  sort: bool = True) -> None:
-        ents = list(ents)
+        ents = tuple(ents)
         if file_id is not None:
             self.file_index[rel] = int(file_id)
         self.by_file[rel] = ents
@@ -297,7 +375,7 @@ class SymbolTable:
             self.qname_index[qname] = (label, i)
             self.name_index[name].append((label, i, rel))
             self.id_qname[i] = qname
-            self.id_names[i] = name
+            self.id_names.set(i, name, qname)
             if label == "Function" and qname.count("::") >= 2:
                 self.method_ids.add(i)
             touched.add(name)
@@ -335,8 +413,8 @@ class SymbolTable:
                 cur = self.qname_index.get(qname)
                 if cur is not None and cur[1] == i:
                     del self.qname_index[qname]
-                self.id_qname.pop(i, None)
                 self.id_names.pop(i, None)
+                self.id_qname.pop(i, None)
                 self.method_ids.discard(i)
                 lst = self.name_index.get(name)
                 if lst is not None:
@@ -499,14 +577,17 @@ class ImportIndex:
             self.file_imports[rel] = file_imports
             for f in file_imports:
                 self.importers[f].add(rel)
+        # Per-file records are read-only until the file is recomputed:
+        # tuples (8 bytes per member) instead of sets (~30), strings interned.
         if import_map:
-            self.import_map[rel] = dict(import_map)
+            self.import_map[rel] = {sys.intern(k): tuple(sorted(v)) for k, v in import_map.items()}
         if recv_map:
-            self.recv_map[rel] = dict(recv_map)
+            self.recv_map[rel] = {sys.intern(k): tuple(sorted(v)) for k, v in recv_map.items()}
         if aliases:
             self.aliases[rel] = aliases
         if external:
-            self.external[rel] = external
+            self.external[rel] = frozenset(external)
+        tails = tuple(sorted(sys.intern(t) for t in tails))
         self.file_tails[rel] = tails
         for t in tails:
             self.tails[t].add(rel)
@@ -570,8 +651,9 @@ class RefIndex:
                 t = raw.get("target_name")
                 if t:
                     names.add(t)
-        self.file_names[rel] = names
-        for n in names:
+        names_t = tuple(sorted(sys.intern(n) for n in names))
+        self.file_names[rel] = names_t
+        for n in names_t:
             self.by_name[n].add(rel)
             if len(n) >= 4:
                 self.by_norm[_norm(n)].add(rel)
@@ -890,4 +972,7 @@ class LiveIndex:
             edges = entry.get("edges") or []
             self.imports.compute(rel, edges, mi)
             self.refs.add(rel, edges)
+        memo = getattr(mi, "_memo", None)
+        if isinstance(memo, dict):
+            memo.clear()                        # rebuilt on demand, per pass
         self.resolve_ready = True

@@ -409,14 +409,24 @@ def write(out_dir: Path, arrays: dict, manifest: dict) -> None:
 
 
 def load(out_dir: Path) -> tuple[dict, dict] | None:
-    """(manifest, arrays) of the persisted generation, or None."""
+    """(manifest, arrays) of the persisted generation, or None. The arrays
+    are read-only memory maps of the (uncompressed) npz: tiles nobody looks
+    at cost no resident memory."""
     try:
         man = json.loads((Path(out_dir) / "manifest.json").read_text(encoding="utf-8"))
-        with np.load(Path(out_dir) / man["file"], allow_pickle=False) as z:
-            arrays = {k: z[k] for k in z.files}
+        arrays = _read_arrays(Path(out_dir) / man["file"])
     except Exception:
         return None
     return man, arrays
+
+
+def _read_arrays(path: Path) -> dict:
+    from docgraph.procmem import mmap_npz
+    arrays = mmap_npz(path)
+    if arrays is None:
+        with np.load(path, allow_pickle=False) as z:
+            arrays = {k: z[k] for k in z.files}
+    return arrays
 
 
 def build(src: TileSource, out_dir: Path, generation: int,
@@ -914,8 +924,7 @@ class TileStore:
                     # the persisted copy of what install() already serves
                     self._mtime = mt
                     return
-                with np.load(self.dir / man["file"], allow_pickle=False) as z:
-                    arrays = {k: z[k] for k in z.files}
+                arrays = _read_arrays(self.dir / man["file"])
             except Exception:
                 return
             self.manifest, self.a, self._mtime = man, arrays, mt
@@ -932,6 +941,12 @@ class TileStore:
                 self._mtime = (self.dir / "manifest.json").stat().st_mtime
             except OSError:
                 self._mtime = -1.0
+
+    def unload(self) -> None:
+        """Drop the served arrays (idle unload); the next request reloads
+        the persisted generation (memory-mapped)."""
+        with self._lock:
+            self.manifest, self.a, self._mtime = None, {}, -1.0
 
     def ready(self) -> bool:
         self._refresh()

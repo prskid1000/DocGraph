@@ -248,8 +248,10 @@ class Retriever:
         chunk_sim: dict[int, float] = {i: s_ for i, s_ in chunk_vec}
         need_c = [i for i in crow if i not in chunk_sim]
         if need_c:
-            eids, emat = self._safe(lambda: self.db.embeddings_for("Chunk", need_c),
-                                    (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
+            loc = self._local_embeddings("Chunk", need_c)
+            eids, emat = loc if loc is not None else self._safe(
+                lambda: self.db.embeddings_for("Chunk", need_c),
+                (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
             if len(eids):
                 en = emat / (np.linalg.norm(emat, axis=1, keepdims=True) + 1e-9)
                 for i, s_ in zip(eids.tolist(), (en @ qv).tolist()):
@@ -293,9 +295,11 @@ class Retriever:
                                         {"ids": list(ids)})
 
             def fetch_emb(want):
-                with db.thread_conn():
-                    got = self._safe(lambda: db.embeddings_for(label, want),
-                                     (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
+                got = self._local_embeddings(label, want)
+                if got is None:
+                    with db.thread_conn():
+                        got = self._safe(lambda: db.embeddings_for(label, want),
+                                         (np.zeros(0, np.int64), np.zeros((0, 1), np.float32)))
                 # entities whose vectors the host has not written yet
                 pend = self.pending_vectors
                 if pend is not None:
@@ -627,6 +631,38 @@ class Retriever:
     # $ids) rather than Cypher var-length patterns: it lets every hop filter
     # on `r.confidence`, and it never touches the backward var-length +
     # `nodes(path)` shape that segfaults Kuzu 0.11 (see CLAUDE.md).
+
+    # Vector tables up to this many rows are held in memory per generation
+    # (<= 24 MB at 384 dims): a small repo's search then reads no vectors
+    # from Kuzu (each IN lookup costs ~5 ms). Bigger tables stay on disk.
+    LOCAL_VEC_MAX_ROWS = 16_000
+
+    def _local_embeddings(self, label: str, want):
+        """(ids, matrix) of `want` from the in-memory copy of a small vector
+        table, or None (big table / unavailable: read from Kuzu)."""
+        cache = self.__dict__.setdefault("_local_vec_cache", {})
+        ent = cache.get(label, False)
+        if ent is False:
+            ent = None
+            try:
+                n = self.db.fetch_all(f"MATCH (n:{self.db.vec_table(label)}) RETURN count(*) AS c")[0]["c"]
+                if int(n) <= self.LOCAL_VEC_MAX_ROWS:
+                    ids, mat = self.db.embedding_matrix(label)
+                    order = np.argsort(ids, kind="stable")
+                    ent = (ids[order], mat[order])
+            except Exception:
+                ent = None
+            cache[label] = ent
+        if ent is None:
+            return None
+        ids, mat = ent
+        q = np.asarray([int(i) for i in want], dtype=np.int64)
+        if not len(ids) or not len(q):
+            return np.zeros(0, np.int64), np.zeros((0, mat.shape[1] if mat.ndim == 2 else 1), np.float32)
+        pos = np.searchsorted(ids, q)
+        pos[pos >= len(ids)] = 0
+        hit = ids[pos] == q
+        return q[hit], mat[pos[hit]]
 
     def _cap(self, key: str) -> bool:
         caps = getattr(self, "_caps_cache", None)
@@ -1077,7 +1113,14 @@ class Retriever:
         # retriever = per index generation): an IN-list hop query over a
         # 10^4-node frontier cost ~0.3 s per edge type and level.
         conf_types = ("CALLS", "INHERITS", "INSTANTIATES")
-        adjs = [(k, self._explore_adj(edge)) for k, edge in enumerate(edges)]
+        adjs = []
+        for k, edge in enumerate(edges):
+            if edge == "CALLS":
+                mg = self._mem_graph()                     # both directions, shared
+                adjs.append((k, mg["fwd"]))
+                adjs.append((k, mg["rev"]))
+            else:
+                adjs.append((k, self._explore_adj(edge)))
         seed_arr = np.unique(np.asarray(seed_ids, dtype=np.int64))
         seen_ids = [seed_arr]
         seen_dist = [np.zeros(len(seed_arr), dtype=np.int16)]
@@ -2729,7 +2772,9 @@ class Retriever:
         indptr = np.zeros(len(ids) + 1, dtype=np.int64)
         np.add.at(indptr, s_d + 1, 1)
         np.cumsum(indptr, out=indptr)
-        return {"ids": ids, "indptr": indptr, "nbr": d_d[order], "kind": kind[order], "conf": conf[order]}
+        idt = np.int32 if len(ids) < 2 ** 31 - 1 else np.int64
+        return {"ids": ids, "indptr": indptr, "nbr": d_d[order].astype(idt), "kind": kind[order],
+                "conf": conf[order]}
 
     # ---- health ----------------------------------------------------------
 
@@ -3174,12 +3219,18 @@ class _CSRAdj:
     __slots__ = ("keys", "start", "nbr", "conf")
 
     def __init__(self, src: np.ndarray, dst: np.ndarray, conf: np.ndarray):
+        # node ids fit int32 far beyond any code graph (the id allocator is
+        # dense): 4 bytes per edge endpoint instead of 8
+        src = np.asarray(src)
+        dst = np.asarray(dst)
+        idt = np.int32 if (not len(src) or max(int(src.max()), int(dst.max())) < 2 ** 31 - 1) else np.int64
         order = np.argsort(src, kind="stable")
-        s = np.asarray(src, dtype=np.int64)[order]
-        self.nbr = np.asarray(dst, dtype=np.int64)[order]
+        s = src.astype(idt, copy=False)[order]
+        self.nbr = dst.astype(idt, copy=False)[order]
         self.conf = np.asarray(conf, dtype=np.float32)[order]
-        self.keys, self.start = np.unique(s, return_index=True)
-        self.start = np.append(self.start, len(s)).astype(np.int64)
+        self.keys, start = np.unique(s, return_index=True)
+        pdt = np.int32 if len(s) < 2 ** 31 - 1 else np.int64
+        self.start = np.append(start, len(s)).astype(pdt)
 
     def _row(self, n):
         i = int(np.searchsorted(self.keys, int(n)))
@@ -3221,8 +3272,8 @@ class _CSRAdj:
         i[i >= len(self.keys)] = 0
         hit = self.keys[i] == f
         f, i = f[hit], i[hit]
-        starts = self.start[i]
-        counts = self.start[i + 1] - starts
+        starts = self.start[i].astype(np.int64)
+        counts = self.start[i + 1].astype(np.int64) - starts
         total = int(counts.sum())
         if not total:
             z = np.zeros(0, np.int64)
