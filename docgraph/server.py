@@ -665,6 +665,7 @@ def make_app(workspace: Workspace) -> FastAPI:
             import io, contextlib
             sink = io.StringIO()
             writer = workspace.take_writer(slot.cfg.repo_root)
+            indexer = None
             try:
                 writer.init_schema()
                 embedder = workspace._embedder_for(slot.cfg)
@@ -675,12 +676,15 @@ def make_app(workspace: Workspace) -> FastAPI:
                                                progress_cb=_progress_cb,
                                                fetch_links=fetch_links,
                                                force_fetch=force_fetch)
-                try:
-                    indexer.db.close()
-                except Exception:
-                    pass
                 return stats, sink.getvalue()
             finally:
+                # Also on failure/cancel: a full reindex leaves its own handle
+                # in indexer.db, which would keep the file lock.
+                if indexer is not None and indexer.db is not writer:
+                    try:
+                        indexer.db.close()
+                    except Exception:
+                        pass
                 workspace.release_writer(slot.cfg.repo_root)
 
         async def _run_job():

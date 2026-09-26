@@ -20,6 +20,7 @@ import asyncio
 import logging
 import os
 import threading
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -279,17 +280,19 @@ class Workspace:
 
     async def release_writer_async(self, root: str | Path) -> None:
         slot = self.resolve(root)
-        with self._lock:
-            if slot.db_writer is not None:
-                try:
-                    slot.db_writer.close()
-                except Exception:
-                    log.exception("failed closing writer for %s", slot.cfg.repo_root)
-                slot.db_writer = None
-            slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
-            embedder = self._embedder_for(slot.cfg)
-            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
-        await slot.lock.release_write()
+        try:
+            with self._lock:
+                if slot.db_writer is not None:
+                    try:
+                        slot.db_writer.close()
+                    except Exception:
+                        log.exception("failed closing writer for %s", slot.cfg.repo_root)
+                    slot.db_writer = None
+                slot.db_ro = self._reopen_ro(slot)
+                embedder = self._embedder_for(slot.cfg)
+                slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
+        finally:
+            await slot.lock.release_write()
 
     def take_writer(self, root: str | Path, label: str = "api",
                     timeout: float | None = None) -> GraphDB:
@@ -338,11 +341,33 @@ class Workspace:
                 except Exception:
                     log.exception("failed closing writer for %s", slot.cfg.repo_root)
                 slot.db_writer = None
-            slot.db_ro = GraphDB(slot.cfg.db_path, read_only=True)
-            embedder = self._embedder_for(slot.cfg)
-            slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
-        if loop is not None and loop.is_running():
-            asyncio.run_coroutine_threadsafe(slot.lock.release_write(), loop)
+            try:
+                slot.db_ro = self._reopen_ro(slot)
+                embedder = self._embedder_for(slot.cfg)
+                slot.retriever = Retriever(slot.db_ro, embedder, cfg=slot.cfg, workspace=self)
+            finally:
+                # Always hand the writer lock back, even if the reopen failed —
+                # otherwise every later writer waits out its timeout forever.
+                if loop is not None and loop.is_running():
+                    asyncio.run_coroutine_threadsafe(slot.lock.release_write(), loop)
+
+    @staticmethod
+    def _reopen_ro(slot) -> GraphDB:
+        """Open the read-only handle after a write session. A handle that is
+        still being torn down can hold the Windows file lock briefly, so
+        collect garbage and retry a few times before giving up."""
+        import gc
+        last: Exception | None = None
+        for attempt in range(5):
+            try:
+                return GraphDB(slot.cfg.db_path, read_only=True)
+            except RuntimeError as exc:
+                if "lock" not in str(exc).lower():
+                    raise
+                last = exc
+                gc.collect()
+                time.sleep(0.2 * (attempt + 1))
+        raise last  # type: ignore[misc]
 
     def clear_data(self, root: str | Path) -> None:
         """Wipe a root's `.docgraph/` (graph DB, cache, wiki, state) and

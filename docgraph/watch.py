@@ -146,6 +146,7 @@ def _baseline_reindex(workspace: Workspace, root: Path) -> None:
     DB up to date before the watcher starts emitting deltas."""
     slot = workspace.resolve(root)
     writer = workspace.take_writer(root)
+    indexer = None
     try:
         # Use the workspace-pooled embedder (not a fresh standalone one) so
         # in-process mode shares a single model + idle-unload is single-source,
@@ -154,6 +155,11 @@ def _baseline_reindex(workspace: Workspace, root: Path) -> None:
         indexer = Indexer(slot.cfg, writer, embedder=embedder)
         indexer.index_all(incremental=True)
     finally:
+        # A full reindex (e.g. a schema bump) wipes the DB and reopens it as
+        # indexer.db, a different handle from `writer`; it must be closed too
+        # or the read-only reopen in release_writer cannot take the file lock.
+        if indexer is not None and indexer.db is not writer:
+            indexer.db.close()
         workspace.release_writer(root)
 
 

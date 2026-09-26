@@ -129,3 +129,31 @@ def test_double_take_raises(two_roots):
                 ws.take_writer(cfg_a.repo_root)
         finally:
             ws.release_writer(cfg_a.repo_root)
+
+
+def test_forced_full_reindex_releases_the_file_lock(tmp_path):
+    """A schema bump turns the watcher's incremental baseline into a full
+    reindex, which wipes the DB and reopens it as a new handle inside the
+    Indexer. That handle must be closed before the read-only reopen, and the
+    writer lock must be free afterwards (regression: 'Could not set lock on
+    file' + every later writer timing out)."""
+    import json
+
+    from docgraph.watch import _baseline_reindex
+
+    root = tmp_path / "bump"
+    _tiny_index(root)
+    cfg = load_config(root)
+    state_file = cfg.data_dir / "state.json"
+    state = json.loads(state_file.read_text(encoding="utf-8")) if state_file.exists() else {}
+    state["schema_version"] = 1
+    state_file.write_text(json.dumps(state), encoding="utf-8")
+
+    with Workspace([cfg]) as ws:
+        _baseline_reindex(ws, cfg.repo_root)
+        slot = ws.resolve(None)
+        assert slot.db_writer is None
+        assert slot.db_ro.execute("MATCH (f:Function) RETURN count(f)")
+        # The writer can be taken again straight away.
+        ws.take_writer(cfg.repo_root)
+        ws.release_writer(cfg.repo_root)
