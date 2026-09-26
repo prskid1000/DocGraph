@@ -204,7 +204,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; line-height: 1.4
 .stage { position: relative; min-width: 0; min-height: 0; background: var(--well);
   background-image: radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--border) 70%, transparent) 1px, transparent 0); background-size: 22px 22px; }
 .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: grab; }
-.stage canvas.layer { pointer-events: none; cursor: default; }
+.stage canvas.layer { pointer-events: none; cursor: default; transform-origin: 0 0; }
 .stage canvas.dragging { cursor: grabbing; }
 .float { position: absolute; z-index: 5; display: flex; gap: 6px; align-items: center; }
 .float.tl { top: 12px; left: 12px; } .float.tr { top: 12px; right: 12px; } .float.bl { bottom: 12px; left: 12px; } .float.br { bottom: 12px; right: 12px; }
@@ -1057,14 +1057,19 @@ function tileBounds(t) {
   return { x0: b[0] + t.tx * tw, y0: b[1] + t.ty * tw, x1: b[0] + (t.tx + 1) * tw, y1: b[1] + (t.ty + 1) * tw };
 }
 
-/* ---- tile decoding (format: docgraph/tiles.py TileStore.tile) ---- */
+/* ---- tile decoding (format: docgraph/tiles.py TileStore.tile) ----
+   One source for the decode worker and the main-thread fallback: parse the
+   tile, then lay out its GPU arrays once (they do not depend on filters or
+   colours -- those are shader uniforms), so a tile arrives ready to upload
+   and nothing is rebuilt when the view or the style changes. */
+const TILE_CODE = `
 const TD = new TextDecoder();
 function parseTile(buf) {
   const dv = new DataView(buf);
   if (dv.getUint32(0, true) !== 0x31544744) throw new Error('bad tile');
   const lod = dv.getUint8(6), level = dv.getUint8(7), tx = dv.getUint32(8, true), ty = dv.getUint32(12, true);
   const n = dv.getUint32(16, true), m = dv.getUint32(20, true), g = dv.getUint32(24, true), k = dv.getUint32(28, true), nb = dv.getUint32(32, true);
-  const mTotal = dv.getUint32(40, true); // aggregated views may carry only the heaviest edges
+  const mTotal = dv.getUint32(40, true);
   let o = 44;
   const a4 = (C, c) => { const a = new C(buf, o, c); o += c * 4; return a; };
   const a1 = (c) => { const a = new Uint8Array(buf, o, c); o += (c + 3) & ~3; return a; };
@@ -1078,12 +1083,102 @@ function parseTile(buf) {
   for (let i = 0; i < k; i++) t.names.set(nl[i], TD.decode(blob.subarray(off[i], off[i + 1])));
   return t;
 }
-const tileRadius = (t, i) => {
+function tileRadiusOf(t, i, prMax) {
   if (t.lod === 2) return 7 * Math.sqrt(t.size[i]);
   if (t.lod === 1) return 6.2 * Math.sqrt(t.size[i]) + 8;
-  const prm = (G.man && G.man.pr_max) || 1e-4, s = Math.sqrt(Math.max(0, t.pr[i]) / prm);
+  const s = Math.sqrt(Math.max(0, t.pr[i]) / (prMax || 1e-4));
   return t.kind[i] === 0 ? 4.5 + 3 * s : 1.6 + 3.6 * s;
-};
+}
+const TEX_W = 1024;
+/* GPU layout of one tile:
+   node  20 B/instance  x f32, y f32, r f32, meta u32 (kind | flags<<8 | lod<<16), cluster i32
+   pos   RGBA32F texel per node + ghost: x, y, kind, in-focus
+   edge  16 B/instance  a u32, b u32 (texel index), kind | conf<<8 | weight<<16 | prio<<24,
+                        owner tile (ox | oy<<16; all ones = owned by this tile)
+   A received edge is dropped in the shader when its owner tile is drawn too
+   (one lookup in a small "drawn tiles" texture), so every tile's edges are
+   ONE draw call whatever the neighbourhood. */
+function buildGpu(t, prMax, bbox, keySuffix) {
+  const n = t.n, g = t.g, m = t.m;
+  const NB = new ArrayBuffer(Math.max(4, n * 20)), nf = new Float32Array(NB), nu = new Uint32Array(NB), ni = new Int32Array(NB);
+  for (let i = 0; i < n; i++) {
+    const o = i * 5;
+    nf[o] = t.x[i]; nf[o + 1] = t.y[i]; nf[o + 2] = tileRadiusOf(t, i, prMax);
+    nu[o + 3] = t.kind[i] | (t.flags[i] << 8) | (t.lod << 16); ni[o + 4] = t.clu[i];
+  }
+  const tot = n + g, texH = Math.max(1, Math.ceil(tot / TEX_W)), P = new Float32Array(TEX_W * texH * 4);
+  for (let i = 0; i < n; i++) { const o = i * 4; P[o] = t.x[i]; P[o + 1] = t.y[i]; P[o + 2] = t.kind[i]; P[o + 3] = 1; }
+  for (let j = 0; j < g; j++) { const o = (n + j) * 4; P[o] = t.gx[j]; P[o + 1] = t.gy[j]; P[o + 2] = t.gkind[j]; P[o + 3] = 1; }
+  const idOf = (j) => j < n ? t.ids[j] : t.gids[j - n];
+  const px = (j) => j < n ? t.x[j] : t.gx[j - n], py = (j) => j < n ? t.y[j] : t.gy[j - n];
+  const nT = 2 ** t.level, tw = (bbox[2] - bbox[0]) / nT;
+  const E = new Uint32Array(Math.max(1, m * 4));
+  // edges are stored in priority order (a stable hash of the edge id), so an
+  // edge budget b draws the first cum[b*256] instances: the vertex work
+  // shrinks with the budget, and the kept subset is a uniform sample
+  const prioOf = new Uint8Array(m), cum = new Uint32Array(257);
+  for (let k = 0; k < m; k++) { const pr = Math.imul(t.eid[k] ^ 0x9e3779b9, 2654435761) >>> 24; prioOf[k] = pr; cum[pr + 1]++; }
+  for (let i = 0; i < 256; i++) cum[i + 1] += cum[i];
+  const slot = cum.slice(0, 256);
+  let nOwned = 0;
+  for (let kk = 0; kk < m; kk++) {
+    const k = kk;
+    const a = t.ea[k], b = t.eb[k], o = idOf(a) <= idOf(b) ? a : b;
+    let owner = 0xFFFFFFFF;
+    if (o < n) nOwned++;
+    else {
+      const ox = Math.max(0, Math.min(nT - 1, Math.floor((px(o) - bbox[0]) / tw))), oy = Math.max(0, Math.min(nT - 1, Math.floor((py(o) - bbox[1]) / tw)));
+      owner = (ox | (oy << 16)) >>> 0;
+    }
+    const w = t.lod ? Math.round(Math.min(1, 0.35 + Math.log2(1 + t.ew[k]) * 0.12) * 255) : 255;
+    const prio = prioOf[k], j = slot[prio]++;
+    E[j * 4] = a; E[j * 4 + 1] = b;
+    E[j * 4 + 2] = (t.ek[k] | (t.ec[k] << 8) | (w << 16) | (prio << 24)) >>> 0; E[j * 4 + 3] = owner;
+  }
+  return { node: NB, pos: P, texH, edges: E, nEdges: m, nOwned, prioCum: cum };
+}
+function decodeTile(buf, prMax, bbox, keySuffix) {
+  const t = parseTile(buf);
+  t.gpu = buildGpu(t, prMax, bbox, keySuffix);
+  return t;
+}
+`;
+const TILEFN = new Function(TILE_CODE + '\nreturn { parseTile, decodeTile, tileRadiusOf };')();
+const parseTile = TILEFN.parseTile;
+const TILE_WORKER_SRC = TILE_CODE + `
+self.onmessage = (ev) => {
+  const { id, buf, prMax, bbox, keySuffix } = ev.data;
+  try {
+    const t = decodeTile(buf, prMax, bbox, keySuffix);
+    const xfer = [buf, t.x.buffer, t.y.buffer, t.gpu.node, t.gpu.pos.buffer, t.gpu.edges.buffer];
+    self.postMessage({ id, t }, xfer);
+  } catch (e) { self.postMessage({ id, error: String(e && e.message || e) }); }
+};`;
+let TILE_WORKER = null, TILE_WORKER_FAILED = false;
+const TW_PENDING = new Map();
+let TW_SEQ = 0;
+function tileWorker() {
+  if (TILE_WORKER || TILE_WORKER_FAILED) return TILE_WORKER;
+  try {
+    TILE_WORKER = new Worker(URL.createObjectURL(new Blob([TILE_WORKER_SRC], { type: 'application/javascript' })));
+    TILE_WORKER.onmessage = (ev) => { const cb = TW_PENDING.get(ev.data.id); TW_PENDING.delete(ev.data.id); if (cb) cb(ev.data); };
+    TILE_WORKER.onerror = () => { TILE_WORKER_FAILED = true; TILE_WORKER = null; for (const cb of TW_PENDING.values()) cb({ error: 'worker failed' }); TW_PENDING.clear(); };
+  } catch { TILE_WORKER_FAILED = true; TILE_WORKER = null; }
+  return TILE_WORKER;
+}
+/* Decode off the main thread (the buffer is transferred, the typed arrays
+   come back transferred); inline when workers are unavailable. */
+function decodeAsync(key, buf) {
+  const prMax = (G.man && G.man.pr_max) || 1e-4, bbox = G.man.bbox, keySuffix = key.slice(key.indexOf('@'));
+  const w = tileWorker();
+  if (!w) return Promise.resolve().then(() => TILEFN.decodeTile(buf, prMax, bbox, keySuffix));
+  return new Promise((res, rej) => {
+    const id = ++TW_SEQ;
+    TW_PENDING.set(id, (d) => d.error ? rej(new Error(d.error)) : res(d.t));
+    w.postMessage({ id, buf, prMax, bbox, keySuffix }, [buf]);
+  });
+}
+const tileRadius = (t, i) => TILEFN.tileRadiusOf(t, i, (G.man && G.man.pr_max) || 1e-4);
 function nodeRec(t, i) {
   return { id: t.ids[i], x: t.x[i], y: t.y[i], r: tileRadius(t, i), kind: TILE_NODE_KINDS[t.kind[i]] || 'Function', lod: t.lod,
     cluster: t.clu[i], pagerank: t.pr[i], size: t.size[i], name: t.names.get(i) || null, test: !!(t.flags[i] & 1) };
@@ -1140,47 +1235,44 @@ async function loadBatch(batch, f) {
     if (c && c.gen === G.gen) { installTile(b.key, c.buf); continue; }
     need.push({ ...b, cached: c });
   }
-  // revalidate stale cache entries one by one (304 -> reuse the bytes), batch the rest
-  const fresh = need.filter(b => !b.cached || !b.cached.etag), stale = need.filter(b => b.cached && b.cached.etag);
-  const budget = DETAIL_BUDGET[G.detail] || 800;
-  for (const b of stale) {
-    try {
-      const r = await fetch(withRoot(`/api/tiles?level=${b.level}&x=${b.x}&y=${b.y}&budget=${budget}`), { headers: { 'If-None-Match': `"${b.cached.etag}"` }, signal: f.ctrl.signal });
-      if (token !== G.token) return;
-      if (r.status === 304) { installTile(b.key, b.cached.buf); cachePut(b.key, b.cached.buf, b.cached.etag); continue; }
-      if (!r.ok) throw new Error('HTTP ' + r.status);
-      const buf = await r.arrayBuffer(); G.stats.bytes += buf.byteLength;
-      const et = (r.headers.get('etag') || '').replace(/"/g, '');
-      installTile(b.key, buf); cachePut(b.key, buf, et);
-    } catch (e) { if (e.name === 'AbortError') return; fresh.push(b); }
-  }
-  if (fresh.length) {
+  // one request for the rest; tiles the client already holds (a cached copy
+  // from an older generation) are revalidated by ETag in the same request
+  // and come back as empty frames when unchanged
+  if (need.length) {
+    const budget = DETAIL_BUDGET[G.detail] || 800;
     let buf;
     try {
-      const keys = fresh.map(b => `${b.level}/${b.x}/${b.y}`).join(',');
-      const r = await fetch(withRoot(`/api/tiles/batch?keys=${q(keys)}&budget=${budget}`), { signal: f.ctrl.signal });
+      const keys = need.map(b => `${b.level}/${b.x}/${b.y}`).join(',');
+      const have = need.map(b => (b.cached && b.cached.etag) || '').join(',');
+      const r = await fetch(withRoot(`/api/tiles/batch?keys=${q(keys)}&budget=${budget}${have.replace(/,/g, '') ? `&have=${q(have)}` : ''}`), { signal: f.ctrl.signal });
       if (!r.ok) throw new Error('HTTP ' + r.status);
       buf = await r.arrayBuffer();
     } catch (e) { if (e.name !== 'AbortError') console.warn('tile batch failed', e); return; }
     if (token !== G.token) return;
     G.stats.bytes += buf.byteLength;
+    const byKey = new Map(need.map(b => [`${b.level}/${b.x}/${b.y}`, b]));
     const dv = new DataView(buf); let o = 4; const cnt = dv.getUint32(0, true);
     for (let i = 0; i < cnt; i++) {
       const lv = dv.getUint32(o, true), x = dv.getUint32(o + 4, true), y = dv.getUint32(o + 8, true), len = dv.getUint32(o + 12, true);
       const et = [...new Uint8Array(buf, o + 16, 10)].map(v => v.toString(16).padStart(2, '0')).join('');
       o += 28;
+      const key = tileKey(lv, x, y), req = byKey.get(`${lv}/${x}/${y}`);
+      if (len === 0 && req && req.cached) { cachePut(key, req.cached.buf.slice(0), et); installTile(key, req.cached.buf); continue; }
       const body = buf.slice(o, o + len); o += (len + 3) & ~3;
-      const key = tileKey(lv, x, y);
-      installTile(key, body); cachePut(key, body, et);
+      cachePut(key, body.slice(0), et);
+      installTile(key, body);
     }
   }
   const dt = performance.now() - t0; G.stats.tileMs.push(dt / Math.max(1, batch.length)); if (G.stats.tileMs.length > 4000) G.stats.tileMs.splice(0, 2000);
 }
 let VIS_T = 0;
 function installTile(key, buf) {
-  let t;
-  try { t = parseTile(buf); } catch (e) { console.warn('bad tile', key, e); return; }
-  t.key = key; t.alpha = 0; t.lastUsed = performance.now(); t.bufs = null; t.ver = 0;
+  const token = G.token;
+  decodeAsync(key, buf).then(t => { if (token === G.token) finishInstall(key, t); })
+    .catch(e => console.warn('bad tile', key, e));
+}
+function finishInstall(key, t) {
+  t.key = key; t.alpha = 0; t.lastUsed = performance.now(); t.bufs = null; t.ver = 0; t.gl = null;
   const old = G.tiles.get(key); if (old) dropTile(old);
   G.tiles.set(key, t); G.resident += t.n; G.stats.tilesLoaded++;
   for (let i = 0; i < t.n; i++) G.nodeRef.set(t.ids[i], { t, i });
@@ -1192,9 +1284,13 @@ function installTile(key, buf) {
   }, 400);
   if (G.status === 'ready' && !G.stats.firstFrameAt && G.want.has(key)) G.stats.firstFrameAt = performance.now();
 }
+function freeGpu(t) {
+  const X = G.glx;
+  if (X && t.gl) { const gl = X.gl; gl.deleteBuffer(t.gl.node); gl.deleteBuffer(t.gl.foc); gl.deleteBuffer(t.gl.edge); gl.deleteTexture(t.gl.pos); gl.deleteVertexArray(t.gl.vaoN); gl.deleteVertexArray(t.gl.vaoE); }
+  t.gl = null; t.bufs = null;
+}
 function dropTile(t) {
-  if (t.bufs && G.gl) { G.gl.deleteBuffer(t.bufs.nodes); G.gl.deleteBuffer(t.bufs.edges); }
-  t.bufs = null; G.resident -= t.n; G.tiles.delete(t.key);
+  freeGpu(t); G.resident -= t.n; G.tiles.delete(t.key);
   for (let i = 0; i < t.n; i++) { const r = G.nodeRef.get(t.ids[i]); if (r && r.t === t) G.nodeRef.delete(t.ids[i]); }
 }
 function evict() {
@@ -1211,29 +1307,73 @@ function lookup(id) {
   return null;
 }
 
-/* ---- WebGL ---- */
-const VS_NODE = `attribute vec2 a_corner;attribute vec2 a_pos;attribute float a_r;attribute vec4 a_col;
-uniform vec3 u_view;uniform vec2 u_size;uniform float u_minpx;varying vec2 v_uv;varying vec4 v_col;varying float v_px;
-void main(){float rpx=max(a_r*u_view.x,u_minpx);vec2 c=a_pos*u_view.x+u_view.yz;vec2 p=c+a_corner*(rpx+1.0);
-vec2 clip=p/u_size*2.0-1.0;gl_Position=vec4(clip.x,-clip.y,0.0,1.0);v_uv=a_corner*(rpx+1.0)/rpx;v_col=a_col;v_px=rpx;}`;
-const FS_NODE = `precision mediump float;varying vec2 v_uv;varying vec4 v_col;varying float v_px;uniform float u_alpha;
-void main(){float d=length(v_uv);float aa=1.5/max(v_px,1.0);float a=1.0-smoothstep(1.0-aa,1.0,d);if(a<=0.0)discard;
-float ring=v_col.a<0.99?0.0:smoothstep(1.0-aa*2.5,1.0-aa,d)*0.35;gl_FragColor=vec4(v_col.rgb*(1.0-ring),a*u_alpha*max(v_col.a,0.35));}`;
-const VS_EDGE = `attribute vec2 a_pos;attribute vec4 a_col;uniform vec3 u_view;uniform vec2 u_size;varying vec4 v_col;
-void main(){vec2 p=a_pos*u_view.x+u_view.yz;vec2 clip=p/u_size*2.0-1.0;gl_Position=vec4(clip.x,-clip.y,0.0,1.0);v_col=a_col;}`;
-const FS_EDGE = `precision mediump float;varying vec4 v_col;uniform float u_alpha;void main(){gl_FragColor=vec4(v_col.rgb,v_col.a*u_alpha);}`;
+/* ---- WebGL2 renderer ----
+   Static per-tile GPU data (uploaded once, when the tile arrives): an
+   instance buffer of nodes, an RGBA32F texture of node + ghost positions and
+   an instance buffer of edges that index into it. The camera transform, the
+   node / edge kind filters, the confidence threshold, colours, focus and the
+   edge budget are all uniforms, so panning, zooming and restyling never
+   touch a buffer. Edges shorter than a pixel on screen and edges over the
+   frame's budget are collapsed in the vertex shader; a received edge group
+   is skipped when its owner tile is drawn. Frames are drawn on demand only. */
+const VS_NODE = `#version 300 es
+precision highp float; precision highp int;
+in vec2 a_corner; in vec2 a_pos; in float a_r; in uint a_meta; in int a_clu; in float a_foc;
+uniform vec3 u_view; uniform vec2 u_size; uniform float u_minpx; uniform uint u_nodeMask; uniform int u_focusOn;
+uniform int u_colorMode; uniform vec4 u_kcol[5]; uniform vec4 u_pal[16];
+out vec2 v_uv; out vec4 v_col; out float v_px;
+void main(){
+  uint kind = a_meta & 255u; uint lod = (a_meta >> 16u) & 255u;
+  bool hide = ((u_nodeMask >> kind) & 1u) == 0u || (u_focusOn == 1 && lod == 0u && a_foc < 0.5);
+  float rpx = max(a_r * u_view.x, u_minpx);
+  vec2 c = a_pos * u_view.x + u_view.yz; vec2 p = c + a_corner * (rpx + 1.0);
+  vec2 clip = p / u_size * 2.0 - 1.0;
+  gl_Position = hide ? vec4(2.0, 2.0, 2.0, 1.0) : vec4(clip.x, -clip.y, 0.0, 1.0);
+  v_uv = a_corner * (rpx + 1.0) / rpx; v_px = rpx;
+  vec4 col = u_kcol[min(kind, 4u)];
+  if ((u_colorMode == 1 || lod == 2u) && a_clu != -1) { int ci = a_clu < 0 ? -a_clu : a_clu; col = u_pal[ci % 16]; col.a = lod > 0u ? 0.85 : 1.0; }
+  else if (lod > 0u) col.a = 216.0 / 255.0;
+  v_col = col;
+}`;
+const FS_NODE = `#version 300 es
+precision mediump float;
+in vec2 v_uv; in vec4 v_col; in float v_px; uniform float u_alpha; out vec4 o;
+void main(){ float d = length(v_uv); float aa = 1.5 / max(v_px, 1.0); float a = 1.0 - smoothstep(1.0 - aa, 1.0, d); if (a <= 0.0) discard;
+  float ring = v_col.a < 0.99 ? 0.0 : smoothstep(1.0 - aa * 2.5, 1.0 - aa, d) * 0.35;
+  o = vec4(v_col.rgb * (1.0 - ring), a * u_alpha * max(v_col.a, 0.35)); }`;
+const VS_EDGE = `#version 300 es
+precision highp float; precision highp int;
+in uvec4 a_e;
+uniform highp sampler2D u_pos; uniform highp usampler2D u_drawn; uniform ivec2 u_win0; uniform int u_dedup;
+uniform vec3 u_view; uniform vec2 u_size;
+uniform uint u_edgeMask; uniform uint u_nodeMask; uniform float u_minConf; uniform float u_minLen; uniform float u_budget;
+uniform int u_focusOn; uniform int u_lod; uniform vec4 u_ecol[16]; uniform float u_alpha;
+out vec4 v_col;
+vec4 P(uint i){ int ii = int(i); return texelFetch(u_pos, ivec2(ii % 1024, ii / 1024), 0); }
+void main(){
+  uint k = a_e.z & 255u; uint conf = (a_e.z >> 8u) & 255u; uint w = (a_e.z >> 16u) & 255u; uint prio = a_e.z >> 24u;
+  vec4 pa = P(a_e.x); vec4 pb = P(a_e.y);
+  bool hide = ((u_edgeMask >> k) & 1u) == 0u;
+  hide = hide || (k == 1u && float(conf) < u_minConf * 255.0);
+  hide = hide || ((u_nodeMask >> uint(pa.z)) & 1u) == 0u || ((u_nodeMask >> uint(pb.z)) & 1u) == 0u;
+  hide = hide || (u_focusOn == 1 && u_lod == 0 && (pa.w < 0.5 || pb.w < 0.5));
+  hide = hide || float(prio) >= u_budget * 256.0;
+  if (u_dedup == 1 && a_e.w != 0xFFFFFFFFu) {
+    int ox = int(a_e.w & 65535u) - u_win0.x, oy = int(a_e.w >> 16u) - u_win0.y;
+    if (ox >= 0 && oy >= 0 && ox < 256 && oy < 256 && texelFetch(u_drawn, ivec2(ox, oy), 0).r > 0u) hide = true;
+  }
+  vec2 sa = pa.xy * u_view.x + u_view.yz; vec2 sb = pb.xy * u_view.x + u_view.yz;
+  hide = hide || distance(sa, sb) < u_minLen;
+  vec2 p = gl_VertexID == 0 ? sa : sb;
+  vec2 clip = p / u_size * 2.0 - 1.0;
+  gl_Position = hide ? vec4(2.0, 2.0, 2.0, 1.0) : vec4(clip.x, -clip.y, 0.0, 1.0);
+  vec4 c = u_ecol[min(k, 15u)]; v_col = vec4(c.rgb, c.a * float(w) / 255.0 * u_alpha);
+}`;
+const FS_EDGE = `#version 300 es
+precision mediump float; in vec4 v_col; out vec4 o; void main(){ o = v_col; }`;
 function glInit(cv) {
-  let gl = null, inst = null;
-  try {
-    gl = cv.getContext('webgl2', { antialias: false, premultipliedAlpha: false, alpha: true, powerPreference: 'high-performance' });
-    if (gl) inst = { div: (l, d) => gl.vertexAttribDivisor(l, d), draw: (m, f, c, n) => gl.drawArraysInstanced(m, f, c, n) };
-    else {
-      gl = cv.getContext('webgl', { antialias: false, premultipliedAlpha: false, alpha: true, powerPreference: 'high-performance' });
-      const ext = gl && gl.getExtension('ANGLE_instanced_arrays');
-      if (ext) inst = { div: (l, d) => ext.vertexAttribDivisorANGLE(l, d), draw: (m, f, c, n) => ext.drawArraysInstancedANGLE(m, f, c, n) };
-      else gl = null;
-    }
-  } catch { gl = null; }
+  let gl = null;
+  try { gl = cv.getContext('webgl2', { antialias: false, premultipliedAlpha: false, alpha: true, powerPreference: 'high-performance' }); } catch { gl = null; }
   if (!gl) return null;
   const prog = (vs, fs) => {
     const p = gl.createProgram();
@@ -1250,15 +1390,21 @@ function glInit(cv) {
     const corner = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, corner);
     gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
     const L = (p, n) => gl.getAttribLocation(p, n), U = (p, n) => gl.getUniformLocation(p, n);
-    return { gl, inst, node, edge, corner,
-      na: { corner: L(node, 'a_corner'), pos: L(node, 'a_pos'), r: L(node, 'a_r'), col: L(node, 'a_col') },
-      nu: { view: U(node, 'u_view'), size: U(node, 'u_size'), minpx: U(node, 'u_minpx'), alpha: U(node, 'u_alpha') },
-      ea: { pos: L(edge, 'a_pos'), col: L(edge, 'a_col') },
-      eu: { view: U(edge, 'u_view'), size: U(edge, 'u_size'), alpha: U(edge, 'u_alpha') } };
-  } catch (e) { console.warn('WebGL init failed, using 2D fallback:', e); return null; }
+    const uni = (p, names) => Object.fromEntries(names.map(n => [n, U(p, n)]));
+    return { gl, node, edge, corner,
+      na: { corner: L(node, 'a_corner'), pos: L(node, 'a_pos'), r: L(node, 'a_r'), meta: L(node, 'a_meta'), clu: L(node, 'a_clu'), foc: L(node, 'a_foc') },
+      nu: uni(node, ['u_view', 'u_size', 'u_minpx', 'u_nodeMask', 'u_focusOn', 'u_colorMode', 'u_kcol', 'u_pal', 'u_alpha']),
+      ea: { e: L(edge, 'a_e') },
+      eu: uni(edge, ['u_pos', 'u_drawn', 'u_win0', 'u_dedup', 'u_view', 'u_size', 'u_edgeMask', 'u_nodeMask', 'u_minConf', 'u_minLen', 'u_budget', 'u_focusOn', 'u_lod', 'u_ecol', 'u_alpha']),
+      drawnTex: (() => { const tx = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tx);
+        gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+        gl.texImage2D(gl.TEXTURE_2D, 0, gl.R8UI, 256, 256, 0, gl.RED_INTEGER, gl.UNSIGNED_BYTE, new Uint8Array(65536)); return tx; })(),
+      drawnBuf: new Uint8Array(65536), drawnVer: -1, win0: [0, 0],
+      styleVer: -1 };
+  } catch (e) { console.warn('WebGL2 init failed, using 2D fallback:', e); return null; }
 }
 
-/* Per-tile buffers: rebuilt only when filters / colours / focus change (styleVersion). */
+/* Per-tile visibility helpers (2D fallback, picking, labels, hulls). */
 function nodeVisible(t, i) {
   const k = TILE_NODE_KINDS[t.kind[i]];
   if (!G.nodeFilter.has(k)) return false;
@@ -1274,6 +1420,7 @@ function nodeColor(t, i) {
   if (t.lod) base[3] = 216;
   return base;
 }
+/* 2D fallback: CPU arrays with the current filters baked in (rebuilt per styleVersion). */
 function buildTileArrays(t) {
   const NV = new Float32Array(t.n * 4), NU = new Uint8Array(NV.buffer);
   let c = 0;
@@ -1284,10 +1431,6 @@ function buildTileArrays(t) {
     NV[c * 4] = t.x[i]; NV[c * 4 + 1] = t.y[i]; NV[c * 4 + 2] = tileRadius(t, i);
     const col = nodeColor(t, i); NU.set(col, c * 16 + 12); c++;
   }
-  // Edges are stored once, under the tile of their lower-id endpoint (the
-  // owner), but a tile also receives the edges of its nodes owned elsewhere.
-  // Owned edges come first; received ones are grouped by owner tile so a
-  // frame can skip every group whose owner tile is drawn too (no double draw).
   const EV = new Float32Array(t.m * 6), EU = new Uint8Array(EV.buffer);
   let e = 0;
   const px = (j) => j < t.n ? t.x[j] : t.gx[j - t.n], py = (j) => j < t.n ? t.y[j] : t.gy[j - t.n];
@@ -1319,51 +1462,142 @@ function buildTileArrays(t) {
   return { nodes: NV.subarray(0, c * 4), nNodes: c, edges: EV.subarray(0, e * 6), nEdges: e, nOwned, segs };
 }
 function ensureBuffers(t) {
-  if (t.ver === G.styleVersion && (t.bufs || !G.glx)) return;
-  const a = buildTileArrays(t);
-  t.cpu = a; t.ver = G.styleVersion;
-  const X = G.glx; if (!X) return;
-  const gl = X.gl;
-  if (!t.bufs) t.bufs = { nodes: gl.createBuffer(), edges: gl.createBuffer() };
-  gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.nodes); gl.bufferData(gl.ARRAY_BUFFER, a.nodes, gl.STATIC_DRAW);
-  gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.edges); gl.bufferData(gl.ARRAY_BUFFER, a.edges, gl.STATIC_DRAW);
-  t.nNodes = a.nNodes; t.nEdges = a.nEdges; t.nOwned = a.nOwned; t.segs = a.segs;
-  if (t.cpu && G.glx) t.cpu = null;
+  if (!G.glx) { if (t.ver !== G.styleVersion || !t.cpu) { t.cpu = buildTileArrays(t); t.ver = G.styleVersion; } return; }
+  const X = G.glx, gl = X.gl;
+  if (t.gl && !t.posDirty && t.focVer === G.focusVer) return;
+  const gp = t.gpu;
+  if (!t.gl) {
+    const g = { node: gl.createBuffer(), foc: gl.createBuffer(), edge: gl.createBuffer(), pos: gl.createTexture(),
+      vaoN: gl.createVertexArray(), vaoE: gl.createVertexArray(), texH: gp.texH };
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.node); gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(gp.node), gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.edge); gl.bufferData(gl.ARRAY_BUFFER, gp.edges, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.foc); gl.bufferData(gl.ARRAY_BUFFER, new Uint8Array(Math.max(1, t.n)).fill(1), gl.DYNAMIC_DRAW);
+    gl.bindTexture(gl.TEXTURE_2D, g.pos);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, 1024, gp.texH, 0, gl.RGBA, gl.FLOAT, gp.pos);
+    // node VAO: shared unit quad + per-instance attributes
+    gl.bindVertexArray(g.vaoN);
+    gl.bindBuffer(gl.ARRAY_BUFFER, X.corner);
+    gl.enableVertexAttribArray(X.na.corner); gl.vertexAttribPointer(X.na.corner, 2, gl.FLOAT, false, 0, 0); gl.vertexAttribDivisor(X.na.corner, 0);
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.node);
+    gl.enableVertexAttribArray(X.na.pos); gl.vertexAttribPointer(X.na.pos, 2, gl.FLOAT, false, 20, 0); gl.vertexAttribDivisor(X.na.pos, 1);
+    gl.enableVertexAttribArray(X.na.r); gl.vertexAttribPointer(X.na.r, 1, gl.FLOAT, false, 20, 8); gl.vertexAttribDivisor(X.na.r, 1);
+    gl.enableVertexAttribArray(X.na.meta); gl.vertexAttribIPointer(X.na.meta, 1, gl.UNSIGNED_INT, 20, 12); gl.vertexAttribDivisor(X.na.meta, 1);
+    gl.enableVertexAttribArray(X.na.clu); gl.vertexAttribIPointer(X.na.clu, 1, gl.INT, 20, 16); gl.vertexAttribDivisor(X.na.clu, 1);
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.foc);
+    gl.enableVertexAttribArray(X.na.foc); gl.vertexAttribPointer(X.na.foc, 1, gl.UNSIGNED_BYTE, true, 1, 0); gl.vertexAttribDivisor(X.na.foc, 1);
+    // edge VAO (the instance offset is re-pointed per drawn range)
+    gl.bindVertexArray(g.vaoE);
+    gl.bindBuffer(gl.ARRAY_BUFFER, g.edge);
+    gl.enableVertexAttribArray(X.ea.e); gl.vertexAttribIPointer(X.ea.e, 4, gl.UNSIGNED_INT, 16, 0); gl.vertexAttribDivisor(X.ea.e, 1);
+    gl.bindVertexArray(null);
+    t.gl = g; t.nEdges = gp.nEdges; t.nOwned = gp.nOwned; t.nNodes = t.n; t.focVer = 0; t.prioCum = gp.prioCum;
+    t.bufs = g;
+  }
+  if (t.posDirty) {
+    // local layout refinement moved nodes: re-upload positions
+    const NB = new Float32Array(gp.node), P = gp.pos;
+    for (let i = 0; i < t.n; i++) { NB[i * 5] = t.x[i]; NB[i * 5 + 1] = t.y[i]; P[i * 4] = t.x[i]; P[i * 4 + 1] = t.y[i]; }
+    gl.bindBuffer(gl.ARRAY_BUFFER, t.gl.node); gl.bufferSubData(gl.ARRAY_BUFFER, 0, new Uint8Array(gp.node));
+    gl.bindTexture(gl.TEXTURE_2D, t.gl.pos); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1024, gp.texH, gl.RGBA, gl.FLOAT, P);
+    t.posDirty = false;
+  }
+  if (t.focVer !== G.focusVer) {
+    // focus membership (lod 0 only): one byte per node + the texture's w
+    if (t.lod === 0) {
+      const F = new Uint8Array(Math.max(1, t.n)), P = gp.pos;
+      for (let i = 0; i < t.n; i++) { const f = !G.focus || G.focus.has(t.ids[i]) ? 1 : 0; F[i] = f; P[i * 4 + 3] = f; }
+      for (let j = 0; j < t.g; j++) P[(t.n + j) * 4 + 3] = !G.focus || G.focus.has(t.gids[j]) ? 1 : 0;
+      gl.bindBuffer(gl.ARRAY_BUFFER, t.gl.foc); gl.bufferSubData(gl.ARRAY_BUFFER, 0, F);
+      gl.bindTexture(gl.TEXTURE_2D, t.gl.pos); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 1024, gp.texH, gl.RGBA, gl.FLOAT, P);
+    }
+    t.focVer = G.focusVer;
+  }
+}
+function glStyle(X) {
+  // colour / filter uniforms, set once per style change (not per frame)
+  if (X.styleVer === G.styleVersion) return;
+  const gl = X.gl, T = G.T;
+  const kcol = new Float32Array(20), pal = new Float32Array(64), ecol = new Float32Array(64);
+  TILE_NODE_KINDS.forEach((k, i) => { const c = T.kindRGBA[k === 'Cluster' ? 'Module' : k] || [136, 136, 136, 255]; kcol.set([c[0] / 255, c[1] / 255, c[2] / 255, c[3] / 255], i * 4); });
+  COMMUNITY_PALETTE.forEach((h, i) => { const c = rgbaBytes(h); pal.set([c[0] / 255, c[1] / 255, c[2] / 255, 1], i * 4); });
+  EDGE_KINDS.forEach((k, i) => { const c = T.edgeRGBA[i] || [128, 128, 128, 60]; ecol.set([c[0] / 255, c[1] / 255, c[2] / 255, c[3] / 255], i * 4); });
+  let nodeMask = 0; TILE_NODE_KINDS.forEach((k, i) => { if (G.nodeFilter.has(k)) nodeMask |= 1 << i; });
+  let edgeMask = 0; EDGE_KINDS.forEach((k, i) => { if (G.edgeFilter.has(k.id)) edgeMask |= 1 << i; });
+  gl.useProgram(X.node);
+  gl.uniform4fv(X.nu.u_kcol, kcol); gl.uniform4fv(X.nu.u_pal, pal);
+  gl.uniform1ui(X.nu.u_nodeMask, nodeMask >>> 0); gl.uniform1i(X.nu.u_colorMode, G.colorMode === 'community' ? 1 : 0);
+  gl.useProgram(X.edge);
+  gl.uniform4fv(X.eu.u_ecol, ecol); gl.uniform1ui(X.eu.u_edgeMask, edgeMask >>> 0); gl.uniform1ui(X.eu.u_nodeMask, nodeMask >>> 0);
+  gl.uniform1f(X.eu.u_minConf, G.minConf || 0); gl.uniform1i(X.eu.u_pos, 0); gl.uniform1i(X.eu.u_drawn, 1);
+  X.styleVer = G.styleVersion;
+}
+/* The "drawn tiles" window: which tiles of the current level are drawn,
+   in a 256x256 window of tile coordinates around the view (a received edge
+   whose owner is marked there is skipped by the shader). */
+function updateDrawn(X, order) {
+  if (!G.man) return;
+  const gl = X.gl, L = G.level, nT = 2 ** L;
+  const v = viewWorld(), b = G.man.bbox, tw = worldSide() / nT;
+  const cx = Math.floor(((v.x0 + v.x1) / 2 - b[0]) / tw), cy = Math.floor(((v.y0 + v.y1) / 2 - b[1]) / tw);
+  const w0 = [Math.max(0, cx - 128), Math.max(0, cy - 128)];
+  const keys = [];
+  for (const t of order) if (t.alpha > 0.5 && t.level === L) keys.push(t.tx + ',' + t.ty);
+  const sig = L + ':' + w0 + ':' + keys.sort().join('|');
+  if (sig === X.drawnSig) return;
+  X.drawnSig = sig; X.win0 = w0;
+  const D = X.drawnBuf; D.fill(0);
+  for (const t of order) {
+    if (!(t.alpha > 0.5) || t.level !== L) continue;
+    const ox = t.tx - w0[0], oy = t.ty - w0[1];
+    if (ox >= 0 && oy >= 0 && ox < 256 && oy < 256) D[oy * 256 + ox] = 1;
+  }
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, X.drawnTex);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, 256, 256, gl.RED_INTEGER, gl.UNSIGNED_BYTE, D);
+  gl.activeTexture(gl.TEXTURE0);
 }
 function drawGL(order, dim) {
   const X = G.glx, gl = X.gl, W = G.size.w, H = G.size.h, vp = G.vp;
+  glStyle(X);
   gl.viewport(0, 0, G.canvas.width, G.canvas.height);
   gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-  // edges (a received edge group is skipped when its owner tile is drawn too)
+  updateDrawn(X, order);
+  const focusOn = G.focus ? 1 : 0;
+  // edges: instanced 2-vertex lines, positions fetched from the tile texture
   gl.useProgram(X.edge);
-  gl.uniform3f(X.eu.view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.eu.size, W, H);
-  const drawnKeys = new Set(); for (const t of order) if (t.alpha > 0.5) drawnKeys.add(t.key);
+  gl.uniform3f(X.eu.u_view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.eu.u_size, W, H);
+  gl.uniform1f(X.eu.u_minLen, G.minEdgePx); gl.uniform1f(X.eu.u_budget, G.edgeBudget); gl.uniform1i(X.eu.u_focusOn, focusOn);
+  gl.uniform2i(X.eu.u_win0, X.win0[0], X.win0[1]);
+  gl.activeTexture(gl.TEXTURE1); gl.bindTexture(gl.TEXTURE_2D, X.drawnTex); gl.activeTexture(gl.TEXTURE0);
+  let drawnEdges = 0;
   for (const t of order) {
-    if (!t.nEdges) continue;
-    gl.uniform1f(X.eu.alpha, t.alpha * (dim ? 0.3 : 1));
-    gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.edges);
-    gl.enableVertexAttribArray(X.ea.pos); gl.vertexAttribPointer(X.ea.pos, 2, gl.FLOAT, false, 12, 0);
-    gl.enableVertexAttribArray(X.ea.col); gl.vertexAttribPointer(X.ea.col, 4, gl.UNSIGNED_BYTE, true, 12, 8);
-    if (t.nOwned) gl.drawArrays(gl.LINES, 0, t.nOwned * 2);
-    for (const sg of t.segs || []) if (sg.count && !drawnKeys.has(sg.key)) gl.drawArrays(gl.LINES, sg.start * 2, sg.count * 2);
+    if (!t.gl || !t.nEdges) continue;
+    gl.uniform1f(X.eu.u_alpha, t.alpha * (dim ? 0.3 : 1)); gl.uniform1i(X.eu.u_lod, t.lod);
+    gl.uniform1i(X.eu.u_dedup, t.level === G.level ? 1 : 0);
+    gl.bindTexture(gl.TEXTURE_2D, t.gl.pos);
+    gl.bindVertexArray(t.gl.vaoE);
+    const cnt = G.edgeBudget >= 1 ? t.nEdges : t.prioCum[Math.max(1, Math.min(256, Math.ceil(G.edgeBudget * 256)))];
+    if (cnt) { gl.drawArraysInstanced(gl.LINES, 0, 2, cnt); drawnEdges += cnt; }
   }
-  // nodes (instanced quads)
+  // nodes: instanced quads
   gl.useProgram(X.node);
-  gl.uniform3f(X.nu.view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.nu.size, W, H);
-  gl.bindBuffer(gl.ARRAY_BUFFER, X.corner);
-  gl.enableVertexAttribArray(X.na.corner); gl.vertexAttribPointer(X.na.corner, 2, gl.FLOAT, false, 0, 0); X.inst.div(X.na.corner, 0);
+  gl.uniform3f(X.nu.u_view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.nu.u_size, W, H); gl.uniform1i(X.nu.u_focusOn, focusOn);
   for (const t of order) {
-    if (!t.nNodes) continue;
-    gl.uniform1f(X.nu.alpha, t.alpha * (dim ? 0.28 : 1));
-    gl.uniform1f(X.nu.minpx, t.lod === 0 ? 1.3 : t.lod === 1 ? 2.2 : 3.5);
-    gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.nodes);
-    gl.enableVertexAttribArray(X.na.pos); gl.vertexAttribPointer(X.na.pos, 2, gl.FLOAT, false, 16, 0); X.inst.div(X.na.pos, 1);
-    gl.enableVertexAttribArray(X.na.r); gl.vertexAttribPointer(X.na.r, 1, gl.FLOAT, false, 16, 8); X.inst.div(X.na.r, 1);
-    gl.enableVertexAttribArray(X.na.col); gl.vertexAttribPointer(X.na.col, 4, gl.UNSIGNED_BYTE, true, 16, 12); X.inst.div(X.na.col, 1);
-    X.inst.draw(gl.TRIANGLE_STRIP, 0, 4, t.nNodes);
+    if (!t.gl || !t.n) continue;
+    gl.uniform1f(X.nu.u_alpha, t.alpha * (dim ? 0.28 : 1));
+    gl.uniform1f(X.nu.u_minpx, t.lod === 0 ? 1.3 : t.lod === 1 ? 2.2 : 3.5);
+    gl.bindVertexArray(t.gl.vaoN);
+    gl.drawArraysInstanced(gl.TRIANGLE_STRIP, 0, 4, t.n);
   }
-  X.inst.div(X.na.pos, 0); X.inst.div(X.na.r, 0); X.inst.div(X.na.col, 0);
+  gl.bindVertexArray(null);
+  G.stats.edgesSubmitted = drawnEdges;
+}
+/* Edges (after dedup) the current view submits; the budget / pixel culls act on these. */
+function edgesInView() {
+  let s = 0; for (const t of G.tiles.values()) if (t.alpha > 0.001 && t.gl) s += t.nEdges;
+  return s;
 }
 function draw2D(order, dim) {
   // Fallback when WebGL is unavailable: same tiles, drawn with Canvas 2D batches.
@@ -1411,6 +1645,9 @@ async function loadGraph() {
     return;
   }
   if (token !== G.token) return;
+  // same generation as what is on screen: nothing to reload
+  if (G.status === 'ready' && G.man && man && man.ready && man.generation === G.gen && G.tiles.size &&
+      JSON.stringify(G.man.bbox) === JSON.stringify(man.bbox)) { setOverlay(null); return; }
   const prevGen = G.gen;
   if (!man || !man.ready || !man.counts || !man.counts.sym_nodes) {
     clearTiles(); G.man = null; G.status = 'empty'; renderGraphChrome(); G.needsRender = true;
@@ -1427,7 +1664,7 @@ async function loadGraph() {
   // a new generation keeps resident tiles until their replacements arrive (304s are cheap)
   if (!sameWorld) { clearTiles(); G.fitNext = true; }
   else for (const t of G.tiles.values()) t.lastUsed = 0;
-  if (sameWorld) { const keep = [...G.tiles.values()]; for (const t of keep) { G.tiles.delete(t.key); G.resident -= t.n; if (t.bufs && G.gl) { G.gl.deleteBuffer(t.bufs.nodes); G.gl.deleteBuffer(t.bufs.edges); } } G.nodeRef.clear(); }
+  if (sameWorld) { const keep = [...G.tiles.values()]; for (const t of keep) { G.tiles.delete(t.key); G.resident -= t.n; freeGpu(t); } G.nodeRef.clear(); }
   G.status = 'ready';
   setOverlay(null);
   renderGraphChrome(); renderLegend();
@@ -1438,9 +1675,23 @@ async function loadGraph() {
   else if (G.selectedId != null) loadNeighbors(G.selectedId);
 }
 
-/* ---- frame loop ---- */
+/* ---- frame loop: on demand ----
+   Setting G.needsRender (or requestDraw) schedules ONE frame; a frame asks
+   for another only while something animates (tile crossfade), the camera
+   moves, or the edge budget is still refining after the camera stopped.
+   An idle graph runs no requestAnimationFrame at all.
+   Adaptive quality: while the camera moves, the edge budget (share of edges
+   drawn, a stable per-edge hash decides which) follows the frame time;
+   when it stops, the budget doubles per frame up to full detail
+   (G.fullDetail). */
+let RAF = 0, NEEDS = true;
+Object.defineProperty(G, 'needsRender', { get: () => NEEDS, set: (v) => { NEEDS = !!v; if (v) requestDraw(); } });
+function requestDraw() { if (!RAF) RAF = requestAnimationFrame(tick); }
+G.edgeBudget = 1; G.minEdgePx = 0.75; G.fullDetail = true; G.lastMove = 0; G.focusVer = 1;
+const lastVp = { tx: NaN, ty: NaN, scale: NaN };
+let REST_T = 0;
 function tick(now) {
-  requestAnimationFrame(tick);
+  RAF = 0;
   if (!G.shown) return;
   const dt = Math.min(64, now - (G.lastTick || now)); G.lastTick = now;
   let animating = false;
@@ -1452,12 +1703,50 @@ function tick(now) {
       animating = true;
     }
   }
-  if (G.needsRender || animating) {
-    const throttled = G.layoutRunning && (now - G.lastRender < SETTLE_RENDER_MS);
-    if (!throttled) { render(); G.needsRender = false; G.lastRender = now; }
+  const vp = G.vp;
+  const moved = vp.tx !== lastVp.tx || vp.ty !== lastVp.ty || vp.scale !== lastVp.scale;
+  if (moved) { G.lastMove = now; lastVp.tx = vp.tx; lastVp.ty = vp.ty; lastVp.scale = vp.scale; }
+  const moving = now - G.lastMove < 160;
+  // Measured edge throughput (edges per ms of frame, learnt from any frame
+  // that overran its vsync) sizes the budget of a new camera motion, so the
+  // first moving frames do not pay for the full-detail frame.
+  if (G.prevFrameAt && now - G.prevFrameAt > 18 && now - G.prevFrameAt < 400 && (G.lastSubmitted || 0) > 50000) {
+    const rate = G.lastSubmitted / (now - G.prevFrameAt);
+    G.edgeRate = G.edgeRate ? G.edgeRate * 0.7 + rate * 0.3 : rate;
   }
+  if (!moving) G.budgetCeil = 0;
+  if (moving && !G.wasMoving) {
+    const E = edgesInView();
+    let b = G.moveBudget || 1;
+    if (G.edgeRate && E) b = Math.min(b, Math.max(0.03, G.edgeRate * 13 / E));
+    G.edgeBudget = Math.min(G.edgeBudget, b);
+  }
+  G.wasMoving = moving;
+  // frame-time controller (only while moving; dt is the rAF interval)
+  if (moving && G.prevFrameAt && now - G.prevFrameAt < 200) {
+    // rAF intervals are vsync-quantised: > 18 ms means the last frame missed
+    // its vsync (shed edges), otherwise probe slowly upwards
+    const ft = now - G.prevFrameAt;
+    if (ft > 18) { G.edgeBudget = Math.max(0.03, G.edgeBudget * (ft > 40 ? 0.55 : 0.8)); G.budgetCeil = G.edgeBudget / 0.8; }
+    else if (G.edgeBudget < 1 && !(G.budgetCeil && G.edgeBudget >= 0.85 * G.budgetCeil))
+      G.edgeBudget = Math.min(1, G.edgeBudget * 1.04, G.budgetCeil ? 0.85 * G.budgetCeil : 1);
+    G.moveBudget = G.edgeBudget;
+  }
+  let refining = false;
+  if (!moving && G.edgeBudget < 1) { G.edgeBudget = Math.min(1, G.edgeBudget * 2); refining = true; }
+  if (NEEDS || animating || moving || refining) {
+    const throttled = G.layoutRunning && (now - G.lastRender < SETTLE_RENDER_MS);
+    if (!throttled) { render(); NEEDS = false; G.lastRender = now; }
+    else animating = true;
+  }
+  G.fullDetail = !moving && G.edgeBudget >= 1;
+  G.lastSubmitted = G.stats.edgesSubmitted || 0;
+  if (!moving && G.layerAt && (G.layerAt.tx !== G.vp.tx || G.layerAt.ty !== G.vp.ty || G.layerAt.scale !== G.vp.scale)) { NEEDS = true; refining = true; }
+  G.prevFrameAt = now;
   const s = G.stats; s.frames++;
   if (now - s.fpsT > 1000) { s.fps = Math.round(s.frames * 1000 / (now - s.fpsT)); s.frames = 0; s.fpsT = now; }
+  if (animating || refining) requestDraw();
+  else if (moving) { clearTimeout(REST_T); REST_T = setTimeout(requestDraw, 170); }
 }
 function render() {
   if (!G.canvas || !G.size.w) return;
@@ -1470,7 +1759,25 @@ function render() {
   for (const t of drawn) ensureBuffers(t);
   const dim = G.selectedId !== null || (G.overlay && G.selectedId === null);
   if (G.glx) drawGL(drawn, dim); else draw2D(drawn, dim);
+  // Label + hull layers are 2D canvases (text rendering is their cost, on
+  // the GPU compositor as much as the CPU). While the camera moves, the last
+  // drawn layers follow it with a CSS transform (pan + zoom) instead of being
+  // redrawn; they are redrawn at rest (160 ms after the last move), when the
+  // zoom has changed by more than 2x, or when the selection / hover / style
+  // changes.
+  const LL = G.layerAt, now = performance.now();
+  const k = LL ? G.vp.scale / LL.scale : 1;
+  const follow = LL && G.lastMove && now - G.lastMove < 160 && k > 0.5 && k < 2 &&
+    LL.sel === G.selectedId && LL.hover === G.hoverId && LL.style === G.styleVersion;
+  if (follow) {
+    const tr = `matrix(${k},0,0,${k},${G.vp.tx - LL.tx * k},${G.vp.ty - LL.ty * k})`;
+    G.over.canvas.style.transform = tr; G.under.canvas.style.transform = tr;
+    return;
+  }
+  G.over.canvas.style.transform = ''; G.under.canvas.style.transform = '';
   drawUnder(T); drawOver(T, drawn, dim);
+  G.layerAt = { t: now, tx: G.vp.tx, ty: G.vp.ty, scale: G.vp.scale, tiles: G.tiles.size, sel: G.selectedId,
+    hover: G.hoverId, style: G.styleVersion };
 }
 function drawUnder(T) {
   const ctx = G.under; if (!ctx) return;
@@ -1570,7 +1877,9 @@ function drawOver(T, drawn, dim) {
   if (sel !== null) ring(sel, 2.5, T.accent, 3);
   if (G.hoverId !== null && G.hoverId !== sel) ring(G.hoverId, 1.6, T.text, 2);
   // labels: top-N by PageRank among visible named nodes, collision-avoided
-  const cap = isPhone() ? 70 : 260, cand = [];
+  // fewer labels while the camera moves (the layer is redrawn every ~250 ms then)
+  const movingNow = G.lastMove && performance.now() - G.lastMove < 160;
+  const cap = (isPhone() ? 70 : 260) / (movingNow ? 2.5 : 1), cand = [];
   const v = viewWorld();
   // Each tile keeps its named nodes pre-sorted by label weight, so a frame
   // looks at only the best few per tile, not every name of every tile.
@@ -1698,7 +2007,7 @@ function startLayout() {
   G.layoutRunning = true; updateLayoutUI();
   w.onmessage = (ev) => {
     const pos = new Float32Array(ev.data.pos);
-    for (let j = 0; j < refs.length; j++) { const [t, i] = refs[j]; t.x[i] = pos[j * 2]; t.y[i] = pos[j * 2 + 1]; t.ver = 0; }
+    for (let j = 0; j < refs.length; j++) { const [t, i] = refs[j]; t.x[i] = pos[j * 2]; t.y[i] = pos[j * 2 + 1]; t.ver = 0; t.posDirty = true; }
     G.needsRender = true;
     if (ev.data.done) { G.layoutRunning = false; updateLayoutUI(); }
   };
@@ -1711,7 +2020,7 @@ function updateLayoutUI() {
   const pill = $('#layout-pill'); if (pill) pill.classList.toggle('hidden', !G.layoutRunning);
   const b = $('#pause-btn'); if (b) { b.innerHTML = ic(G.layoutRunning ? 'pause' : 'play'); b.title = G.layoutRunning ? 'Stop refining' : 'Refine the visible layout (local, in the browser)'; }
 }
-function restyle() { G.styleVersion++; G.hullCache = null; G.needsRender = true; }
+function restyle() { G.styleVersion++; G.focusVer++; G.hullCache = null; G.needsRender = true; }
 
 /* Cluster names come with the manifest; kept for callers of the old API. */
 const clustersList = () => cached('clusters', () => api('/api/clusters?limit=500'));
@@ -3629,6 +3938,12 @@ function setupEvents() {
   const parse = (e) => { try { return JSON.parse(e.data || '{}'); } catch { return {}; } };
   EVT.addEventListener('index_progress', e => { const d = parse(e); noteProgress(d.job_id, d); throttledLive(); });
   EVT.addEventListener('wiki_progress', e => { const d = parse(e); noteProgress(d.job_id, d); if (S.page === 'wiki') drawWikiStatus(); throttledLive(); });
+  // a background tile patch landed (after reindex_done): reload the manifest
+  EVT.addEventListener('tiles_ready', e => {
+    const d = parse(e);
+    if (d.repo_slug && ROOT.slug && d.repo_slug !== ROOT.slug) return;
+    if (G.status !== 'loading' && d.generation !== G.gen) loadGraph();
+  });
   EVT.addEventListener('reindex_done', e => {
     const d = parse(e), slug = d.repo_slug;
     if (slug) delete STATS_BY_SLUG[slug]; else Object.keys(STATS_BY_SLUG).forEach(k => delete STATS_BY_SLUG[k]);
@@ -3762,7 +4077,7 @@ function initShell() {
   const other = document.createElement('div'); other.id = 'pg-other'; other.className = 'page-host hidden'; v.appendChild(other);
   applyTheme(saved);
   mountGraphPage();
-  requestAnimationFrame(tick);
+  requestDraw();
 }
 async function boot() {
   clearTimeout(BOOT_RETRY); ROOT.error = null;
