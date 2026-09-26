@@ -1064,10 +1064,11 @@ function parseTile(buf) {
   if (dv.getUint32(0, true) !== 0x31544744) throw new Error('bad tile');
   const lod = dv.getUint8(6), level = dv.getUint8(7), tx = dv.getUint32(8, true), ty = dv.getUint32(12, true);
   const n = dv.getUint32(16, true), m = dv.getUint32(20, true), g = dv.getUint32(24, true), k = dv.getUint32(28, true), nb = dv.getUint32(32, true);
-  let o = 40;
+  const mTotal = dv.getUint32(40, true); // aggregated views may carry only the heaviest edges
+  let o = 44;
   const a4 = (C, c) => { const a = new C(buf, o, c); o += c * 4; return a; };
   const a1 = (c) => { const a = new Uint8Array(buf, o, c); o += (c + 3) & ~3; return a; };
-  const t = { lod, level, tx, ty, n, m, g };
+  const t = { lod, level, tx, ty, n, m, g, mTotal };
   t.ids = a4(Int32Array, n); t.x = new Float32Array(a4(Float32Array, n)); t.y = new Float32Array(a4(Float32Array, n));
   t.pr = a4(Float32Array, n); t.size = a4(Uint32Array, n); t.clu = a4(Int32Array, n); t.kind = a1(n); t.flags = a1(n);
   t.gids = a4(Int32Array, g); t.gx = a4(Float32Array, g); t.gy = a4(Float32Array, g); t.gclu = a4(Int32Array, g); t.gkind = a1(g);
@@ -1089,7 +1090,7 @@ function nodeRec(t, i) {
 }
 
 /* ---- Cache API (per-viewer tile cache across reloads; optional) ---- */
-const TCACHE = 'docgraph-tiles-v2';
+const TCACHE = 'docgraph-tiles-v3'; // bump with the tile format (tiles.py VERSION)
 async function cacheGet(key) {
   try { if (!('caches' in self)) return null; const c = await caches.open(TCACHE); const r = await c.match(`/__tiles/${ROOT.slug}/${key}`); if (!r) return null; return { buf: await r.arrayBuffer(), gen: Number(r.headers.get('x-gen') || 0), etag: r.headers.get('x-etag') || '' }; } catch { return null; }
 }
@@ -1184,7 +1185,11 @@ function installTile(key, buf) {
   G.tiles.set(key, t); G.resident += t.n; G.stats.tilesLoaded++;
   for (let i = 0; i < t.n; i++) G.nodeRef.set(t.ids[i], { t, i });
   evict(); G.needsRender = true;
-  if (!VIS_T) VIS_T = setTimeout(() => { VIS_T = 0; updateVisCount(); }, 250);
+  if (!VIS_T) VIS_T = setTimeout(() => {
+    VIS_T = 0; updateVisCount();
+    // the Explore list shows what is in view: refresh it as tiles land (not while typing in it)
+    if (S.page === 'graph' && S.leftTab === 'explore' && !S.explore && document.activeElement?.id !== 'lq') renderLeft();
+  }, 400);
   if (G.status === 'ready' && !G.stats.firstFrameAt && G.want.has(key)) G.stats.firstFrameAt = performance.now();
 }
 function dropTile(t) {
@@ -1279,21 +1284,39 @@ function buildTileArrays(t) {
     NV[c * 4] = t.x[i]; NV[c * 4 + 1] = t.y[i]; NV[c * 4 + 2] = tileRadius(t, i);
     const col = nodeColor(t, i); NU.set(col, c * 16 + 12); c++;
   }
+  // Edges are stored once, under the tile of their lower-id endpoint (the
+  // owner), but a tile also receives the edges of its nodes owned elsewhere.
+  // Owned edges come first; received ones are grouped by owner tile so a
+  // frame can skip every group whose owner tile is drawn too (no double draw).
   const EV = new Float32Array(t.m * 6), EU = new Uint8Array(EV.buffer);
   let e = 0;
   const px = (j) => j < t.n ? t.x[j] : t.gx[j - t.n], py = (j) => j < t.n ? t.y[j] : t.gy[j - t.n];
+  const idOf = (j) => j < t.n ? t.ids[j] : t.gids[j - t.n];
   const okEnd = (j) => j < t.n ? vis[j] === 1 : (G.nodeFilter.has(TILE_NODE_KINDS[t.gkind[j - t.n]]) && (!G.focus || t.lod !== 0 || G.focus.has(t.gids[j - t.n])));
+  const keep = [], recv = new Map();
+  const b0 = G.man.bbox, tw = (b0[2] - b0[0]) / 2 ** t.level, nT = 2 ** t.level, suffix = t.key.slice(t.key.indexOf('@'));
   for (let k = 0; k < t.m; k++) {
     const kind = EDGE_KINDS[t.ek[k]]; if (!kind || !G.edgeFilter.has(kind.id)) continue;
     if (G.minConf > 0 && kind.id === 'CALLS' && t.ec[k] / 255 < G.minConf) continue;
     const a = t.ea[k], b = t.eb[k]; if (!okEnd(a) || !okEnd(b)) continue;
+    const own = idOf(a) <= idOf(b) ? a : b;
+    if (own < t.n) { keep.push(k); continue; }
+    const ox = Math.max(0, Math.min(nT - 1, Math.floor((px(own) - b0[0]) / tw))), oy = Math.max(0, Math.min(nT - 1, Math.floor((py(own) - b0[1]) / tw)));
+    const okey = `${t.level}/${ox}/${oy}${suffix}`;
+    let g = recv.get(okey); if (!g) { g = []; recv.set(okey, g); } g.push(k);
+  }
+  const put = (k) => {
+    const a = t.ea[k], b = t.eb[k];
     const col = G.T.edgeRGBA[t.ek[k]] || [128, 128, 128, 60];
     const w = t.lod ? Math.min(1, 0.35 + Math.log2(1 + t.ew[k]) * 0.12) : 1;
     EV[e * 6] = px(a); EV[e * 6 + 1] = py(a); EU.set([col[0], col[1], col[2], Math.round(col[3] * w)], e * 24 + 8);
     EV[e * 6 + 3] = px(b); EV[e * 6 + 4] = py(b); EU.set([col[0], col[1], col[2], Math.round(col[3] * w)], e * 24 + 20);
     e++;
-  }
-  return { nodes: NV.subarray(0, c * 4), nNodes: c, edges: EV.subarray(0, e * 6), nEdges: e };
+  };
+  for (const k of keep) put(k);
+  const nOwned = e, segs = [];
+  for (const [okey, ks] of recv) { const start = e; for (const k of ks) put(k); segs.push({ key: okey, start, count: e - start }); }
+  return { nodes: NV.subarray(0, c * 4), nNodes: c, edges: EV.subarray(0, e * 6), nEdges: e, nOwned, segs };
 }
 function ensureBuffers(t) {
   if (t.ver === G.styleVersion && (t.bufs || !G.glx)) return;
@@ -1304,7 +1327,7 @@ function ensureBuffers(t) {
   if (!t.bufs) t.bufs = { nodes: gl.createBuffer(), edges: gl.createBuffer() };
   gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.nodes); gl.bufferData(gl.ARRAY_BUFFER, a.nodes, gl.STATIC_DRAW);
   gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.edges); gl.bufferData(gl.ARRAY_BUFFER, a.edges, gl.STATIC_DRAW);
-  t.nNodes = a.nNodes; t.nEdges = a.nEdges;
+  t.nNodes = a.nNodes; t.nEdges = a.nEdges; t.nOwned = a.nOwned; t.segs = a.segs;
   if (t.cpu && G.glx) t.cpu = null;
 }
 function drawGL(order, dim) {
@@ -1312,16 +1335,18 @@ function drawGL(order, dim) {
   gl.viewport(0, 0, G.canvas.width, G.canvas.height);
   gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
   gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
-  // edges
+  // edges (a received edge group is skipped when its owner tile is drawn too)
   gl.useProgram(X.edge);
   gl.uniform3f(X.eu.view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.eu.size, W, H);
+  const drawnKeys = new Set(); for (const t of order) if (t.alpha > 0.5) drawnKeys.add(t.key);
   for (const t of order) {
     if (!t.nEdges) continue;
     gl.uniform1f(X.eu.alpha, t.alpha * (dim ? 0.3 : 1));
     gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.edges);
     gl.enableVertexAttribArray(X.ea.pos); gl.vertexAttribPointer(X.ea.pos, 2, gl.FLOAT, false, 12, 0);
     gl.enableVertexAttribArray(X.ea.col); gl.vertexAttribPointer(X.ea.col, 4, gl.UNSIGNED_BYTE, true, 12, 8);
-    gl.drawArrays(gl.LINES, 0, t.nEdges * 2);
+    if (t.nOwned) gl.drawArrays(gl.LINES, 0, t.nOwned * 2);
+    for (const sg of t.segs || []) if (sg.count && !drawnKeys.has(sg.key)) gl.drawArrays(gl.LINES, sg.start * 2, sg.count * 2);
   }
   // nodes (instanced quads)
   gl.useProgram(X.node);
@@ -1349,7 +1374,10 @@ function draw2D(order, dim) {
     const a = t.cpu || buildTileArrays(t); t.cpu = a;
     ctx.globalAlpha = t.alpha * (dim ? 0.3 : 1);
     const EU = new Uint8Array(a.edges.buffer, a.edges.byteOffset, a.edges.byteLength);
-    for (let e = 0; e < a.nEdges; e++) { const o = e * 24 + 8; ctx.strokeStyle = `rgba(${EU[o]},${EU[o + 1]},${EU[o + 2]},${EU[o + 3] / 255})`; ctx.beginPath(); ctx.moveTo(a.edges[e * 6], a.edges[e * 6 + 1]); ctx.lineTo(a.edges[e * 6 + 3], a.edges[e * 6 + 4]); ctx.stroke(); }
+    const skip = new Uint8Array(a.nEdges);
+    for (const sg of a.segs || []) if (order.some(o => o.key === sg.key && o.alpha > 0.5)) skip.fill(1, sg.start, sg.start + sg.count);
+    for (let e = 0; e < a.nEdges; e++) {
+      if (skip[e]) continue; const o = e * 24 + 8; ctx.strokeStyle = `rgba(${EU[o]},${EU[o + 1]},${EU[o + 2]},${EU[o + 3] / 255})`; ctx.beginPath(); ctx.moveTo(a.edges[e * 6], a.edges[e * 6 + 1]); ctx.lineTo(a.edges[e * 6 + 3], a.edges[e * 6 + 4]); ctx.stroke(); }
     const NU = new Uint8Array(a.nodes.buffer, a.nodes.byteOffset, a.nodes.byteLength);
     for (let i = 0; i < a.nNodes; i++) { const o = i * 16 + 12; ctx.fillStyle = `rgb(${NU[o]},${NU[o + 1]},${NU[o + 2]})`; ctx.beginPath(); ctx.arc(a.nodes[i * 4], a.nodes[i * 4 + 1], Math.max(a.nodes[i * 4 + 2], 1.3 / vp.scale), 0, Math.PI * 2); ctx.fill(); }
   }
@@ -1499,6 +1527,13 @@ function computeHulls() {
   return out.slice(0, 40);
 }
 const LABEL_W = new Map();
+function labelOrderOf(t) {
+  const idx = [...t.names.keys()];
+  const w = (i) => t.lod === 2 ? t.size[i] * 1e6 : t.lod === 1 ? t.size[i] * 1e3 + t.pr[i] : t.pr[i] + (t.kind[i] === 0 ? 1 : 0);
+  idx.sort((a, b) => w(b) - w(a));
+  t.labelW = Float64Array.from(idx, w);
+  return Int32Array.from(idx);
+}
 function drawOver(T, drawn, dim) {
   const ctx = G.over; if (!ctx) return;
   const vp = G.vp, W = G.size.w, H = G.size.h;
@@ -1537,14 +1572,20 @@ function drawOver(T, drawn, dim) {
   // labels: top-N by PageRank among visible named nodes, collision-avoided
   const cap = isPhone() ? 70 : 260, cand = [];
   const v = viewWorld();
+  // Each tile keeps its named nodes pre-sorted by label weight, so a frame
+  // looks at only the best few per tile, not every name of every tile.
+  let nWant = 0; for (const t of drawn) if (G.want.has(t.key)) nWant++;
+  const perTile = Math.max(8, Math.ceil(cap * 3 / Math.max(1, nWant)));
   for (const t of drawn) {
     if (!G.want.has(t.key)) continue;
-    for (const [i, name] of t.names) {
+    const order = t.labelOrder || (t.labelOrder = labelOrderOf(t));
+    let taken = 0;
+    for (let j = 0; j < order.length && taken < perTile; j++) {
+      const i = order[j];
       if (t.x[i] < v.x0 || t.x[i] > v.x1 || t.y[i] < v.y0 || t.y[i] > v.y1) continue;
       if (!nodeVisible(t, i)) continue;
       if (dim && sel !== null && !G.nb.nodes.has(t.ids[i])) continue;
-      const w = t.lod === 2 ? t.size[i] * 1e6 : t.lod === 1 ? t.size[i] * 1e3 + t.pr[i] : t.pr[i] + (t.kind[i] === 0 ? 1 : 0);
-      cand.push([w, t, i, name]);
+      cand.push([t.labelW[j], t, i, t.names.get(i)]); taken++;
     }
   }
   if (sel !== null && G.nb.id === sel) for (const n of G.nb.nodes.values()) { const r = lookup(n.id) || n; if (r.x != null && n.name) cand.push([1e9, null, r, n.name]); }
@@ -1895,8 +1936,8 @@ function renderGraphChrome() {
 function residentTop(limit, pred) {
   const out = [];
   for (const key of G.want) {
-    const t = G.tiles.get(key); if (!t || t.lod !== 0) continue;
-    for (const [i, name] of t.names) { const n = nodeRec(t, i); n.name = name; if (!pred || pred(n)) out.push(n); }
+    const t = G.tiles.get(key); if (!t || t.lod === 2) continue;   // symbols and files (clusters are not selectable)
+    for (const [i, name] of t.names) { const n = nodeRec(t, i); n.name = name; if (t.lod === 1) n.kind = 'File'; if (!pred || pred(n)) out.push(n); }
   }
   out.sort((a, b) => b.pagerank - a.pagerank);
   return limit ? out.slice(0, limit) : out;

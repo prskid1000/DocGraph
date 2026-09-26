@@ -43,7 +43,12 @@ GRID = 1 << MAX_LEVEL
 TILE_BUDGET = 1500        # nodes per tile before a coarser LOD is served
 NAME_BUDGET = 400         # labelled nodes per symbol tile (top PageRank)
 MAGIC = 0x31544744        # "DGT1"
-VERSION = 2
+VERSION = 3
+# File / cluster views aggregate edges; a tile carries at most this many per
+# node, heaviest first (the header says how many there were). Symbol tiles
+# always carry every edge.
+AGG_EDGES_PER_NODE = 6
+AGG_EDGES_MIN = 2000
 LODS = ("sym", "file", "clu")
 NODE_KINDS = ["File", "Class", "Function", "Variable", "Cluster"]
 EDGE_KINDS = ["CONTAINS", "CALLS", "IMPORTS", "IMPORTS_SYMBOL", "INHERITS",
@@ -407,6 +412,13 @@ class TileStore:
             ek = a[f"{lod}_ek"][eidx]
             conf = a[f"{lod}_ec"][eidx].astype(np.float32) / 255.0
             eidx = eidx[(ek != EDGE_KIND_ID["CALLS"]) | (conf >= min_conf)]
+        m_total = len(eidx)
+        if lod != "sym" and len(eidx):
+            cap = max(AGG_EDGES_MIN, AGG_EDGES_PER_NODE * max(1, e - s))
+            if len(eidx) > cap:
+                w = a[f"{lod}_ew"][eidx]
+                keep = np.argpartition(-w.astype(np.int64), cap - 1)[:cap]
+                eidx = np.sort(eidx[keep])
         ea = a[f"{lod}_ea"][eidx].astype(np.int64)
         eb = a[f"{lod}_eb"][eidx].astype(np.int64)
         K = a[f"{lod}_kind"]
@@ -445,8 +457,8 @@ class TileStore:
             noff[1:] = np.cumsum([len(p) for p in pieces])
         nblob = b"".join(pieces)
         gen = int(self.manifest.get("generation", 0))
-        head = struct.pack("<IHBBIIIIIIII", MAGIC, VERSION, LODS.index(lod), level, tx, ty,
-                           n, len(eidx), g, len(pieces), len(nblob), gen & 0xFFFFFFFF)
+        head = struct.pack("<IHBBIIIIIIIII", MAGIC, VERSION, LODS.index(lod), level, tx, ty,
+                           n, len(eidx), g, len(pieces), len(nblob), gen & 0xFFFFFFFF, m_total)
         parts = [head,
                  ID[rows].astype(np.int32).tobytes(),
                  X[rows].tobytes(), Y[rows].tobytes(),

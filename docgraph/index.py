@@ -216,7 +216,7 @@ def walk_files(cfg: Config) -> list[tuple[Path, str]]:
                         continue
                 except OSError:
                     continue
-                kind = classify_file(full)
+                kind = classify_file(full, sniff_known=False)
                 if kind is None:
                     continue
                 if kind.startswith("text:") and not text_fallback:
@@ -300,7 +300,17 @@ def save_cache(cfg: Config, cache: dict[str, dict]) -> None:
 # --- Indexer --------------------------------------------------------------
 
 
+class _InlineExecutor:
+    """Executor.map look-alike that runs in the calling process."""
+
+    @staticmethod
+    def map(fn, items, chunksize: int = 1):
+        return map(fn, list(items))
+
+
 class Indexer:
+    INPROC_PARSE_MAX = 8
+
     def __init__(self, cfg: Config, db: GraphDB, embedder: Embedder | None = None):
         self.cfg = cfg
         self.db = db
@@ -901,7 +911,12 @@ class Indexer:
                     embed_state["last"] = now
                     _emit("embed_entities", embed_state["done"], embed_state["total"])
 
-            with _bar() as prog, ProcessPoolExecutor(max_workers=self.cfg.workers) as ex:
+            # A handful of files (the watcher's usual case) parse in-process:
+            # spawning the pool costs more than the parse.
+            n_workers = max(1, min(int(self.cfg.workers or 1), len(args_all)))
+            pool_cm = (ProcessPoolExecutor(max_workers=n_workers) if len(args_all) > self.INPROC_PARSE_MAX
+                       else contextlib.nullcontext(_InlineExecutor()))
+            with _bar() as prog, pool_cm as ex:
                 ptask = prog.add_task("Parsing files", total=len(changed))
                 etask = prog.add_task("Embedding", total=0)
                 # Executor.map submits eagerly: queueing batch N+1 before
@@ -1158,9 +1173,9 @@ class Indexer:
                     prog_resolve.advance(rtask, len(file_data.get("entities", [])))
                 continue
             # qnames in this file
+            if prog_resolve is not None:
+                prog_resolve.advance(rtask, len(file_data["entities"]))
             for ent_dict in file_data["entities"]:
-                if prog_resolve is not None:
-                    prog_resolve.advance(rtask)
                 qname = ent_dict["qname"]
                 if qname not in qname_index:
                     continue
@@ -1211,9 +1226,11 @@ class Indexer:
         for rel, file_data in cache.items():
             src_changed = rel in changed_set
             al = aliases.get(rel) if scoped else None
+            # one progress tick per file (a Rich update per edge cost ~1 s per
+            # million edges)
+            if prog_resolve is not None:
+                prog_resolve.advance(rtask, len(file_data.get("edges", [])))
             for raw in file_data.get("edges", []):
-                if prog_resolve is not None:
-                    prog_resolve.advance(rtask)
                 kind = raw["kind"]
                 if scoped and not src_changed and kind != "IMPORTS":
                     t = raw.get("target_name") or ""

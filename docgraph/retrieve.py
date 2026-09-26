@@ -1142,6 +1142,14 @@ class Retriever:
         chain plus the call edges between its members (the UI draws them as
         a sequence diagram)."""
         max_chain_len = max(2, min(int(max_chain_len), 12))
+        key = (int(limit), max_chain_len, float(min_confidence))
+        memo = getattr(self, "_processes_memo", None)
+        if memo is None:
+            memo = self._processes_memo = {}
+        if key in memo:            # per Retriever = per index generation
+            return memo[key]
+        if len(memo) > 16:
+            memo.clear()
         out: list[dict] = []
         for e in self._entry_points(limit):
             flow = self._flow_for(e, max_chain_len, min_confidence)
@@ -1150,6 +1158,7 @@ class Retriever:
             out.append(flow)
             if len(out) >= limit:
                 break
+        memo[key] = out
         return out
 
     def flow(self, entry_id: int, max_chain_len: int = 8, min_confidence: float = 0.0) -> dict | None:

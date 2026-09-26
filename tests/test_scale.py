@@ -210,9 +210,9 @@ def test_layout_deterministic_and_non_overlapping():
 
 def _decode(body: bytes) -> dict:
     """Python mirror of the UI's tile decoder (docgraph/ui/index.html parseTile)."""
-    magic, ver, lod, level, tx, ty, n, m, g, k, nb, gen = struct.unpack_from("<IHBBIIIIIIII", body, 0)
-    assert magic == 0x31544744
-    o = 40
+    magic, ver, lod, level, tx, ty, n, m, g, k, nb, gen, m_total = struct.unpack_from("<IHBBIIIIIIIII", body, 0)
+    assert magic == 0x31544744 and m <= m_total
+    o = 44
 
     def arr(dt, c, item=4):
         nonlocal o
@@ -225,7 +225,7 @@ def _decode(body: bytes) -> dict:
         a = np.frombuffer(body, dtype=np.uint8, count=c, offset=o)
         o += (c + 3) & ~3
         return a
-    t = {"lod": lod, "level": level, "tx": tx, "ty": ty}
+    t = {"lod": lod, "level": level, "tx": tx, "ty": ty, "m_total": m_total}
     t["ids"] = arr(np.int32, n); t["x"] = arr(np.float32, n); t["y"] = arr(np.float32, n)
     t["pr"] = arr(np.float32, n); t["size"] = arr(np.uint32, n); t["clu"] = arr(np.int32, n)
     t["kind"] = u8(n); t["flags"] = u8(n)

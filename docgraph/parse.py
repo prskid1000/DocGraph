@@ -1005,7 +1005,7 @@ def decode_text(data: bytes) -> str | None:
         return None
 
 
-def classify_file(path: Path, sniff: bool = True) -> str | None:
+def classify_file(path: Path, sniff: bool = True, sniff_known: bool = True) -> str | None:
     """What the indexer does with a file: a grammar language key, "text:<kind>"
     for the plain-text fallback, or None (skip: binary / unreadable).
 
@@ -1018,7 +1018,9 @@ def classify_file(path: Path, sniff: bool = True) -> str | None:
     if lang is not None:
         return lang
     kind = text_kind_for(path)
-    if not sniff:
+    if not sniff or (kind and not sniff_known):
+        # a known text kind (README, .toml, .ini ...) is decoded at parse time
+        # anyway; only unknown names need the binary sniff up front
         return f"text:{kind or 'text'}"
     try:
         with open(path, "rb") as fh:
