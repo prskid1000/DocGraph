@@ -25,9 +25,9 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **One Kuzu DB per repo, one host process per machine.** `docgraph host` runs the unified server: web UI + JSON API + MCP HTTP + optional watchers, all rooted in a `Workspace` registry that owns per-repo connections. Multi-root via repeatable `--root` flags.
 - **Closed-enum `root` selection.** The host reads its registered slugs at boot and emits the JSON API + MCP tool schemas with a JSON Schema enum. LLMs pick from a known set; protocol rejects typos. Single-root collapses to a one-value default.
 - **40+ tree-sitter grammars** bundled (one pip package each), and **every other text file is indexed too** through the plain-text fallback: configs, docs, `Dockerfile` / `Makefile` / `LICENSE` / `README`, notebooks. See **Languages bundled**.
-- **Scales to very large repos** (tested at 200k functions / 20k files / 1M+ edges): streamed batch indexing, Kuzu HNSW vector + full-text indexes for search, bounded-memory similarity / PageRank / communities, and a graph UI that streams precomputed layout tiles like map chunks. See **Scale**.
+- **Scales to very large repos** (tested at 200k functions / 20k files / 1M+ edges): streamed batch indexing, Kuzu HNSW vector indexes + an in-process BM25 keyword index for search, incremental passes proportional to the change, bounded-memory similarity / PageRank / communities, and a graph UI that streams precomputed layout tiles like map chunks. See **Scale**.
 - **Parallel indexer** — process pool, batched embeddings, bulk Cypher writes.
-- **Per-file delta updates** — sub-second on edits, 0 ms on no-op runs.
+- **Per-file delta updates** — a one-file edit is ~0.3 s end to end even on a 200k-function repo (the host keeps the symbol table, import records and parse cache in memory; the watcher hands over the changed paths), 0 ms on no-op runs.
 - **Optional GPU acceleration** — `docgraph index --gpu` routes embeddings through torch via sentence-transformers. NVIDIA CUDA only; install with the matching torch wheel (`pip install --index-url https://download.pytorch.org/whl/cu130 torch`, or `cu124` / `cpu`). The CUDA wheels bundle their own CUDA + cuDNN runtime so no separate CUDA Toolkit install is needed. Falls back to CPU silently when no GPU is available, and falls back from CUDA to CPU mid-run on driver / OOM errors instead of crashing the host.
 - **Local-only by default** — no telemetry, no cloud round-trips. The only outbound calls are opt-in LLM requests via `--llm-model <name>` (you supply the local server).
 - **Configuration is flags-only.** No `DOCGRAPH_*` environment variables. Every knob is a CLI flag or a `load_config(...)` kwarg, so the spawn surface is fully visible in `ps` / Process Hacker.
@@ -49,7 +49,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
 - **Symbol-level imports + method overrides** — `IMPORTS_SYMBOL` (file → exact Class / Function imported by name) and `OVERRIDES` (child method → parent via the inheritance closure).
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
-- **Indexed search** — candidates come from Kuzu's HNSW vector index and full-text (BM25) index per label, plus an exact-name probe and the parents of the best sub-chunks; RRF fusion, name / PageRank / personalized-PageRank boosts and the optional reranker run on that candidate set only, so a query never loads the whole table. Both extensions are statically linked into Kuzu 0.11: nothing is downloaded, works offline and read-only. Plain-text / config / doc files come back as `File` hits with the matching line and snippet (`kind=file` to search only them).
+- **Indexed search** — candidates come from Kuzu's HNSW vector index per label and DocGraph's own BM25 keyword index (`.docgraph/kw/`, patched per pass), plus an exact-name probe and the parents of the best sub-chunks; RRF fusion, name / PageRank / personalized-PageRank boosts and the optional reranker run on that candidate set only, so a query never loads the whole table. The vector extension is statically linked into Kuzu 0.11: nothing is downloaded, works offline and read-only. Plain-text / config / doc files come back as `File` hits with the matching line and snippet (`kind=file` to search only them).
 - **Diff- and history-aware tools** — `git_changes` (changed entities + 1-hop callers), `git_blame` (line-range blame), `git_recent` (last N commits scoped to a file or repo).
 
 ### Watcher + UI
@@ -89,33 +89,41 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 
 ## Performance
 
+DocGraph's own source tree (46 files, 1,025 entities), host API, RTX 5070 Ti Laptop for embeddings:
+
 | Scenario | Time |
 |---|---|
-| Full index, ~13 files | 6.2s (cold model load) |
-| No-op incremental | 0.01s |
-| Touch only (same hash) | 0.00s |
-| 1-file content edit | 1.3s |
-| New file added | 1.3s |
-| File deleted | 0.23s (no parse needed) |
+| Full index | 11.6 s (cold model load included) |
+| No-op pass | 8 ms (55 ms over HTTP) |
+| 1-file content edit (watcher paths, host) | 0.37-0.5 s |
+| 20-file edit (host) | 1.0-1.4 s |
+| Search over HTTP, p50 / p95 | 43 / 69 ms |
 
-Incremental and full produce identical stats — verified by add/edit/delete cycles.
+Incremental and full produce identical graphs -- `tests/test_live.py` asserts it after add / edit / delete / rename / subclass cycles, for both the host's warm state and a cold CLI run.
 
-### At scale (synthetic repo, schema v4)
+### At scale (synthetic repo, schema v5)
 
-Generated repo: 21,601 files (20,000 Python modules in 400 packages + README / TOML / text files), 200,000 functions, 20,801 classes -> 242,802 graph nodes, 1.02M resolved edges + 200k `SIMILAR_TO` (2.09M edges in the symbol tiles). Windows 11, 24 threads, RTX 5070 Ti Laptop (embeddings, `--gpu`), bge-small-en-v1.5; browser numbers from headless Chrome on the integrated Intel GPU (D3D11) at 1440x900.
+Generated repo: 21,601 files (20,000 Python modules in 400 packages + README / TOML / text files), 200,000 functions, 20,801 classes -> 242,802 graph nodes, 1.02M resolved edges + 200k `SIMILAR_TO` (2.09M edges in the symbol tiles). Windows 11, 24 threads, RTX 5070 Ti Laptop (embeddings, `--gpu`), bge-small-en-v1.5; browser numbers from headless Chrome on the integrated Intel GPU (D3D11; `--use-angle=d3d11` and the RTX preference both land on the iGPU for a headless browser) at 1440x900. "Before" is the v4 release (15c1964) on the same machine and repo; its incremental times are in-process (`Indexer.index_all`), since that release had no warm host state to measure over HTTP.
 
-| Measure | Result |
-|---|---|
-| Full index (`docgraph index --full --gpu --no-history`) | 361 s (parse + embed 187 s, HNSW + FTS index build ~100 s, resolve 12 s, edge writes 15 s, analytics + layout + tiles 27 s) |
-| Peak memory, whole process tree | 5.4 GB (was 13.4 GB, and not finished after 10 min, before the Arrow COPY / lean-worker changes) |
-| Incremental, one file edited (host API) | ~11 s: parse / embed / resolve / insert of the change < 1 s; the rest is repo-wide but vectorised (file scan + 180 MB cache JSON ~3 s, Arrow symbol table ~1 s, set-lookup pass over 1.16M cached edges ~2 s, rank / community patch ~1.3 s, tile rebuild ~2 s) |
-| Search, in-process, p50 / p95 | **136 / 144 ms** (HNSW + FTS candidates) vs **7.8 / 11.4 s** for the old whole-table path on the same DB |
-| Search over HTTP, p50 / p95 | 152 / 169 ms |
-| Tile request, p50 / p95 | 15-45 ms / 26-73 ms per tile (level 0-12); 304 revalidation 41 ms; batch of 12 tiles 234 ms |
-| Tile payload | clusters 4-22 KB, files 64-160 KB, symbols 0.5-300 KB (by level) |
-| Browser: time to first frame | 41 ms after the manifest (327 ms wall from navigation) |
-| Browser: zoom in / out, full-world pan at the symbol level | 60 fps / 54 fps average (worst frame 67 ms); peak 200k resident nodes, 137 MB JS heap, 71 MB transferred, 569 tiles, tile latency p50 35 ms / p95 44 ms |
-| Browser: 115k nodes on screen at once | 56 fps with 318k CALLS edges, 60 fps with 456k structural edges, 12 fps with all 1.28M edges (SIMILAR_TO lines crossing the screen, fill-rate bound on the iGPU); software GL (SwiftShader) is not interactive at that size |
+| Measure | Before | Now |
+|---|---|---|
+| Full index (`docgraph index --full --gpu --no-history`) | 455 s | 369 s |
+| One file edited, host API with the watcher's paths, wall p50 | ~11 s | **0.32 s** (scan 6 ms, harvest 45, delete 25, parse + embed + insert 50, resolve 5, edge write 55, tests 35, rank / community / layout patch 50, persist 20; tiles are patched afterwards on a background thread, ~0.2 s) |
+| One file edited, host API without paths (cached walk) | ~11 s | 0.42 s |
+| 100 files edited, host API | ~41 s | 3.6 s |
+| Cold start to `/api/roots` | 3.1 s | 2.1 s |
+| First search after start | 11.0 s | 2.2-3.1 s (model loads in the background at start) |
+| Search, in-process, p50 / p95 | 138 / 142 ms | 65 / 70 ms (HNSW + in-process BM25 candidates) |
+| First `health` | 7.3-8.5 s | 15 ms (precomputed in the background, 0.85 s; served from `health.json` across restarts) |
+| `trace` / `explore` (3 hops) / `call_graph` (depth 2), p50 | 11.3 s / 7.2 s / 554 ms | 49 / 98 / 53 ms |
+| `context` / `detect_changes` / `processes` (first) / `node_neighbors` | 300 / 272 / 1,570 / 224 ms | 81 / 24 / 151 / 123 ms |
+| Resident memory after the first search (model on GPU) | 2.4 GB | 3.0 GB (+ ~450 MB live incremental state: symbol table, import / reference indexes, a 22 MB compressed parse cache) |
+| Browser: 102k nodes on screen with all 1.43M edges, moving | 16 fps | **59 fps** (worst frame 46 ms); full detail 289 ms after the camera stops |
+| Browser: idle page, animation frames per 2 s | 120 | 7 (draws only on change) |
+| Browser: graph first frame after navigation | 306 ms | 302 ms (tile decode in a worker) |
+| Tile payload over the wire | clusters 4-22 KB, files 64-160 KB, symbols 0.5-300 KB | same bytes; unchanged tiles keep their ETag across passes, `batch?have=` answers them empty |
+
+All MCP tools on the same repo (first call / p50, in-process): search 782 / 65 ms, definition 36 / 33, references 45 / 49, call_graph 55 / 53, file_map 30 / 30, neighborhood 92 / 92, explore 587 / 98, impact_of 146 / 136, test_impact 54 / 52, git_changes 27 / 21, git_blame 23 / 21, git_recent 22 / 21, rules_for < 1, cypher 1, context 95 / 81, detect_changes 35 / 24, repo_map 158 / 157, list_clusters 147 / 0 (memoised), cluster 243 / 99, route_map 49 / 48, trace 350 / 49, health 848 / 0, symbol_history 91 / 86, processes 151 / 0, index_info 2 / 1, graph_dump(2000) 847 / 0, files 27 / 25, node_neighbors 120 / 123. On the host the per-generation caches behind the first calls (call graph CSR, node payload table) are prewarmed.
 
 Regenerate: the benchmark scripts are not part of the package; the method is `docgraph index --full --gpu` on a generated repo, `docgraph host --port <spare>` for the HTTP / browser numbers.
 
@@ -458,12 +466,13 @@ Adding a language: `pip install tree-sitter-<lang>`, then add `EXT_TO_LANG` (or 
 Target: 200k+ functions, 1M+ edges, 20k+ files on one machine.
 
 - **Indexing** streams files in batches (`--index-batch-files`): parse (process pool; workers import tree-sitter only), embed on the GPU, bulk-load nodes with Kuzu `COPY FROM` Arrow, then the next batch -- one batch of bodies / vectors in memory at a time. Kuzu's buffer pool is bounded (a quarter of RAM, at most 4 GB).
-- **Search** uses Kuzu HNSW + FTS indexes (created once after a full load, maintained by Kuzu on every incremental insert / delete).
+- **Search** uses Kuzu HNSW indexes on side tables (`FnVec` / `ClsVec` / `ChunkVec`, created once after a full load; on the host new vectors are inserted by background maintenance and scored from memory until then) and the BM25 keyword index in `.docgraph/kw/` (Kuzu FTS was dropped: in 0.11 deleting a row inserted after the index was built crashes the process).
 - **SIMILAR_TO** never builds an n x n matrix: exact row blocks for small tables, IVF lists (k-means on a sample, oversized lists split) for big ones; incremental passes query the HNSW index per changed entity.
 - **PageRank** is a scipy sparse power iteration over Arrow edge arrays; **communities** aggregate in numpy and fold symbols into files (above 60k nodes) and files into directories (above 60k files) before Louvain.
 - **Layout + tiles**: a deterministic hierarchical world layout (symbols on a spiral inside their file, files inside their cluster, clusters in the world) is stored in Kuzu (`x`, `y`) and cut into the `.docgraph/tiles/` sidecar: every level of detail sorted by Morton code so any quadtree tile is one contiguous range; edges stored once (lower-id endpoint) plus a reverse index so a tile also serves the edges it receives.
 - **Incremental passes stay O(change)** where it matters: only edges that can reach a changed file are resolved, positions of unchanged files never move, and graphs above `--full-recompute-max-nodes` patch PageRank / communities for the changed files until `--recompute-drift` of the files changed.
-- Request paths that used to scan everything are indexed, bounded or cached per index generation (`graph_dump`, `stats`, `list_clusters`, `repo_map`, `health`, `detect_changes`' in-memory call graph).
+- Request paths that used to scan everything are indexed, bounded or cached per index generation (`graph_dump`, `stats`, `list_clusters`, `repo_map`, `health`, `processes`). Multi-hop tools (`impact_of`, `test_impact`, `call_graph`, `processes`, `route_map`, `api_impact`, `detect_changes`, `trace`) walk an in-memory CSR of the call graph with numpy instead of one query per hop.
+- **Host maintenance**: after a pass the host answers at once; SIMILAR_TO for new entities, the global PageRank / communities / layout pass, vector inserts, keyword-index compaction and the health report run on a low-priority background thread once the repo has been quiet for 3 s. `health` serves the previous report marked `refreshing: true` meanwhile.
 
 ## Architecture
 
@@ -480,12 +489,14 @@ docgraph/
   similar.py         # bounded-memory SIMILAR_TO (blocked exact / IVF)
   layout.py          # deterministic hierarchical world layout
   tiles.py           # LOD tile sidecar: build + binary tile server
-  retrieve.py        # hybrid retrieval (HNSW + FTS candidates, RRF, boosts) + analysis tools
+  retrieve.py        # hybrid retrieval (HNSW + BM25 candidates, RRF, boosts) + analysis tools
+  live.py            # host-resident incremental state: sharded parse cache, symbol table, import / reference indexes, scan
+  kwindex.py         # BM25 keyword index (CSR base + delta, compaction)
+  graphalgo.py       # sampled betweenness + bounded cycle search for health()
   resolve.py         # call-resolution confidence cascade
   frameworks.py      # HTTP route + MCP tool detection (table-driven)
   communities.py     # Louvain communities
   insights.py        # diff parsing, risk scoring, token budgets, repo-map rendering
-  merkle.py          # file-hash tree for fast scans
   history.py         # git blame symbol history
   scip.py            # optional SCIP ingest (built-in protobuf decoder)
   agent_setup.py     # `docgraph agent-setup` + hook runtime
@@ -503,8 +514,10 @@ docgraph/
 
 Data lives at `<repo>/.docgraph/`:
 - `graph.kuzu/` — the embedded DB
-- `cache.json` — per-file `{hash, entities, edges}` for delta updates
-- `merkle.json` — per-file `(size, mtime, sha1)` + directory hashes (the file-hash tree; a cache, safe to delete)
+- `cache/` — per-file `{hash, size, mtime, entities, edges}` for delta updates, in 1024 binary shards (only changed shards are rewritten; a cache, safe to delete -- the next pass is then a full one)
+- `kw/` — the BM25 keyword index (derived; rebuilt by a full pass)
+- `pending_vectors/` — host only: vectors of the last passes not yet inserted into the HNSW index
+- `health.json` — the last health report (served while a new one is computed)
 - `state.json` — schema version, git heads, resolution stats, embedding-cache hits, SCIP status, history bookkeeping, removed symbols
 - `wiki/` — generated module pages
 - `llm_docstrings.json` — body-hash-keyed cache of generated docstrings
@@ -514,15 +527,15 @@ Data lives at `<repo>/.docgraph/`:
 
 ## How incremental works
 
-0. If `state.json["schema_version"]` differs from the code's schema version, run a full reindex once (**upgrading to schema v4 -- text fallback, search indexes, layout, tiles -- triggers this automatically on the next index run**).
-1. Walk repo; hash files through the file-hash tree (`.docgraph/merkle.json`): a file whose size + mtime match the last scan reuses its hash without being read; directory hashes form a Merkle tree so unchanged subtrees are known.
+0. If `state.json["schema_version"]` differs from the code's schema version, run a full reindex once (**upgrading to schema v5 -- vector side tables, keyword index, sharded cache -- triggers this automatically on the next index run**).
+1. Find the changed files. With the watcher (or `POST /api/admin/index` with `paths`) only those paths are classified -- no walk (a full walk still re-validates every 10 min). Otherwise the walk reuses cached ignore decisions and compares size + mtime from the directory listing with the cache; only files whose stat differs are read and hashed.
 2. Bucket files into **changed / added / deleted / unchanged**.
-3. Harvest the embeddings of the nodes about to be deleted (keyed by content hash), then `DETACH DELETE` only changed/deleted files' nodes — Kuzu drops incident edges in the same step.
-4. Re-parse only changed/added files in a process pool; `git blame` them for symbol history.
-5. Continue ID allocation from `max(id) + 1` in the DB. Entities whose content hash was harvested (moved / renamed / re-parsed but identical) reuse their vector instead of being re-embedded.
-6. Re-resolve only edges that touch a changed file through the confidence cascade: edges of changed files, plus edges of unchanged files whose target name (directly, through an import alias, or by the fuzzy underscore-insensitive key) names an entity of a changed file. Edges fully inside the unchanged set are not even resolved (so a new same-named symbol elsewhere does not retro-actively re-resolve an unchanged caller until a full reindex).
-7. `SIMILAR_TO` / `TESTS` for the changed entities only (HNSW queries); `CO_CHANGED_WITH` when HEAD moved. PageRank and communities are recomputed globally for graphs up to `--full-recompute-max-nodes`; bigger graphs patch the changed files until `--recompute-drift`.
-8. Layout: unchanged files keep their position; a changed file keeps its previous centre (a new one is placed next to its neighbours / cluster) and its symbols re-spiral around it. The tile sidecar is rebuilt, so tiles outside the change are byte-identical and stay valid in the browser cache.
+3. Harvest what is about to be deleted: embeddings (keyed by content hash) and the incoming edges from unchanged files. Then `DETACH DELETE` the changed / deleted files' nodes by id.
+4. Re-parse only changed / added files (in-process for a handful, a process pool for more); `git blame` them for symbol history.
+5. Continue ID allocation; entities whose content hash was harvested reuse their vector instead of being re-embedded. On the host the new vectors go to background maintenance (search scores them from memory meanwhile).
+6. Resolve edges through the confidence cascade, scoped per file: every edge of a changed file; unchanged files whose imports resolve differently (a file they import appeared / disappeared) are re-resolved whole; unchanged files naming a symbol whose candidate set changed are re-resolved for that name; edges of unchanged callers into symbols that were only re-created are re-pointed to the new ids. The symbol table, import records and name -> referencing-files index are updated per file, never rebuilt.
+7. `TESTS` for the changed entities, `CO_CHANGED_WITH` when HEAD moved. PageRank, communities and the layout are patched for the changed files; the global recompute (`--full-recompute-max-nodes`, `--recompute-drift`) and `SIMILAR_TO` for new entities run in the pass on the CLI and in background maintenance on the host.
+8. Layout: unchanged files keep their position; a changed file keeps its previous centre (a new one is placed next to its neighbours / cluster) and its symbols re-spiral around it. The tile sidecar is patched from the pass's edge journal (all levels, ~0.2 s at 2M edges), so tiles outside the change keep their bytes and their ETag and stay valid in the browser cache.
 
 ## JSON API (when running `docgraph host`)
 
@@ -609,10 +622,10 @@ In multi-repo mode, file paths are prefixed with each repo's basename (`repo-b/s
 
 ```bash
 pip install pytest
-pytest -p no:cacheprovider   # ~410 tests
+pytest -p no:cacheprovider   # ~425 tests
 ```
 
-Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, Variable round-trip + delete cascade, the `Workspace` registry's `resolve()` + writer-lock round-trip, the GPU→CPU embedder fallback on a poisoned ORT session, every CLI flag telecode passes, the document/asset pass, and the env-free contract (`DOCGRAPH_*` env vars must not affect Config). `tests/test_graph_features.py` covers schema v3 on a second fixture repo (`tests/fw_fixture.py`: FastAPI / Flask / aiohttp / Express routes, MCP tools, an ambiguous call, an external receiver, an import cycle, dead code, two commits and a synthetic SCIP index): confidence tiers, candidates, communities, routes, context, detect_changes, repo_map, trace, health, history, rename (plan + line-verified apply), MCP resources/prompts, every new REST route, and the embedding cache + file-hash tree + removed-symbol tracking across incremental runs. `tests/test_languages.py` has one fixture per grammar; `tests/test_scale.py` covers the text fallback, notebooks, the indexed search and its brute-force fallback, bounded similarity, PageRank, community folding, the layout, the tile format + endpoints, and the incremental layout / resolution scope.
+Covers indexer correctness, per-file delta updates, all retrieval methods, every MCP tool (registered + invoked), every HTTP API route (incl. `.cursorignore` redaction + cypher write-blocker), multi-repo walking, watch filter logic, the embedding-text builder, Variable round-trip + delete cascade, the `Workspace` registry's `resolve()` + writer-lock round-trip, the GPU→CPU embedder fallback on a poisoned ORT session, every CLI flag telecode passes, the document/asset pass, and the env-free contract (`DOCGRAPH_*` env vars must not affect Config). `tests/test_graph_features.py` covers schema v3 on a second fixture repo (`tests/fw_fixture.py`: FastAPI / Flask / aiohttp / Express routes, MCP tools, an ambiguous call, an external receiver, an import cycle, dead code, two commits and a synthetic SCIP index): confidence tiers, candidates, communities, routes, context, detect_changes, repo_map, trace, health, history, rename (plan + line-verified apply), MCP resources/prompts, every new REST route, and the embedding cache + scan cache + removed-symbol tracking across incremental runs. `tests/test_languages.py` has one fixture per grammar; `tests/test_scale.py` covers the text fallback, notebooks, the indexed search and its brute-force fallback, bounded similarity, PageRank, community folding, the layout, the tile format + endpoints, and the incremental layout / resolution scope. `tests/test_live.py` checks incremental == full across edit series, watcher paths, the kept parse pool, stage timings and the keyword index; `tests/test_host_live.py` the host pass with deferred vectors / tiles and maintenance; `tests/test_tool_paths.py` the in-memory tool paths (CSR walks, node payload table, explore) against Cypher references.
 
 Live LLM tests (`tests/test_llm_live.py`) auto-skip unless an OpenAI-compatible server is reachable at `localhost:1235` with `qwen3.6-35b` loaded.
 
