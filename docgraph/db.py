@@ -4,6 +4,7 @@ Schema covers all Tier 1-4 relationships.
 """
 from __future__ import annotations
 
+import re
 import shutil
 from contextlib import contextmanager
 from pathlib import Path
@@ -48,7 +49,6 @@ NODE_DDL = [
         body STRING,
         kind STRING,
         llm_doc STRING,
-        embedding FLOAT[{dim}],
         pagerank DOUBLE,
         ehash STRING,
         terms STRING,
@@ -72,7 +72,6 @@ NODE_DDL = [
         is_method BOOLEAN,
         is_test BOOLEAN,
         llm_doc STRING,
-        embedding FLOAT[{dim}],
         pagerank DOUBLE,
         ehash STRING,
         terms STRING,
@@ -106,13 +105,19 @@ NODE_DDL = [
         file STRING,
         idx INT64,
         body STRING,
-        embedding FLOAT[{dim}],
         ehash STRING,
         line_start INT64,
         line_end INT64,
         terms STRING,
         PRIMARY KEY (id)
     )""",
+    # Embeddings (schema v5) live in side tables keyed by the entity's id,
+    # carrying the HNSW index: an entity row is written without paying the
+    # vector-index insertion (~5 ms per row on a 200k-row index), and the host
+    # adds the vectors in the background (Indexer.vector_sink).
+    """CREATE NODE TABLE IF NOT EXISTS FnVec(id INT64, embedding FLOAT[{dim}], PRIMARY KEY (id))""",
+    """CREATE NODE TABLE IF NOT EXISTS ClsVec(id INT64, embedding FLOAT[{dim}], PRIMARY KEY (id))""",
+    """CREATE NODE TABLE IF NOT EXISTS ChunkVec(id INT64, embedding FLOAT[{dim}], PRIMARY KEY (id))""",
     # Server-side communities (Louvain over the resolved call/type graph).
     # Wiped + recomputed on every index pass that dirties the graph, like
     # PageRank. `top_members` / `files` are JSON-encoded lists.
@@ -193,7 +198,7 @@ EDGE_DDL = [
 # forces a full reindex on mismatch (an incremental run over an old-shape
 # DB would leave pre-upgrade edges without confidence, nodes without
 # ehash, etc.).
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # Columns added after the first public schema. `migrate()` ALTERs them onto
 # an existing DB opened read-write so an old DB never hard-errors on a new
@@ -270,6 +275,23 @@ def _default_buffer_pool() -> int:
 BUFFER_POOL_SIZE = _default_buffer_pool()
 
 
+_PK_IN = re.compile(r"\b([A-Za-z_]\w*)\.id IN \$ids\b")
+_PK_EQ = re.compile(r"\b([A-Za-z_]\w*)\.id = \$id\b")
+
+
+class EdgeJournal:
+    """What an incremental pass changed in the graph, for patching derived
+    data (the tile sidecar) without re-reading the whole graph:
+    ("add", rel, from_ids, to_ids, conf), ("del_pairs", rel, a, b),
+    ("del_out", rel, src_ids), ("del_kind", rel), ("del_nodes", ids)."""
+
+    def __init__(self) -> None:
+        self.ops: list[tuple] = []
+
+    def __len__(self) -> int:
+        return len(self.ops)
+
+
 class GraphDB:
     def __init__(self, db_path: Path, embedding_dim: int = 384, read_only: bool = False):
         self.db_path = Path(db_path)
@@ -283,7 +305,12 @@ class GraphDB:
         # `insert_nodes` extends the cache so freshly inserted nodes are seen.
         self._known_ids: dict[str, set[int]] = {}
         self._props_cache: dict[str, set[str]] = {}
+        self._col_types: dict[str, dict[str, str]] = {}
         self.read_only = read_only
+        self.journal: EdgeJournal | None = None
+        # vector_sink(label, [{id, embedding}]) takes the vectors of inserted
+        # entities instead of writing them now (the host defers them)
+        self.vector_sink = None
         # Per-thread side connections (see thread_conn) for concurrent reads.
         import threading as _th
         self._tls = _th.local()
@@ -371,26 +398,32 @@ class GraphDB:
     def upgrade_calls(self, rows: list[dict]) -> int:
         """Raise existing CALLS edges to a precise confidence/method (SCIP).
         rows: [{a, b, confidence, method}]. Returns the number of rows sent."""
+        import importlib.util  # noqa: F401
         if not rows:
             return 0
+        up_arrow = pa.table({  # noqa: F841 - referenced by name in the query
+            "_a": pa.array([int(r["a"]) for r in rows], pa.int64()),
+            "_b": pa.array([int(r["b"]) for r in rows], pa.int64()),
+            "_c": pa.array([float(r["confidence"]) for r in rows], pa.float64()),
+            "_m": pa.array([str(r["method"]) for r in rows], pa.string()),
+        })
         self.execute(
-            "UNWIND $rows AS row "
-            "MATCH (a:Function {id: row.a})-[r:CALLS]->(b:Function {id: row.b}) "
-            "SET r.confidence = row.confidence, r.method = row.method",
-            {"rows": rows},
-        )
+            "LOAD FROM up_arrow WITH _a AS _a, _b AS _b, _c AS _c, _m AS _m "
+            "MATCH (a:Function)-[r:CALLS]->(b:Function) WHERE a.id = _a AND b.id = _b "
+            "SET r.confidence = _c, r.method = _m")
         return len(rows)
 
     def set_history(self, label: str, rows: list[dict]) -> None:
         """Update history columns in place: rows [{id, fc, fts, lc, lts}]."""
+        import numpy as np
         if not rows:
             return
-        self.execute(
-            f"UNWIND $rows AS row MATCH (n:{label} {{id: row.id}}) "
-            f"SET n.first_seen_commit = row.fc, n.first_seen_ts = row.fts, "
-            f"n.last_changed_commit = row.lc, n.last_changed_ts = row.lts",
-            {"rows": rows},
-        )
+        self.set_node_values(label, np.array([r["id"] for r in rows], np.int64), {
+            "first_seen_commit": np.array([r["fc"] for r in rows], dtype=object),
+            "first_seen_ts": np.array([int(r["fts"]) for r in rows], np.int64),
+            "last_changed_commit": np.array([r["lc"] for r in rows], dtype=object),
+            "last_changed_ts": np.array([int(r["lts"]) for r in rows], np.int64),
+        })
 
     def community_graph(self) -> tuple[dict[int, dict], list[tuple[int, int, float]]]:
         """Nodes + weighted edges for community detection (communities.py)."""
@@ -419,21 +452,6 @@ class GraphDB:
             edges.append((r["a"], r["b"], 0.3))
         return nodes, edges
 
-    def embeddings_in_files(self, label: str, files: list[str]) -> dict[str, list]:
-        """{ehash: embedding} for every node of `label` in `files` -- the
-        pre-delete harvest of the embedding cache."""
-        if not files or "ehash" not in self.table_props(label):
-            return {}
-        out: dict[str, list] = {}
-        for r in self.fetch_all(
-            f"MATCH (n:{label}) WHERE n.file IN $files AND n.ehash IS NOT NULL "
-            f"RETURN n.ehash AS h, n.embedding AS e",
-            {"files": files},
-        ):
-            if r.get("h") and r.get("e") is not None:
-                out.setdefault(r["h"], r["e"])
-        return out
-
     def entity_spans(self, files: list[str]) -> list[dict]:
         """[{label, id, file, s, e}] for Function/Class nodes in `files`."""
         out: list[dict] = []
@@ -449,18 +467,6 @@ class GraphDB:
                 out.append(r)
         return out
 
-    def framework_nodes(self) -> dict[tuple[str, int, str], tuple[str, int]]:
-        """{(file, line, name): (label, id)} for existing Route/Tool nodes."""
-        out: dict[tuple[str, int, str], tuple[str, int]] = {}
-        for label in ("Route", "Tool"):
-            if not self.has_table(label):
-                continue
-            for r in self.fetch_all(
-                f"MATCH (n:{label}) RETURN n.id AS id, n.file AS file, n.line AS line, n.name AS name"
-            ):
-                out[(r["file"], int(r["line"] or 0), r["name"])] = (label, r["id"])
-        return out
-
     def embeddings_by_ehash(self, label: str, hashes: list[str],
                             files: list[str] | None = None) -> dict[str, list]:
         """Existing vectors for content hashes (the embedding cache). With
@@ -468,21 +474,22 @@ class GraphDB:
         harvest); otherwise the whole table."""
         if not hashes or "ehash" not in self.table_props(label):
             return {}
-        out: dict[str, list] = {}
         if files is not None:
             q = (f"MATCH (n:{label}) WHERE n.file IN $files AND n.ehash IS NOT NULL "
-                 f"RETURN n.ehash AS h, n.embedding AS e")
+                 f"RETURN n.id AS id, n.ehash AS h")
             params: dict = {"files": files}
         else:
-            q = (f"MATCH (n:{label}) WHERE n.ehash IN $hs "
-                 f"RETURN n.ehash AS h, n.embedding AS e")
+            q = f"MATCH (n:{label}) WHERE n.ehash IN $hs RETURN n.id AS id, n.ehash AS h"
             params = {"hs": hashes}
         want = set(hashes)
+        seen: set[str] = set()
+        pairs = []
         for r in self.fetch_all(q, params):
             h = r.get("h")
-            if h in want and h not in out and r.get("e") is not None:
-                out[h] = r["e"]
-        return out
+            if h in want and h not in seen:
+                seen.add(h)
+                pairs.append((int(r["id"]), h))
+        return self._vectors_by_hash_rows(label, pairs)
 
     # ---- search indexes (Kuzu's statically linked vector + FTS extensions) ----
     #
@@ -495,6 +502,18 @@ class GraphDB:
     # already does.
 
     VECTOR_INDEXES = {"Function": "fn_vec", "Class": "cls_vec", "Chunk": "chunk_vec"}
+    VEC_TABLES = {"Function": "FnVec", "Class": "ClsVec", "Chunk": "ChunkVec"}
+
+    def vec_table(self, label: str) -> str:
+        """Table holding `label`'s embeddings: the side table (schema v5),
+        else the entity table itself (an older database)."""
+        t = self.VEC_TABLES.get(label)
+        if t and self.has_table(t):
+            return t
+        return label
+    # Kuzu FTS indexes of schema v4. Not created any more (deleting a row
+    # inserted after an FTS index was built crashes Kuzu 0.11; keywords are
+    # served by docgraph.kwindex) -- only dropped when found.
     FTS_INDEXES = {"Function": ("fn_fts", ["name", "terms", "body"]),
                    "Class": ("cls_fts", ["name", "terms", "body"]),
                    "Chunk": ("chunk_fts", ["terms", "body"])}
@@ -514,42 +533,34 @@ class GraphDB:
         return out
 
     def ensure_search_indexes(self, on_progress: "Callable[[str], None] | None" = None) -> dict:
-        """Create any missing vector / FTS index. Returns a status dict
-        {vector: {label: ok|error}, fts: {label: ok|error}}; never raises."""
+        """Create any missing vector index (and drop legacy FTS indexes).
+        Returns {vector: {label: ok|error}, fts: {label: "kwindex"}}; never
+        raises."""
         have = self.list_indexes()
         status: dict[str, dict[str, str]] = {"vector": {}, "fts": {}}
         for label, name in self.VECTOR_INDEXES.items():
             if name in have:
                 status["vector"][label] = "ok"
                 continue
-            if "embedding" not in self.table_props(label):
+            vt = self.vec_table(label)
+            if "embedding" not in self.table_props(vt):
                 status["vector"][label] = "missing column"
                 continue
             if on_progress:
                 on_progress(f"vector index {label}")
             try:
-                self.execute(f"CALL CREATE_VECTOR_INDEX('{label}', '{name}', 'embedding', "
+                self.execute(f"CALL CREATE_VECTOR_INDEX('{vt}', '{name}', 'embedding', "
                              f"metric := 'cosine')")
                 status["vector"][label] = "ok"
             except Exception as exc:  # noqa: BLE001 - search falls back to brute force
                 status["vector"][label] = f"error: {exc}"
-        for label, (name, props) in self.FTS_INDEXES.items():
-            if name in have:
-                status["fts"][label] = "ok"
-                continue
-            tp = self.table_props(label)
-            cols = [p for p in props if p in tp]
-            if not cols:
-                status["fts"][label] = "missing column"
-                continue
-            if on_progress:
-                on_progress(f"fts index {label}")
-            try:
-                cols_sql = ", ".join(f"'{c}'" for c in cols)
-                self.execute(f"CALL CREATE_FTS_INDEX('{label}', '{name}', [{cols_sql}])")
-                status["fts"][label] = "ok"
-            except Exception as exc:  # noqa: BLE001
-                status["fts"][label] = f"error: {exc}"
+        for label, (name, _props) in self.FTS_INDEXES.items():
+            if name in have:            # a v4 database: drop it, see FTS_INDEXES
+                try:
+                    self.execute(f"CALL DROP_FTS_INDEX('{label}', '{name}')")
+                except Exception:
+                    pass
+            status["fts"][label] = "kwindex"
         return status
 
     def drop_search_indexes(self) -> None:
@@ -557,7 +568,7 @@ class GraphDB:
         for label, name in self.VECTOR_INDEXES.items():
             if name in have:
                 try:
-                    self.execute(f"CALL DROP_VECTOR_INDEX('{label}', '{name}')")
+                    self.execute(f"CALL DROP_VECTOR_INDEX('{have[name].get('table') or self.vec_table(label)}', '{name}')")
                 except Exception:
                     pass
         for label, (name, _p) in self.FTS_INDEXES.items():
@@ -573,19 +584,9 @@ class GraphDB:
         v = vec.tolist() if hasattr(vec, "tolist") else list(vec)
         opt = f", efs := {int(efs)}" if efs else ""
         rows = self.fetch_all(
-            f"CALL QUERY_VECTOR_INDEX('{label}', '{name}', $v, {int(k)}{opt}) "
+            f"CALL QUERY_VECTOR_INDEX('{self.vec_table(label)}', '{name}', $v, {int(k)}{opt}) "
             f"RETURN node.id AS id, distance AS d", {"v": v})
         return [(int(r["id"]), 1.0 - float(r["d"])) for r in rows]
-
-    def fts_topk(self, label: str, query: str, k: int) -> list[tuple[int, float]]:
-        """[(id, bm25_score)] best-first via Kuzu FTS (disjunctive)."""
-        name = self.FTS_INDEXES[label][0]
-        if not query.strip():
-            return []
-        rows = self.fetch_all(
-            f"CALL QUERY_FTS_INDEX('{label}', '{name}', $q, conjunctive := false, top := {int(k)}) "
-            f"RETURN node.id AS id, score AS s ORDER BY s DESC LIMIT {int(k)}", {"q": query})
-        return [(int(r["id"]), float(r["s"])) for r in rows]
 
     # ---- columnar reads / bulk updates for the graph analytics ------------
     # Everything below returns numpy arrays through Arrow, so a 1M-edge graph
@@ -643,7 +644,7 @@ class GraphDB:
     def embedding_matrix(self, label: str):
         """(ids int64, float32 matrix) of every row that has an embedding."""
         import numpy as np
-        t = self.fetch_arrow(f"MATCH (n:{label}) WHERE n.embedding IS NOT NULL "
+        t = self.fetch_arrow(f"MATCH (n:{self.vec_table(label)}) WHERE n.embedding IS NOT NULL "
                              f"RETURN n.id AS id, n.embedding AS e")
         ids = t.column("id").to_numpy().astype(np.int64)
         if len(ids) == 0:
@@ -659,15 +660,16 @@ class GraphDB:
             return np.zeros(0, np.int64), np.zeros((0, self.embedding_dim), np.float32)
         # No `embedding IS NOT NULL` predicate: Kuzu would then read the
         # embedding column of every row of the scan, not just the matches.
+        vt = self.vec_table(label)
         if len(ids) <= 2000:   # small sets: the row path beats Arrow's list conversion
             rows = [r for r in self.fetch_all(
-                f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.embedding AS e",
+                f"MATCH (n:{vt}) WHERE n.id IN $ids RETURN n.id AS id, n.embedding AS e",
                 {"ids": [int(i) for i in ids]}) if r.get("e") is not None]
             if not rows:
                 return np.zeros(0, np.int64), np.zeros((0, self.embedding_dim), np.float32)
             return (np.array([r["id"] for r in rows], dtype=np.int64),
                     np.array([r["e"] for r in rows], dtype=np.float32))
-        t = self.fetch_arrow(f"MATCH (n:{label}) WHERE n.id IN $ids "
+        t = self.fetch_arrow(f"MATCH (n:{vt}) WHERE n.id IN $ids "
                              f"RETURN n.id AS id, n.embedding AS e", {"ids": [int(i) for i in ids]})
         got = t.column("id").to_numpy().astype(np.int64)
         if len(got) == 0:
@@ -683,22 +685,40 @@ class GraphDB:
         return got, mat.reshape(len(got), -1)
 
     def set_node_values(self, label: str, ids, cols: dict[str, "np.ndarray"],
-                        batch: int = 50_000) -> int:
-        """Bulk `SET n.<col> = value` by primary key, batched UNWINDs."""
+                        batch: int = 500_000) -> int:
+        """Bulk `SET n.<col> = value` by primary key.
+
+        `LOAD FROM <arrow> ... MATCH (n) WHERE n.id = i SET ...` plans as a
+        hash join: 250k updates take ~0.3 s, where `UNWIND $rows MATCH (n
+        {id: row.id}) SET` took ~9 s per 50k (one PK probe + Python->Kuzu
+        conversion per row)."""
+        import importlib.util  # noqa: F401 - kuzu's Arrow scan needs it imported
         import numpy as np
         ids = np.asarray(ids, dtype=np.int64)
         if len(ids) == 0:
             return 0
         names = list(cols)
-        sets = ", ".join(f"n.{c} = row.{c}" for c in names)
-        q = f"UNWIND $rows AS row MATCH (n:{label} {{id: row.id}}) SET {sets}"
+        sets = ", ".join(f"n.{c} = _v_{c}" for c in names)
+        withs = ", ".join(["_i AS _i"] + [f"_v_{c} AS _v_{c}" for c in names])
+        q = (f"LOAD FROM set_arrow WITH {withs} "
+             f"MATCH (n:{label}) WHERE n.id = _i SET {sets}")
         vals = {c: np.asarray(v) for c, v in cols.items()}
-        for s in range(0, len(ids), batch):
-            sl = slice(s, s + batch)
-            cols_py = {c: vals[c][sl].tolist() for c in names}
-            rows = [{"id": int(i), **{c: cols_py[c][j] for c in names}}
-                    for j, i in enumerate(ids[sl].tolist())]
-            self.execute(q, {"rows": rows})
+        for s0 in range(0, len(ids), batch):
+            sl = slice(s0, s0 + batch)
+            data = {"_i": pa.array(ids[sl], pa.int64())}
+            for c in names:
+                v = vals[c][sl]
+                if v.dtype.kind == "f":
+                    data[f"_v_{c}"] = pa.array(v.astype(np.float64), pa.float64())
+                elif v.dtype.kind in "iu":
+                    data[f"_v_{c}"] = pa.array(v.astype(np.int64), pa.int64())
+                elif v.dtype.kind == "b":
+                    data[f"_v_{c}"] = pa.array(v, pa.bool_())
+                else:
+                    data[f"_v_{c}"] = pa.array([None if x is None else str(x) for x in v.tolist()],
+                                               pa.string())
+            set_arrow = pa.table(data)  # noqa: F841 - referenced by name in the query
+            self.execute(q)
         return len(ids)
 
     def memberships(self):
@@ -724,28 +744,6 @@ class GraphDB:
         if "x" in self.table_props("Community"):
             cols += ", c.x AS x, c.y AS y, c.r AS r"
         return self.fetch_all(f"MATCH (c:Community) RETURN {cols}")
-
-    def positions_in_files(self, files: list[str]) -> tuple[dict, dict]:
-        """Pre-delete harvest of layout positions: ({qname: (x, y, pagerank)},
-        {path: (x, y)}) for the nodes of `files`."""
-        by_q: dict[str, tuple] = {}
-        by_p: dict[str, tuple] = {}
-        if not files or "x" not in self.table_props("File"):
-            return by_q, by_p
-        for r in self.fetch_all("MATCH (f:File) WHERE f.path IN $f AND f.x IS NOT NULL "
-                                "RETURN f.path AS p, f.x AS x, f.y AS y", {"f": files}):
-            by_p[r["p"]] = (float(r["x"]), float(r["y"]))
-        for label in ("Function", "Class"):
-            for r in self.fetch_all(
-                    f"MATCH (n:{label}) WHERE n.file IN $f AND n.x IS NOT NULL "
-                    f"RETURN n.qname AS q, n.x AS x, n.y AS y, coalesce(n.pagerank, 0.0) AS pr",
-                    {"f": files}):
-                by_q[r["q"]] = (float(r["x"]), float(r["y"]), float(r["pr"] or 0.0))
-        for r in self.fetch_all(
-                "MATCH (n:Variable) WHERE n.file IN $f AND n.x IS NOT NULL "
-                "RETURN n.qname AS q, n.x AS x, n.y AS y", {"f": files}):
-            by_q[r["q"]] = (float(r["x"]), float(r["y"]), 0.0)
-        return by_q, by_p
 
     def layout_source(self):
         """Arrays for layout / tiles: every File/Class/Function/Variable with
@@ -794,6 +792,238 @@ class GraphDB:
                 "line": num("line", np.float64), "pr": num("pr", np.float64),
                 "test": num("t", np.float64) > 0, "x": num("x", np.float64), "y": num("y", np.float64)}
 
+    # ---- live-index helpers (all by primary key / id lists) ---------------
+
+    def symbol_rows(self) -> list[tuple[str, int, str, str, str]]:
+        """[(label, id, name, qname, file)] of every Function / Class /
+        Variable, in id order (= parse order)."""
+        out: list[tuple[str, int, str, str, str]] = []
+        for label in ("Function", "Class", "Variable"):
+            t = self.fetch_arrow(f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, "
+                                 f"n.qname AS q, n.file AS f")
+            if t.num_rows == 0:
+                continue
+            import sys as _sys
+            ids = t.column("id").to_pylist()
+            # names and paths repeat (a path once per entity, common names
+            # thousands of times): intern them so the live symbol table holds
+            # one string object each
+            names = [_sys.intern(x or "") for x in t.column("name").to_pylist()]
+            qs = t.column("q").to_pylist()
+            fs = [_sys.intern(x or "") for x in t.column("f").to_pylist()]
+            out.extend(zip([label] * len(ids), ids, names, qs, fs))
+        out.sort(key=lambda r: r[1])
+        return out
+
+    def file_ids(self) -> dict[str, int]:
+        t = self.fetch_arrow("MATCH (f:File) RETURN f.path AS p, f.id AS id")
+        return dict(zip(t.column("p").to_pylist(), t.column("id").to_pylist()))
+
+    def module_rows(self) -> list[dict]:
+        return self.fetch_all("MATCH (m:Module) RETURN m.id AS id, m.name AS name")
+
+    def insert_vectors(self, label: str, vec_rows: list[dict]) -> int:
+        """(id, embedding) rows into `label`'s vector side table."""
+        vt = self.VEC_TABLES.get(label)
+        if not vec_rows or not vt or not self.has_table(vt):
+            return 0
+        return self.insert_nodes(vt, vec_rows)
+
+    def delete_by_ids(self, label: str, ids: list[int]) -> None:
+        if ids and self.journal is not None:
+            self.journal.ops.append(("del_nodes", [int(i) for i in ids]))
+        vt = self.VEC_TABLES.get(label)
+        if ids and vt and self.has_table(vt):
+            for s0 in range(0, len(ids), 20_000):
+                self.execute(f"MATCH (n:{vt}) WHERE n.id IN $ids DELETE n",
+                             {"ids": [int(i) for i in ids[s0:s0 + 20_000]]})
+        for s0 in range(0, len(ids), 20_000):
+            self.execute(f"MATCH (n:{label}) WHERE n.id IN $ids DETACH DELETE n",
+                         {"ids": [int(i) for i in ids[s0:s0 + 20_000]]})
+
+    def ids_in_files(self, label: str, files: list[str]) -> list[int]:
+        if not files or not self.has_table(label):
+            return []
+        prop = "path" if label == "File" else "file"
+        rows = self.fetch_all(f"MATCH (n:{label}) WHERE n.{prop} IN $f RETURN n.id AS id", {"f": files})
+        return [int(r["id"]) for r in rows]
+
+    def embeddings_by_ids(self, label: str, ids: list[int]) -> dict[str, list]:
+        """{ehash: embedding} for rows by id -- the pre-delete harvest."""
+        if not ids or "ehash" not in self.table_props(label):
+            return {}
+        return self._vectors_by_hash_rows(label, [
+            (int(r["id"]), r["h"]) for s0 in range(0, len(ids), 5000)
+            for r in self.fetch_all(f"MATCH (n:{label}) WHERE n.id IN $ids RETURN n.id AS id, n.ehash AS h",
+                                    {"ids": [int(i) for i in ids[s0:s0 + 5000]]}) if r.get("h")])
+
+    def _vectors_by_hash_rows(self, label: str, id_hash: list[tuple[int, str]]) -> dict[str, list]:
+        """{ehash: embedding} for (id, ehash) pairs, vectors read by id."""
+        if not id_hash:
+            return {}
+        got, mat = self.embeddings_for(label, [i for i, _h in id_hash])
+        vec_of = {int(i): mat[j] for j, i in enumerate(got.tolist())}
+        out: dict[str, list] = {}
+        for i, h in id_hash:
+            v = vec_of.get(int(i))
+            if v is not None and h not in out:
+                out[h] = v
+        return out
+
+    def layout_by_ids(self, label: str, ids: list[int]) -> dict[int, tuple[float, float, float]]:
+        """{id: (x, y, pagerank)} for rows that have a position."""
+        if not ids or "x" not in self.table_props(label):
+            return {}
+        pr = "coalesce(n.pagerank, 0.0)" if label != "Variable" else "0.0"
+        out: dict[int, tuple[float, float, float]] = {}
+        for s0 in range(0, len(ids), 20_000):
+            for r in self.fetch_all(f"MATCH (n:{label}) WHERE n.id IN $ids AND n.x IS NOT NULL "
+                                    f"RETURN n.id AS id, n.x AS x, n.y AS y, {pr} AS pr",
+                                    {"ids": [int(i) for i in ids[s0:s0 + 20_000]]}):
+                out[int(r["id"])] = (float(r["x"]), float(r["y"]), float(r["pr"] or 0.0))
+        return out
+
+    def communities_of(self, ids: list[int]) -> dict[int, int]:
+        if not ids or not self.has_table("Community"):
+            return {}
+        rows = self.fetch_all("MATCH (n)-[:MEMBER_OF]->(c:Community) WHERE n.id IN $ids "
+                              "RETURN n.id AS n, c.id AS c", {"ids": [int(i) for i in ids]})
+        return {int(r["n"]): int(r["c"]) for r in rows}
+
+    # (rel, from_label, to_label) pairs a source entity resolves out of
+    RESOLVED_OUT = (("CALLS", "Function", "Function"), ("CALLS_CANDIDATE", "Function", "Function"),
+                    ("INSTANTIATES", "Function", "Class"), ("INHERITS", "Class", "Class"),
+                    ("DECORATED_BY", "Function", "Function"), ("DECORATED_BY", "Class", "Function"),
+                    ("IMPORTS_SYMBOL", "File", "Class"), ("IMPORTS_SYMBOL", "File", "Function"),
+                    ("HANDLES", "Route", "Function"), ("HANDLES", "Tool", "Function"))
+
+    # (rel, from_label, to_label, props) whose target may sit in a changed
+    # file: incoming edges an incremental pass re-points at the recreated
+    # target instead of re-resolving every caller (see Indexer._resolve_scope)
+    REMAP_IN = (("CALLS", "Function", "Function", ("line", "confidence", "method")),
+                ("CALLS_CANDIDATE", "Function", "Function", ("line", "confidence", "method")),
+                ("INSTANTIATES", "Function", "Class", ("line", "confidence", "method")),
+                ("INHERITS", "Class", "Class", ("confidence", "method")),
+                ("DECORATED_BY", "Function", "Function", ()), ("DECORATED_BY", "Class", "Function", ()),
+                ("IMPORTS_SYMBOL", "File", "Class", ()), ("IMPORTS_SYMBOL", "File", "Function", ()),
+                ("HANDLES", "Route", "Function", ()), ("HANDLES", "Tool", "Function", ()),
+                ("IMPORTS", "File", "File", ()))
+
+    def incoming_edges(self, ids_by_label: dict[str, list[int]]) -> list[tuple]:
+        """[(rel, fl, tl, src_id, src_file, dst_id, props)] of the REMAP_IN
+        edges ending at the given nodes."""
+        out = []
+        for rel, fl, tl, props in self.REMAP_IN:
+            ids = ids_by_label.get(tl)
+            if not ids or not self.has_table(rel) or not self.has_table(fl):
+                continue
+            have = self.table_props(rel)
+            pr = [p for p in props if p in have]
+            fcol = "a.path" if fl == "File" else "a.file"
+            ret = ", ".join(["a.id AS a", f"{fcol} AS f", "b.id AS b"] + [f"r.{p} AS {p}" for p in pr])
+            for s0 in range(0, len(ids), 20_000):
+                for r in self.fetch_all(f"MATCH (a:{fl})-[r:{rel}]->(b:{tl}) WHERE b.id IN $ids RETURN {ret}",
+                                        {"ids": [int(i) for i in ids[s0:s0 + 20_000]]}):
+                    out.append((rel, fl, tl, int(r["a"]), r["f"] or "", int(r["b"]),
+                                {p: r.get(p) for p in pr}))
+        return out
+
+    def resolved_out_edges(self, ids_by_label: dict[str, list[int]]) -> list[tuple[str, str, str, int, int, str]]:
+        """[(rel, from_label, to_label, src, dst, dst_name)] leaving the given nodes."""
+        out = []
+        for rel, fl, tl in self.RESOLVED_OUT:
+            ids = ids_by_label.get(fl)
+            if not ids or not self.has_table(rel) or not self.has_table(fl):
+                continue
+            for s0 in range(0, len(ids), 20_000):
+                for r in self.fetch_all(
+                        f"MATCH (a:{fl})-[r:{rel}]->(b:{tl}) WHERE a.id IN $ids "
+                        f"RETURN a.id AS a, b.id AS b, b.name AS n",
+                        {"ids": [int(i) for i in ids[s0:s0 + 20_000]]}):
+                    out.append((rel, fl, tl, int(r["a"]), int(r["b"]), r["n"] or ""))
+        return out
+
+    def delete_edge_pairs(self, rel: str, fl: str, tl: str, pairs: list[tuple[int, int]]) -> None:
+        import importlib.util  # noqa: F401
+        if not pairs:
+            return
+        if self.journal is not None:
+            self.journal.ops.append(("del_pairs", rel, [int(a) for a, _ in pairs],
+                                     [int(b) for _, b in pairs]))
+        del_arrow = pa.table({"_a": pa.array([int(a) for a, _ in pairs], pa.int64()),  # noqa: F841
+                              "_b": pa.array([int(b) for _, b in pairs], pa.int64())})
+        self.execute(f"LOAD FROM del_arrow WITH _a AS _a, _b AS _b "
+                     f"MATCH (a:{fl})-[r:{rel}]->(b:{tl}) WHERE a.id = _a AND b.id = _b DELETE r")
+
+    def delete_out_edges(self, rel: str, fl: str, tl: str, ids: list[int]) -> None:
+        if not ids or not self.has_table(rel):
+            return
+        if self.journal is not None:
+            self.journal.ops.append(("del_out", rel, [int(i) for i in ids]))
+        for s0 in range(0, len(ids), 20_000):
+            self.execute(f"MATCH (a:{fl})-[r:{rel}]->(b:{tl}) WHERE a.id IN $ids DELETE r",
+                         {"ids": [int(i) for i in ids[s0:s0 + 20_000]]})
+
+    def delete_all_edges(self, rel: str) -> None:
+        if not self.has_table(rel):
+            return
+        if self.journal is not None:
+            self.journal.ops.append(("del_kind", rel))
+        self.execute(f"MATCH ()-[r:{rel}]->() DELETE r")
+
+    def delete_edges_touching(self, rel: str, fl: str, tl: str, ids: list[int]) -> None:
+        """Edges of `rel` with either endpoint in `ids` (journalled as the
+        two directions)."""
+        if not ids or not self.has_table(rel):
+            return
+        ids = [int(i) for i in ids]
+        rows = self.fetch_all(f"MATCH (a:{fl})-[r:{rel}]->(b:{tl}) WHERE a.id IN $ids OR b.id IN $ids "
+                              f"RETURN a.id AS a, b.id AS b", {"ids": ids})
+        if rows:
+            self.delete_edge_pairs(rel, fl, tl, [(int(r["a"]), int(r["b"])) for r in rows])
+
+    def inherits_pairs(self) -> list[tuple[int, int]]:
+        if not self.has_table("INHERITS"):
+            return []
+        t = self.fetch_arrow("MATCH (a:Class)-[:INHERITS]->(b:Class) RETURN a.id AS a, b.id AS b")
+        return list(zip(t.column("a").to_pylist(), t.column("b").to_pylist()))
+
+    def test_function_rows(self) -> list[dict]:
+        """[{id, name}] of every test function."""
+        return self.fetch_all("MATCH (n:Function) WHERE n.is_test RETURN n.id AS id, n.name AS name")
+
+    def node_lines(self, ids_by_label: dict[str, list[int]]) -> dict[int, int]:
+        """{id: first line} for Class / Function / Variable rows by id."""
+        out: dict[int, int] = {}
+        for label, col in (("Class", "line_start"), ("Function", "line_start"), ("Variable", "line")):
+            ids = ids_by_label.get(label) or []
+            for s0 in range(0, len(ids), 20_000):
+                for r in self.fetch_all(f"MATCH (n:{label}) WHERE n.id IN $ids "
+                                        f"RETURN n.id AS id, coalesce(n.{col}, 0) AS l",
+                                        {"ids": [int(i) for i in ids[s0:s0 + 20_000]]}):
+                    out[int(r["id"])] = int(r["l"] or 0)
+        return out
+
+    def framework_nodes_in(self, files: list[str]) -> dict[tuple[str, int, str], tuple[str, int]]:
+        out: dict[tuple[str, int, str], tuple[str, int]] = {}
+        if not files:
+            return out
+        for label in ("Route", "Tool"):
+            if not self.has_table(label):
+                continue
+            for r in self.fetch_all(f"MATCH (n:{label}) WHERE n.file IN $f "
+                                    f"RETURN n.id AS id, n.file AS file, n.line AS line, n.name AS name",
+                                    {"f": files}):
+                out[(r["file"], int(r["line"] or 0), r["name"])] = (label, int(r["id"]))
+        return out
+
+    def test_functions(self, ids: list[int]) -> list[dict]:
+        if not ids:
+            return []
+        return self.fetch_all("MATCH (n:Function) WHERE n.id IN $ids AND n.is_test "
+                              "RETURN n.id AS id, n.name AS name, n.is_test AS is_test",
+                              {"ids": [int(i) for i in ids]})
+
     # ---- small targeted helpers for the incremental analytics path ------
 
     def count_symbols(self, files: list[str] | None = None) -> int:
@@ -817,24 +1047,6 @@ class GraphDB:
             return 1 << 30
         r = self.fetch_all("MATCH (f:File) WHERE f.x IS NULL RETURN count(f) AS c")
         return int(r[0]["c"]) if r else 0
-
-    def file_communities(self, paths: list[str]) -> dict[str, int]:
-        if not paths or not self.has_table("Community"):
-            return {}
-        rows = self.fetch_all("MATCH (f:File)-[:MEMBER_OF]->(c:Community) WHERE f.path IN $p "
-                              "RETURN f.path AS p, c.id AS c", {"p": paths})
-        return {r["p"]: int(r["c"]) for r in rows}
-
-    def nodes_in_files(self, files: list[str]) -> list[tuple[str, int, str]]:
-        out: list[tuple[str, int, str]] = []
-        if not files:
-            return out
-        for label in self.SYMBOL_LABELS:
-            prop = "path" if label == "File" else "file"
-            for r in self.fetch_all(f"MATCH (n:{label}) WHERE n.{prop} IN $f "
-                                    f"RETURN n.id AS id, n.{prop} AS f", {"f": files}):
-                out.append((label, int(r["id"]), r["f"]))
-        return out
 
     _NEIGHBOR_RELS = "CALLS|CONTAINS|IMPORTS|IMPORTS_SYMBOL|INHERITS|INSTANTIATES"
 
@@ -874,17 +1086,6 @@ class GraphDB:
             return 0.0
         return float(max(rows[0]["a"], rows[0]["b"]))
 
-    def file_layout_rows(self, path: str) -> dict | None:
-        r = self.fetch_all("MATCH (f:File) WHERE f.path = $p RETURN f.id AS id", {"p": path})
-        if not r:
-            return None
-        syms: list[tuple[str, int, int]] = []
-        for label, line in (("Class", "line_start"), ("Function", "line_start"), ("Variable", "line")):
-            for row in self.fetch_all(f"MATCH (n:{label}) WHERE n.file = $p "
-                                      f"RETURN n.id AS id, coalesce(n.{line}, 0) AS l", {"p": path}):
-                syms.append((label, int(row["id"]), int(row["l"] or 0)))
-        return {"file_id": int(r[0]["id"]), "symbols": syms}
-
     def fetch_arrow(self, cypher: str, params: dict | None = None, chunk: int = 1_000_000):
         """Query result as one pyarrow Table (columnar; embeddings come back
         as a fixed-size-list column that converts to numpy without Python
@@ -900,17 +1101,65 @@ class GraphDB:
         the search fan-out; every helper method works unchanged inside."""
         if self.db is None:
             raise DatabaseBusy(f"graph DB busy: {self.db_path} is closed")
+        self._thread_connection()
+        prev = getattr(self._tls, "active", False)
+        self._tls.active = True
+        try:
+            yield self
+        finally:
+            self._tls.active = prev
+
+    def _thread_connection(self):
         c = getattr(self._tls, "conn", None)
         if c is None:
             c = kuzu.Connection(self.db)
             with self._side_lock:
                 self._side.append(c)
             self._tls.conn = c
-        self._tls.active = True
+        return c
+
+    # Kuzu 0.11 uses the primary-key index only for `x.id = <literal>`: a
+    # parameter (`= $id`) or a list (`IN $ids`) scans the whole table (~7 ms
+    # on 200k rows, ~40 ms for a 1000-id list). A read query whose only use of
+    # the id list is `x.id IN $ids` is therefore rewritten, for short lists,
+    # into a UNION ALL of literal equalities (11 ids: 2 ms instead of 8).
+    PK_UNION_MAX = 48
+    _PK_BAD = (" ORDER BY", " LIMIT", " SKIP", " WITH ", "UNWIND", " OR ", "EXISTS", "COUNT(",
+               "COLLECT(", "DISTINCT", "SUM(", "AVG(", "MIN(", "MAX(", " DELETE", " SET ", "CREATE",
+               "MERGE", "UNION", "CALL ", "LOAD ", "COPY ", "OPTIONAL")
+
+    def _pk_rewrite(self, cypher: str, params: dict | None):
+        if not params:
+            return None
+        if "id" in params and len(params) >= 1 and isinstance(params.get("id"), int) \
+                and not isinstance(params.get("id"), bool) and cypher.count("$id") == 1:
+            m = _PK_EQ.search(cypher)
+            up = cypher.upper()
+            write = any(b in up for b in (" DELETE", " SET ", "CREATE", "MERGE", "COPY ", "LOAD "))
+            if m and not write and re.search(rf"MATCH \({m.group(1)}:\w+\)", cypher):
+                return (cypher[:m.start()] + f"{m.group(1)}.id = {int(params['id'])}" + cypher[m.end():],
+                        {k: v for k, v in params.items() if k != "id"})
+        ids = params.get("ids")
+        if not isinstance(ids, list) or not (0 < len(ids) <= self.PK_UNION_MAX) or cypher.count("$ids") != 1:
+            return None
+        up = cypher.upper()
+        if not up.lstrip().startswith("MATCH") or " RETURN " not in up or any(b in up for b in self._PK_BAD):
+            return None
+        # node lookups only: a relationship pattern per literal is a scan each
+        if "-[" in cypher or "]-" in cypher or "," in cypher.split("WHERE", 1)[0]:
+            return None
+        m = _PK_IN.search(cypher)
+        if not m or not re.search(rf"MATCH \({m.group(1)}:\w+\)", cypher):
+            return None
         try:
-            yield self
-        finally:
-            self._tls.active = False
+            lits = [int(i) for i in ids if not isinstance(i, bool)]
+        except (TypeError, ValueError):
+            return None
+        if len(lits) != len(ids):
+            return None
+        head, tail = cypher[:m.start()], cypher[m.end():]
+        parts = [f"{head}{m.group(1)}.id = {v}{tail}" for v in dict.fromkeys(lits)]
+        return " UNION ALL ".join(parts), {k: v for k, v in params.items() if k != "ids"}
 
     def execute(self, cypher: str, params: dict | None = None) -> Any:
         if self.conn is None:
@@ -918,16 +1167,23 @@ class GraphDB:
                 f"graph DB busy: connection to {self.db_path} is closed "
                 "(writer active — retry shortly)"
             )
-        if getattr(self._tls, "active", False):
-            return self._tls.conn.execute(cypher, params or {})
-        return self.conn.execute(cypher, params or {})
+        # A handle is shared by the event loop, worker threads (routes run in
+        # the thread pool) and -- on the host -- the indexer: every thread
+        # gets its own connection, so reads run concurrently and a
+        # connection is never used by two threads at once.
+        rw = self._pk_rewrite(cypher, params)
+        if rw is not None:
+            cypher, params = rw
+        return self._thread_connection().execute(cypher, params or {})
 
     def fetch_all(self, cypher: str, params: dict | None = None) -> list[dict]:
         result = self.execute(cypher, params)
         out: list[dict] = []
+        cols = None
         while result.has_next():
             row = result.get_next()
-            cols = result.get_column_names()
+            if cols is None:
+                cols = result.get_column_names()
             out.append(dict(zip(cols, row)))
         return out
 
@@ -958,11 +1214,26 @@ class GraphDB:
         rows = list(rows)
         if not rows:
             return 0
+        vt = self.VEC_TABLES.get(table)
+        if vt and "embedding" in rows[0] and self.has_table(vt):
+            # schema v5: the vector goes to the side table (now, or through
+            # the host's vector_sink in the background)
+            vec_rows = [{"id": r["id"], "embedding": r.pop("embedding")} for r in rows
+                        if r.get("embedding") is not None]
+            for r in rows:
+                r.pop("embedding", None)
+            n = self.insert_nodes(table, rows, batch_size=batch_size, on_progress=on_progress)
+            if vec_rows:
+                if self.vector_sink is not None:
+                    self.vector_sink(table, vec_rows)
+                else:
+                    self.insert_vectors(table, vec_rows)
+            return n
         # Bulk path: COPY FROM Arrow is ~75x faster than UNWIND for rows with
         # an embedding (UNWIND converts every float of every row). Only for
         # tables without a search index -- Kuzu's FTS index does not see
         # COPY'd rows, so indexed tables (incremental passes) take UNWIND.
-        if len(rows) >= self.COPY_MIN_ROWS and not self._has_search_index(table):
+        if len(rows) >= self.COPY_MIN_ROWS:
             try:
                 return self._copy_nodes(table, rows, batch_size=max(batch_size, 20_000),
                                         on_progress=on_progress)
@@ -991,7 +1262,15 @@ class GraphDB:
                 on_progress(len(slab))
         return n
 
-    COPY_MIN_ROWS = 64
+    # COPY FROM has a fixed cost that grows with the table (measured on a
+    # 200k-row Function table with an HNSW index: 12 rows via COPY 260-500 ms,
+    # via UNWIND CREATE ~40 ms); bulk loads take COPY, small batches UNWIND.
+    COPY_MIN_ROWS = 2000
+    # Same for relationships: up to this many rows go through
+    # LOAD FROM <arrow> + two PK MATCHes + CREATE (~10 ms for 10 rows where a
+    # COPY costs 30-50 ms per rel table); dangling ids simply match nothing,
+    # so no existence pre-check is needed either.
+    SMALL_EDGE_ROWS = 5000
 
     def _has_search_index(self, table: str) -> bool:
         have = self.list_indexes()
@@ -1009,9 +1288,12 @@ class GraphDB:
                     on_progress: "Callable[[int], None] | None" = None) -> int:
         import importlib.util  # noqa: F401 - kuzu's Arrow scan uses it without importing
         import numpy as np
-        types = {}
-        for r in self.fetch_all(f"CALL table_info('{table}') RETURN *"):
-            types[str(r.get("name"))] = str(r.get("type"))
+        types = self._col_types.get(table)
+        if types is None:
+            types = {}
+            for r in self.fetch_all(f"CALL table_info('{table}') RETURN *"):
+                types[str(r.get("name"))] = str(r.get("type"))
+            self._col_types[table] = types
         keys = [k for k in rows[0].keys() if k in types]
         cached = self._known_ids.get(table)
         for i in range(0, len(rows), batch_size):
@@ -1084,10 +1366,14 @@ class GraphDB:
         from_table: str,
         to_table: str,
         rows: Iterable[dict],
-        batch_size: int = 10_000,
+        batch_size: int = 100_000,
         on_progress: "Callable[[int], None] | None" = None,
+        validate: bool = True,
     ) -> int:
         """Bulk edge insert via Kuzu's COPY FROM (Arrow path).
+
+        validate=False skips the endpoint-existence check -- for callers whose
+        ids come from the live symbol table (every id is known to exist).
 
         batch_size=10_000 picks a sweet spot: small enough that the progress
         bar ticks visibly on large repos (a 500k-edge insert gets 50 updates
@@ -1112,17 +1398,71 @@ class GraphDB:
         rows = list(rows)
         if not rows:
             return 0
+        if len(rows) <= self.SMALL_EDGE_ROWS:
+            prop_keys = [k for k in rows[0].keys() if k not in ("from_id", "to_id")]
+            self._load_edges(edge, from_table, to_table, rows, prop_keys)
+            if on_progress is not None:
+                on_progress(len(rows))
+            return len(rows)
 
-        from_ids = self._existing_ids(from_table, {r["from_id"] for r in rows})
-        to_ids = self._existing_ids(to_table, {r["to_id"] for r in rows})
-        valid = [
-            r for r in rows
-            if r["from_id"] in from_ids and r["to_id"] in to_ids
-        ]
+        if validate:
+            from_ids = self._existing_ids(from_table, {r["from_id"] for r in rows})
+            to_ids = self._existing_ids(to_table, {r["to_id"] for r in rows})
+            valid = [
+                r for r in rows
+                if r["from_id"] in from_ids and r["to_id"] in to_ids
+            ]
+        else:
+            valid = rows
         if not valid:
             return 0
 
         prop_keys = [k for k in valid[0].keys() if k not in ("from_id", "to_id")]
+        n = len(valid)
+        if not validate:
+            try:
+                self._copy_edges(edge, from_table, to_table, valid, prop_keys, batch_size, on_progress)
+            except Exception as exc:  # noqa: BLE001 - a dangling id: take the checked path
+                import logging
+                logging.getLogger(__name__).warning("unchecked COPY %s failed (%s); validating", edge, exc)
+                return self.insert_edges(edge, from_table, to_table, valid, batch_size,
+                                         on_progress, validate=True)
+            return n
+        self._copy_edges(edge, from_table, to_table, valid, prop_keys, batch_size, on_progress)
+        return n
+
+    def _load_edges(self, edge: str, fl: str, tl: str, rows: list[dict], prop_keys: list[str]) -> None:
+        """Small relationship batch: LOAD FROM an Arrow table, look both
+        endpoints up by primary key, CREATE. Rows whose endpoints do not
+        exist produce nothing (the MATCH is empty)."""
+        import importlib.util  # noqa: F401 - kuzu's Arrow scan needs it imported
+        cols = {"_a": pa.array([int(r["from_id"]) for r in rows], pa.int64()),
+                "_b": pa.array([int(r["to_id"]) for r in rows], pa.int64())}
+        keys = []
+        for k in prop_keys:
+            vals = [r.get(k) for r in rows]
+            if all(v is None for v in vals):
+                continue
+            if all(isinstance(v, (int, bool)) or v is None for v in vals) and not any(isinstance(v, bool) for v in vals):
+                arr = pa.array(vals, pa.int64())
+            elif all(isinstance(v, (int, float)) or v is None for v in vals):
+                arr = pa.array([None if v is None else float(v) for v in vals], pa.float64())
+            else:
+                arr = pa.array([None if v is None else str(v) for v in vals], pa.string())
+            cols[f"_p_{k}"] = arr
+            keys.append(k)
+        load_arrow = pa.table(cols)  # noqa: F841 - referenced by name in the query
+        withs = ", ".join(f"{c} AS {c}" for c in cols)
+        carry = ", ".join(["x", "_b"] + [f"_p_{k}" for k in keys])
+        props = (" {" + ", ".join(f"{k}: _p_{k}" for k in keys) + "}") if keys else ""
+        self.execute(f"LOAD FROM load_arrow WITH {withs} MATCH (x:{fl}) WHERE x.id = _a "
+                     f"WITH {carry} MATCH (y:{tl}) WHERE y.id = _b CREATE (x)-[:{edge}{props}]->(y)")
+        if self.journal is not None:
+            conf = [r.get("confidence") for r in rows] if "confidence" in keys else None
+            self.journal.ops.append(("add", edge, [int(r["from_id"]) for r in rows],
+                                     [int(r["to_id"]) for r in rows], conf))
+
+    def _copy_edges(self, edge, from_table, to_table, valid, prop_keys, batch_size, on_progress):
         n = len(valid)
         for i in range(0, n, batch_size):
             slab = valid[i : i + batch_size]
@@ -1136,9 +1476,12 @@ class GraphDB:
             self.execute(
                 f"COPY {edge} FROM arrow (from='{from_table}', to='{to_table}')"
             )
+            if self.journal is not None:
+                conf = cols.get("confidence") or cols.get("score")
+                self.journal.ops.append(("add", edge, cols["from"], cols["to"],
+                                         conf if edge != "SIMILAR_TO" and conf is not None else None))
             if on_progress is not None:
                 on_progress(len(slab))
-        return n
 
     def close(self) -> None:
         """Explicitly close the Kuzu connection + database. Required after

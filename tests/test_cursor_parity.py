@@ -170,7 +170,8 @@ def test_chunks_created_for_long_function(indexed):
 
 def test_chunks_have_embeddings(indexed):
     _cfg, db, _e, _s = indexed
-    rows = db.fetch_all("MATCH (c:Chunk) RETURN c.embedding AS e LIMIT 5")
+    # schema v5: vectors live in the side table next to the chunk rows
+    rows = db.fetch_all("MATCH (c:ChunkVec) RETURN c.embedding AS e LIMIT 5")
     if not rows:
         pytest.skip("no chunks; threshold may have changed")
     # First element of an embedding is a float (not all zeros)
