@@ -117,13 +117,39 @@ Generated repo: 21,601 files (20,000 Python modules in 400 packages + README / T
 | First `health` | 7.3-8.5 s | 15 ms (precomputed in the background, 0.85 s; served from `health.json` across restarts) |
 | `trace` / `explore` (3 hops) / `call_graph` (depth 2), p50 | 11.3 s / 7.2 s / 554 ms | 49 / 98 / 53 ms |
 | `context` / `detect_changes` / `processes` (first) / `node_neighbors` | 300 / 272 / 1,570 / 224 ms | 81 / 24 / 151 / 123 ms |
-| Resident memory after the first search (model on GPU) | 2.4 GB | 3.0 GB (+ ~450 MB live incremental state: symbol table, import / reference indexes, a 22 MB compressed parse cache) |
+| Host working set after the first search (model on GPU) | 2.4 GB | 0.21 GB (see **Memory**) |
 | Browser: 102k nodes on screen with all 1.43M edges, moving | 16 fps | **59 fps** (worst frame 46 ms); full detail 289 ms after the camera stops |
 | Browser: idle page, animation frames per 2 s | 120 | 7 (draws only on change) |
 | Browser: graph first frame after navigation | 306 ms | 302 ms (tile decode in a worker) |
 | Tile payload over the wire | clusters 4-22 KB, files 64-160 KB, symbols 0.5-300 KB | same bytes; unchanged tiles keep their ETag across passes, `batch?have=` answers them empty |
 
 All MCP tools on the same repo (first call / p50, in-process): search 782 / 65 ms, definition 36 / 33, references 45 / 49, call_graph 55 / 53, file_map 30 / 30, neighborhood 92 / 92, explore 587 / 98, impact_of 146 / 136, test_impact 54 / 52, git_changes 27 / 21, git_blame 23 / 21, git_recent 22 / 21, rules_for < 1, cypher 1, context 95 / 81, detect_changes 35 / 24, repo_map 158 / 157, list_clusters 147 / 0 (memoised), cluster 243 / 99, route_map 49 / 48, trace 350 / 49, health 848 / 0, symbol_history 91 / 86, processes 151 / 0, index_info 2 / 1, graph_dump(2000) 847 / 0, files 27 / 25, node_neighbors 120 / 123. On the host the per-generation caches behind the first calls (call graph CSR, node payload table) are prewarmed.
+
+### Memory
+
+Host process on the same synthetic repo (working set = what Windows reports as RSS; private = committed memory, mostly torch / CUDA reservations that are never touched). "Before" is the Phase-2 host (2719b3c); both runs use the same scripted sequence over HTTP, embedding model fp16 on the GPU in-process unless noted.
+
+| Host working set / private | Before | Now | Now, `--embed-daemon` |
+|---|---|---|---|
+| After start (warm-up done) | 2.55 / 3.33 GB | 0.02 / 3.03 GB | 0.01 / 0.63 GB |
+| After the first search | 2.62 / 3.42 GB | 0.21 / 3.15 GB | 0.18 / 0.71 GB |
+| After search / trace / explore / context | 2.84 / 3.67 GB | 0.52 / 3.43 GB | 0.48 / 0.99 GB |
+| After 100 one-file incrementals (+8 s) | 3.36 / 4.22 GB | 0.72 / 3.92 GB | 1.02 / 1.15 GB (20 passes) |
+| After a full index over the API | 5.67 / 6.70 GB | 0.37 / 3.67 GB | -- |
+| Idle 120 s (graph unload at 60 s) | 3.15 / 4.16 GB | 0.02-0.05 / 3.22 GB | 0.02 / 0.45 GB |
+
+DocGraph's own source (77 files): 1.99 GB after the first search before, 0.09 GB now; 0.05 GB idle; HTTP search p50 58 -> 32 ms (in-process 46 -> 22 ms).
+
+What changed:
+
+- **Working-set trim** (`procmem.trim`: gc, `HeapCompact`, `SetProcessWorkingSetSize(-1, -1)`; glibc `malloc_trim`). torch + CUDA + the first encode map ~1.6 GB of DLL and kernel images that are touched once; trimmed after warm-up, after a full pass, after 60 s idle, and whenever the working set passes 1 GB (at most every 60 s). Pages still in use fault back from the standby list.
+- **Idle graph unload** (`--graph-idle-unload-sec`, default 600): call-graph CSRs, node table, trace / explore graphs, memos, tile arrays, the incremental live state and the parse pool are dropped and the read handle reopened (Kuzu's buffer pool goes with it). Everything is rebuilt on demand: the first trace after an unload costs ~0.4 s (as before), the first incremental ~3.5 s instead of 1.5 s (live state re-primed). Warm-up no longer builds the call graph or node table; the first tool that needs them does.
+- **Kuzu buffer pool** capped (`--db-buffer-mb`, auto = half the database size, 256-512 MB; 361 MB here). Measured search / trace / explore / context latency is the same at 361 MB, 512 MB, 1 GB and 4 GB. Full passes and incrementals over 2,000 files use the large bulk pool: Kuzu 0.11 fails bulk vector-table inserts under a 256 MB pool with a spurious "duplicated primary key".
+- **Tiles memory-mapped** from the uncompressed npz (0.1 MB of Python heap instead of 95 MB; the patcher shares the served arrays instead of loading a second copy).
+- **Compact live state**: packed qname index, derived names, tuple-based import / reference records, int32 CSRs, explore reusing the call-graph CSRs (Python heap per structure, before -> now: symbol table 108 -> 93 MB, import + reference indexes 158 -> 63 MB, tiles 95 -> 0.1 MB, explore CSRs 55 -> 34 MB, call graph 16 -> 12 MB).
+- **Daemon mode is the low-RAM setup**: the host no longer loads torch for index passes when `--embed-daemon` is on (it used to load the model in-process for every pass that embedded), so private memory stays under ~1.2 GB. Search pays one loopback round trip (~40 ms).
+
+Latency p50 on the synthetic repo, in-process, same database (before / now): search 80 / 80 ms, trace 36 / 36 ms, explore 253 / 262 ms, context 117 / 118 ms; over HTTP: search 101 / 89 ms, trace 69 / 72 ms, explore 304 / 278 ms, context 156 / 145 ms, one-file incremental 478 / 443 ms. The first search after start is ~40 ms slower (the vector-table size probe; on the small repo ~90 ms, it loads the in-memory vector copy). A full index over the API took 351 s vs 298 s before (one run each). Right after a burst of incrementals, search is slower for ~10 s while maintenance recomputes (143 ms before, ~290 ms now: the smaller buffer pool re-reads pages the global pass evicted), then back to ~80 ms.
 
 Regenerate: the benchmark scripts are not part of the package; the method is `docgraph index --full --gpu` on a generated repo, `docgraph host --port <spare>` for the HTTP / browser numbers.
 
@@ -196,6 +222,7 @@ Parallel index. Incremental by default; pass `--full` to wipe and rebuild.
 | `--scip STR` | `auto` | Precise SCIP references: `auto` (use `scip-python` / `scip-typescript` from PATH or `--scip-index` when present), `on` (always re-run the binaries), `off`. |
 | `--scip-python PATH` / `--scip-typescript PATH` | PATH lookup | Explicit SCIP indexer binaries. |
 | `--scip-index PATH` | unset | A prebuilt `index.scip` to ingest instead of running a binary. |
+| `--db-buffer-mb INT` | `0` (auto) | Kuzu buffer pool per open database. Auto = half the database size, clamped to 256-512 MB. Full / very large passes always use the large bulk pool (see **Memory**). |
 | `--verbose`, `-v` | `false` | Verbose logs |
 
 ### `docgraph host [path]`
@@ -219,6 +246,8 @@ Accepts every `index`-time flag too (`--gpu`, `--embed-model`, `--llm-*`, `--rer
 | `--port INT` | `5500` | Bind port |
 | `--debounce INT` | `500` | Watcher debounce (ms) |
 | `--embed-idle-unload-sec FLOAT` | `0` | Unload the embedder after N idle seconds (0 = never). Reloads lazily. |
+| `--graph-idle-unload-sec FLOAT` | `600` | Drop a root's in-memory graph structures (call-graph CSRs, node table, tile arrays, incremental live state, parse pool) after N seconds without a tool call or index pass, reopen the read handle (frees Kuzu's buffer pool) and trim the working set. Rebuilt on next use (0 = never). |
+| `--db-buffer-mb INT` | `0` (auto) | Kuzu buffer pool per open database: auto = half the database size clamped to 256-512 MB. |
 | `--rerank-idle-unload-sec FLOAT` | `0` | Unload the reranker after N idle seconds (0 = never). |
 | `--embed-daemon` / `--no-embed-daemon` | off | Route embed + rerank to a shared daemon (see below). |
 | `--daemon-port INT` | `5577` | Loopback port for the embedding daemon. |
@@ -267,6 +296,8 @@ Enable it for a host with `--embed-daemon` (the host spawns it lazily on first u
 - `--idle-exit-sec` — once **both** models are unloaded and the daemon has been idle this long, it **exits** to release the CUDA context, and is respawned on the next embed/rerank. This is loop-safe: the daemon does no GPU work on boot and is only respawned on demand.
 
 Without `--embed-daemon`, embedding/reranking happen in-process (pooled per host) with the same `*-idle-unload-sec` weight-unloading; the CUDA context then lives in the host until it exits.
+
+**Low-RAM setup:** `docgraph host --embed-daemon --daemon-idle-exit-sec 600 --embed-idle-unload-sec 300`. The host then never imports torch (torch + CUDA + the model commit ~2.4 GB of private memory in-process, of which ~200 MB stays in the working set after the host's trim); the daemon holds the model and exits when idle.
 
 ### `docgraph watch [path]`
 
