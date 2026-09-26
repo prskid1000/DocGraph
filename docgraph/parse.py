@@ -61,6 +61,89 @@ EXT_TO_LANG: dict[str, str] = {
 }
 
 
+# Exact lower-case basenames that name a grammar language regardless of
+# extension (Dockerfile, Makefile, ...). Checked before EXT_TO_LANG.
+FILENAME_TO_LANG: dict[str, str] = {}
+
+# Lower-case basename prefixes (e.g. "dockerfile." for `Dockerfile.dev`).
+FILENAME_PREFIX_TO_LANG: dict[str, str] = {}
+
+
+# --- Plain-text fallback ----------------------------------------------------
+# Files no grammar claims are still indexed when they are text: a File node
+# whose `language` is one of these kinds (or "text"), plus line/paragraph
+# chunks that are embedded and keyword-searchable. A grammar entry above
+# always wins over these tables.
+TEXT_EXT_KINDS: dict[str, str] = {
+    ".txt": "txt", ".text": "txt", ".rst": "rst", ".adoc": "asciidoc",
+    ".asciidoc": "asciidoc", ".org": "org", ".tex": "latex", ".mdx": "markdown",
+    ".ini": "ini", ".cfg": "ini", ".conf": "ini", ".properties": "ini",
+    ".editorconfig": "ini", ".toml": "toml", ".xml": "xml", ".xsd": "xml",
+    ".xsl": "xml", ".plist": "xml", ".csproj": "xml", ".vcxproj": "xml",
+    ".props": "xml", ".targets": "xml", ".pom": "xml", ".svg": "xml",
+    ".sql": "sql", ".csv": "csv", ".tsv": "csv", ".graphql": "graphql",
+    ".gql": "graphql", ".proto": "protobuf", ".tf": "hcl", ".tfvars": "hcl",
+    ".hcl": "hcl", ".nix": "nix", ".cmake": "cmake", ".mk": "makefile",
+    ".mak": "makefile", ".dockerfile": "dockerfile", ".gradle": "groovy",
+    ".groovy": "groovy", ".bat": "batch", ".cmd": "batch", ".ps1": "powershell",
+    ".psm1": "powershell", ".psd1": "powershell", ".vue": "vue",
+    ".svelte": "svelte", ".lua": "lua", ".swift": "swift", ".dart": "dart",
+    ".zig": "zig", ".hs": "haskell", ".ml": "ocaml", ".mli": "ocaml",
+    ".r": "r", ".jl": "julia", ".pl": "perl", ".pm": "perl", ".m": "objc",
+    ".mm": "objc", ".erl": "erlang", ".hrl": "erlang", ".clj": "clojure",
+    ".cljs": "clojure", ".cljc": "clojure", ".edn": "clojure", ".f90": "fortran",
+    ".f95": "fortran", ".f": "fortran", ".for": "fortran", ".v": "verilog",
+    ".sv": "verilog", ".vhd": "vhdl", ".vhdl": "vhdl", ".env": "env",
+    ".example": "env-example", ".sample": "env-example", ".template": "text",
+    ".log": "text", ".diff": "diff", ".patch": "diff", ".jsonl": "json",
+    ".json5": "json", ".jsonc": "json", ".ndjson": "json", ".lock": "text",
+    ".gitignore": "ignore", ".dockerignore": "ignore", ".npmignore": "ignore",
+    ".htaccess": "ini", ".service": "ini", ".desktop": "ini", ".rc": "text",
+    ".man": "text", ".1": "text", ".nfo": "txt", ".srt": "txt", ".vtt": "txt",
+}
+
+# Lower-case basenames (no or odd extension) -> text kind.
+TEXT_NAME_KINDS: dict[str, str] = {
+    "dockerfile": "dockerfile", "containerfile": "dockerfile",
+    "makefile": "makefile", "gnumakefile": "makefile", "bsdmakefile": "makefile",
+    "jenkinsfile": "groovy", "vagrantfile": "ruby", "gemfile": "ruby",
+    "rakefile": "ruby", "podfile": "ruby", "brewfile": "ruby", "procfile": "ini",
+    "justfile": "makefile", "cmakelists.txt": "cmake", "build": "text",
+    "workspace": "text", "license": "txt", "licence": "txt", "copying": "txt",
+    "notice": "txt", "authors": "txt", "contributors": "txt", "readme": "txt",
+    "changelog": "txt", "changes": "txt", "history": "txt", "news": "txt",
+    "todo": "txt", "codeowners": "text", "owners": "text", "version": "text",
+    ".env.example": "env-example", ".env.sample": "env-example",
+    ".env.template": "env-example", "env.example": "env-example",
+    ".editorconfig": "ini", ".gitattributes": "ignore",
+}
+
+# Lower-case basename prefixes for text kinds (`Dockerfile.prod`, `Makefile.win`).
+TEXT_NAME_PREFIX_KINDS: dict[str, str] = {
+    "dockerfile.": "dockerfile", "containerfile.": "dockerfile",
+    "makefile.": "makefile", "jenkinsfile.": "groovy", "license.": "txt",
+    "licence.": "txt", "readme.": "txt", "changelog.": "txt",
+    "requirements": "text",
+}
+
+# Extensions that are never text, whatever the sniff says (the ignore list
+# already drops most media; this guards files that slipped past it).
+BINARY_EXTS: frozenset[str] = frozenset({
+    ".png", ".jpg", ".jpeg", ".gif", ".bmp", ".tif", ".tiff", ".ico", ".webp",
+    ".psd", ".mp3", ".mp4", ".wav", ".flac", ".ogg", ".avi", ".mov", ".mkv",
+    ".webm", ".flv", ".ttf", ".otf", ".woff", ".woff2", ".eot", ".pdf", ".doc",
+    ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt", ".zip", ".gz", ".tgz",
+    ".bz2", ".xz", ".7z", ".rar", ".tar", ".jar", ".war", ".exe", ".dll", ".so",
+    ".dylib", ".bin", ".o", ".a", ".lib", ".obj", ".class", ".pyc", ".pyo",
+    ".pyd", ".wasm", ".db", ".sqlite", ".sqlite3", ".kuzu", ".npy", ".npz",
+    ".pkl", ".pickle", ".pt", ".pth", ".onnx", ".safetensors", ".h5", ".hdf5",
+    ".parquet", ".arrow", ".feather", ".avro", ".orc", ".dat", ".iso", ".img",
+    ".dmg", ".msi", ".apk", ".aab", ".ipa", ".deb", ".rpm", ".beam", ".swf",
+})
+
+SNIFF_BYTES = 8192
+
+
 # (language key → (module_name, language_function_name_or_attr))
 # language_function_name supports either a callable like `language()` or
 # `language_typescript()` / `language_tsx()` for the multi-language packages.
@@ -367,7 +450,94 @@ def _get_query(lang_key: str) -> ts.Query | None:
 
 
 def detect_language(path: Path) -> str | None:
-    return EXT_TO_LANG.get(path.suffix.lower())
+    """Grammar language for a path (basename first, then extension), or
+    None when no grammar claims it. Notebooks report "ipynb"."""
+    name = path.name.lower()
+    lang = FILENAME_TO_LANG.get(name)
+    if lang:
+        return lang
+    for pre, lk in FILENAME_PREFIX_TO_LANG.items():
+        if name.startswith(pre):
+            return lk
+    suffix = path.suffix.lower()
+    if suffix == ".ipynb":
+        return "ipynb"
+    return EXT_TO_LANG.get(suffix)
+
+
+def text_kind_for(path: Path) -> str | None:
+    """Text kind from the name alone (no IO), or None when unknown."""
+    name = path.name.lower()
+    k = TEXT_NAME_KINDS.get(name)
+    if k:
+        return k
+    for pre, kind in TEXT_NAME_PREFIX_KINDS.items():
+        if name.startswith(pre):
+            return kind
+    return TEXT_EXT_KINDS.get(path.suffix.lower())
+
+
+def looks_binary(head: bytes) -> bool:
+    """NUL byte in the sniff window, or undecodable as UTF-8 / cp1252."""
+    if not head:
+        return False
+    if b"\x00" in head:
+        return True
+    try:
+        head.decode("utf-8")
+        return False
+    except UnicodeDecodeError as exc:
+        # A multi-byte sequence cut by the sniff window is still text.
+        if exc.start >= len(head) - 4:
+            return False
+    try:
+        head.decode("cp1252")
+        return False
+    except UnicodeDecodeError:
+        return True
+
+
+def decode_text(data: bytes) -> str | None:
+    """UTF-8 (BOM stripped), else cp1252 as a last resort; None if binary."""
+    if b"\x00" in data[:SNIFF_BYTES]:
+        return None
+    try:
+        return data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        pass
+    try:
+        return data.decode("cp1252")
+    except UnicodeDecodeError:
+        return None
+
+
+def classify_file(path: Path, sniff: bool = True) -> str | None:
+    """What the indexer does with a file: a grammar language key, "text:<kind>"
+    for the plain-text fallback, or None (skip: binary / unreadable).
+
+    `sniff=False` never reads the file (used for paths that no longer
+    exist, e.g. a deleted file in the watcher)."""
+    suffix = path.suffix.lower()
+    if suffix in BINARY_EXTS:
+        return None
+    lang = detect_language(path)
+    if lang is not None:
+        return lang
+    kind = text_kind_for(path)
+    if not sniff:
+        return f"text:{kind or 'text'}"
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(SNIFF_BYTES)
+    except OSError:
+        return None
+    if looks_binary(head):
+        return None
+    return f"text:{kind or 'text'}"
+
+
+def is_indexable(path: Path) -> bool:
+    return classify_file(path, sniff=path.exists()) is not None
 
 
 def _capture_dict(query: ts.Query, root: ts.Node) -> dict[str, list[ts.Node]]:
