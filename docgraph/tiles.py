@@ -284,6 +284,8 @@ def build(src: TileSource, out_dir: Path, generation: int,
     manifest = {
         "version": VERSION, "generation": int(generation), "file": name,
         "bbox": [bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[2]],
+        "content_bbox": ([float(src.x.min()), float(src.y.min()), float(src.x.max()), float(src.y.max())]
+                         if n else [bbox[0], bbox[1], bbox[0] + bbox[2], bbox[1] + bbox[2]]),
         "max_level": MAX_LEVEL, "tile_budget": TILE_BUDGET,
         "node_kinds": NODE_KINDS, "edge_kinds": EDGE_KINDS, "lods": list(LODS),
         "counts": {"sym_nodes": int(len(arrays["sym_id"])), "sym_edges": int(len(arrays["sym_ea"])),

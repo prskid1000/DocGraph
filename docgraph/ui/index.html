@@ -204,6 +204,7 @@ textarea.input { height: auto; padding: 8px 10px; resize: none; line-height: 1.4
 .stage { position: relative; min-width: 0; min-height: 0; background: var(--well);
   background-image: radial-gradient(circle at 1px 1px, color-mix(in srgb, var(--border) 70%, transparent) 1px, transparent 0); background-size: 22px 22px; }
 .stage canvas { position: absolute; inset: 0; width: 100%; height: 100%; touch-action: none; cursor: grab; }
+.stage canvas.layer { pointer-events: none; cursor: default; }
 .stage canvas.dragging { cursor: grabbing; }
 .float { position: absolute; z-index: 5; display: flex; gap: 6px; align-items: center; }
 .float.tl { top: 12px; left: 12px; } .float.tr { top: 12px; right: 12px; } .float.bl { bottom: 12px; left: 12px; } .float.br { bottom: 12px; right: 12px; }
@@ -725,7 +726,7 @@ function statsFor(slug) {
 }
 const llmConfig = () => cached('llm', () => api('/api/llm_config'));
 const wikiList = () => cached('wiki', () => api('/api/wiki/list'));
-const filesDump = () => cached('files', () => api('/api/files'));
+const filesDump = () => cached('files', () => api('/api/files?edges=false'));
 const rootInfo = (slug = ROOT.slug) => ROOT.list.find(r => r.slug === slug) || null;
 const rootByPath = (p) => ROOT.list.find(r => r.path === p) || null;
 
@@ -923,147 +924,40 @@ function linkSymbols(el, extraNames) {
     c.onclick = () => openSymbol(hit);
   });
 }
+/* Layout refinement worker: relaxes only the loaded fine-level tiles, with
+   nodes near tile borders pinned, so the streamed world stays consistent. */
 const WORKER_SRC = `
-let positions=null,velocities=null,edges=null,degrees=null,communities=null;
-let N=0,E=0,running=false,frame=0,lowFrames=0,maxF=300;
-const pinned=new Set(),pinnedX=new Map(),pinnedY=new Map();
-const GRID=90;
-const grid=new Map();
 self.onmessage=(ev)=>{
-  const m=ev.data;
-  if(m.type==='init'){
-positions=new Float32Array(m.positions);
-N=positions.length/2;
-velocities=new Float32Array(N*2);
-edges=new Int32Array(m.edges);
-E=edges.length/2;
-degrees=new Float32Array(N);
-for(let i=0;i<E;i++){degrees[edges[i*2]]++;degrees[edges[i*2+1]]++;}
-communities=new Int32Array(N);
-for(let i=0;i<N;i++)communities[i]=i;
-frame=0;lowFrames=0;
-runCommunities(8);
-self.postMessage({type:'communities',data:new Int32Array(communities).buffer},[new Int32Array(communities).buffer]);
-  } else if(m.type==='run'){
-running=true;maxF=m.maxFrames||300;loop();
-  } else if(m.type==='stop'){
-running=false;
-  } else if(m.type==='pin'){
-pinned.add(m.idx);pinnedX.set(m.idx,m.x);pinnedY.set(m.idx,m.y);
-positions[m.idx*2]=m.x;positions[m.idx*2+1]=m.y;
-velocities[m.idx*2]=0;velocities[m.idx*2+1]=0;
-  } else if(m.type==='unpin'){
-pinned.delete(m.idx);pinnedX.delete(m.idx);pinnedY.delete(m.idx);
-  } else if(m.type==='kick'){
-// Random velocity to escape local minima
-for(let i=0;i<N;i++){velocities[i*2]+=(Math.random()-0.5)*4;velocities[i*2+1]+=(Math.random()-0.5)*4;}
-if(!running){running=true;frame=0;lowFrames=0;loop();}
-  }
-};
-function loop(){
-  if(!running)return;
-  step();frame++;
-  // Send positions to main thread less often when N is large so we don't
-  // starve the UI thread under a flood of cloned Float32Arrays. At 50k
-  // nodes a position payload is 400KB; at every-2-frame cadence (~30 Hz)
-  // that's ~12 MB/s of structured cloning + 50k iterations of x/y copy on
-  // the main thread per second — enough to drop tab clicks. Scale with N.
-  const interval=N>30000?12:N>10000?6:2;
-  if(frame%interval===0){
-const buf=new Float32Array(positions);
-self.postMessage({type:'positions',data:buf.buffer,frame:frame},[buf.buffer]);
-  }
-  if(lowFrames>=20||frame>=maxF){
-running=false;
-const buf=new Float32Array(positions);
-self.postMessage({type:'positions',data:buf.buffer,frame:frame},[buf.buffer]);
-self.postMessage({type:'done'});
-return;
-  }
-  setTimeout(loop,0);
-}
-function step(){
-  // Inverse-square repulsion (Coulomb-style) instead of FA2's linear. Linear
-  // decay made grid-cell cutoffs visible because far-cell contributions still
-  // mattered; with 1/d² they're negligible past one cell, so the field is
-  // smooth across cell boundaries and nodes don't line up on a grid.
-  const REPULSE=400,ATTRACT=0.03,GRAVITY=0.4,FRICTION=0.88,VCAP=6;
-  grid.clear();
-  for(let i=0;i<N;i++){
-const cx=Math.floor(positions[i*2]/GRID),cy=Math.floor(positions[i*2+1]/GRID);
-const k=cx*32768+cy;
-let b=grid.get(k);if(!b){b=[];grid.set(k,b);}b.push(i);
-  }
-  const fx=new Float32Array(N),fy=new Float32Array(N);
-  for(let i=0;i<N;i++){
-const ix=positions[i*2],iy=positions[i*2+1];
-const cx=Math.floor(ix/GRID),cy=Math.floor(iy/GRID);
-const di=Math.sqrt(degrees[i]+1);
-for(let dcx=-1;dcx<=1;dcx++)for(let dcy=-1;dcy<=1;dcy++){
-  const b=grid.get((cx+dcx)*32768+(cy+dcy));if(!b)continue;
-  const st=b.length>40?Math.ceil(b.length/40):1;
-  for(let bi=0;bi<b.length;bi+=st){
-    const j=b[bi];if(i===j)continue;
-    const dx=ix-positions[j*2],dy=iy-positions[j*2+1];
-    const d2=dx*dx+dy*dy+0.01;
-    const d=Math.sqrt(d2);
-    // 1/d² Coulomb falls off fast enough that beyond ~1.5 cells the
-    // contribution is rounding-error tiny — eliminates the grid artifact.
-    const f=REPULSE*di*Math.sqrt(degrees[j]+1)/d2;
-    fx[i]+=dx/d*f;fy[i]+=dy/d*f;
-  }
-}
-const r=Math.sqrt(ix*ix+iy*iy)+0.001;
-fx[i]-=ix/r*GRAVITY*di;fy[i]-=iy/r*GRAVITY*di;
-  }
-  for(let i=0;i<E;i++){
-const a=edges[i*2],b=edges[i*2+1];
-const dx=positions[b*2]-positions[a*2],dy=positions[b*2+1]-positions[a*2+1];
-fx[a]+=dx*ATTRACT;fy[a]+=dy*ATTRACT;
-fx[b]-=dx*ATTRACT;fy[b]-=dy*ATTRACT;
-  }
-  let total=0;
-  for(let i=0;i<N;i++){
-if(pinned.has(i)){
-  positions[i*2]=pinnedX.get(i);positions[i*2+1]=pinnedY.get(i);
-  velocities[i*2]=0;velocities[i*2+1]=0;continue;
-}
-velocities[i*2]=(velocities[i*2]+fx[i])*FRICTION;
-velocities[i*2+1]=(velocities[i*2+1]+fy[i])*FRICTION;
-const v2=velocities[i*2]*velocities[i*2]+velocities[i*2+1]*velocities[i*2+1];
-if(v2>VCAP*VCAP){const s=VCAP/Math.sqrt(v2);velocities[i*2]*=s;velocities[i*2+1]*=s;}
-positions[i*2]+=velocities[i*2];positions[i*2+1]+=velocities[i*2+1];
-total+=Math.sqrt(v2);
-  }
-  const avg=total/Math.max(1,N);
-  if(avg<0.5)lowFrames++;else lowFrames=0;
-}
-function runCommunities(iters){
-  // Label propagation: each node adopts most-common community among its neighbors.
-  const adj=new Array(N);for(let i=0;i<N;i++)adj[i]=[];
-  for(let i=0;i<E;i++){adj[edges[i*2]].push(edges[i*2+1]);adj[edges[i*2+1]].push(edges[i*2]);}
-  for(let i=0;i<N;i++)communities[i]=i;
-  const order=new Int32Array(N);for(let i=0;i<N;i++)order[i]=i;
+  const m=ev.data; if(m.type!=='refine')return;
+  const P=new Float32Array(m.pos), N=P.length/2, E=new Int32Array(m.edges), pin=new Uint8Array(m.pin);
+  const V=new Float32Array(N*2), deg=new Float32Array(N);
+  for(let i=0;i<E.length;i+=2){deg[E[i]]++;deg[E[i+1]]++;}
+  const G=24, iters=m.iters||120;
   for(let it=0;it<iters;it++){
-for(let i=N-1;i>0;i--){const j=Math.floor(Math.random()*(i+1));const t=order[i];order[i]=order[j];order[j]=t;}
-let changed=0;
-for(let oi=0;oi<N;oi++){
-  const v=order[oi],neigh=adj[v];if(!neigh.length)continue;
-  const counts=new Map();
-  for(const u of neigh){const c=communities[u];counts.set(c,(counts.get(c)||0)+1);}
-  let bestC=communities[v],bestN=-1;
-  for(const [c,n] of counts){if(n>bestN||(n===bestN&&c<bestC)){bestN=n;bestC=c;}}
-  if(bestC!==communities[v]){communities[v]=bestC;changed++;}
-}
-if(changed===0)break;
+    const grid=new Map();
+    for(let i=0;i<N;i++){const k=Math.floor(P[i*2]/G)*65536+Math.floor(P[i*2+1]/G);let b=grid.get(k);if(!b){b=[];grid.set(k,b);}b.push(i);}
+    const F=new Float32Array(N*2);
+    for(let i=0;i<N;i++){
+      const x=P[i*2],y=P[i*2+1],cx=Math.floor(x/G),cy=Math.floor(y/G);
+      for(let dx=-1;dx<=1;dx++)for(let dy=-1;dy<=1;dy++){const b=grid.get((cx+dx)*65536+cy+dy);if(!b)continue;
+        for(let j of b){if(j===i)continue;const ux=x-P[j*2],uy=y-P[j*2+1],d2=ux*ux+uy*uy+0.01;if(d2>G*G)continue;const f=40/d2;F[i*2]+=ux*f;F[i*2+1]+=uy*f;}}
+    }
+    for(let e=0;e<E.length;e+=2){const a=E[e],b=E[e+1],ux=P[b*2]-P[a*2],uy=P[b*2+1]-P[a*2+1];F[a*2]+=ux*0.02;F[a*2+1]+=uy*0.02;F[b*2]-=ux*0.02;F[b*2+1]-=uy*0.02;}
+    const cool=1-it/iters;
+    for(let i=0;i<N;i++){if(pin[i])continue;V[i*2]=(V[i*2]+F[i*2])*0.6;V[i*2+1]=(V[i*2+1]+F[i*2+1])*0.6;
+      const v=Math.hypot(V[i*2],V[i*2+1]),cap=3*cool+0.2;if(v>cap){V[i*2]*=cap/v;V[i*2+1]*=cap/v;}
+      P[i*2]+=V[i*2];P[i*2+1]+=V[i*2+1];}
+    if(it%20===19){const c=new Float32Array(P);self.postMessage({type:'pos',pos:c.buffer,done:false},[c.buffer]);}
   }
-  // Compact IDs
-  const remap=new Map();let nx=0;
-  for(let i=0;i<N;i++){if(!remap.has(communities[i]))remap.set(communities[i],nx++);communities[i]=remap.get(communities[i]);}
-}
+  const c=new Float32Array(P);self.postMessage({type:'pos',pos:c.buffer,done:true},[c.buffer]);
+};
 `;
 
-/* ─────────────────────────── Graph engine ─────────────────────────── */
+/* ─────────────────────────── Graph engine: streamed tiles + WebGL ───────────────────────────
+   The server cuts a precomputed world layout into quadtree tiles (docgraph/tiles.py). The client
+   works like map tiles / game chunks: pick the level from the zoom, load the visible tiles nearest-
+   first (+ a prefetch ring), cancel what scrolls away, evict least-recently-used tiles over a
+   resident-node budget, crossfade between levels. One GPU buffer pair per tile. No global node cap. */
 const NODE_KINDS = [
   { id: 'Function', label: 'Function', tok: '--k-fn' }, { id: 'Class', label: 'Class', tok: '--k-cls' },
   { id: 'File', label: 'File', tok: '--k-file' }, { id: 'Variable', label: 'Variable', tok: '--k-var' },
@@ -1081,26 +975,28 @@ const EDGE_KINDS = [
 ];
 const EDGE_LABELS = Object.fromEntries(EDGE_KINDS.map(k => [k.id, k.label]));
 const COMMUNITY_PALETTE = ['#7dd3fc', '#c084fc', '#34d399', '#fb923c', '#f472b6', '#facc15', '#22d3ee', '#a78bfa', '#4ade80', '#fb7185', '#60a5fa', '#f59e0b', '#2dd4bf', '#e879f9', '#84cc16', '#fdba74'];
-const ALL_NODES_CAP = 50000;
-const LAYOUT_HARD_CAP_FRAMES = 300;
+const TILE_NODE_KINDS = ['File', 'Class', 'Function', 'Variable', 'Cluster']; // docgraph/tiles.py NODE_KINDS order
+const LOD_NAMES = ['symbols', 'files', 'clusters'];
+const DETAIL_BUDGET = { low: 400, normal: 800, high: 1500 };
+const isPhone = () => innerWidth <= 820;
+const residentBudget = () => isPhone() ? 60000 : 300000;
+const tilePx = () => isPhone() ? 300 : 420;
 const SETTLE_RENDER_MS = 80;
 
 const G = {
-  graph: { nodes: [], edges: [] }, layout: [], byId: new Map(), labelOrder: [],
-  worker: null, canvas: null, ctx: null, size: { w: 0, h: 0 }, vp: { tx: 0, ty: 0, scale: 1 },
-  selectedId: null, hoverId: null, dragging: null, layoutRunning: false, fitNext: true,
-  needsRender: true, lastRender: 0, shown: false, T: null,
-  nodeFilter: new Set(NODE_KINDS.map(k => k.id)), edgeFilter: new Set(EDGE_KINDS.map(k => k.id)),
-  focusHops: 0, visibleIds: null, colorMode: 'kind', lodMode: 'all',
-  level0: new Set(), revealed: new Set(), expanded: new Set(), nb: { id: null, set: new Set() },
-  status: 'idle', error: null, token: 0, pending: null, communities: [],
-  minConf: 0, hasConf: false, hasServerClusters: false, clusterNames: new Map(), hulls: false, hullCache: null, hullAt: 0,
-  overlay: null,
+  man: null, gen: 0, status: 'idle', error: null, token: 0,
+  tiles: new Map(), want: new Set(), ring: new Set(), level: 0, detail: lsGet('docgraph.detail', 'normal'),
+  queue: [], inflight: [], resident: 0, nodeRef: new Map(),
+  canvas: null, gl: null, glx: null, ctx2d: null, under: null, over: null, size: { w: 0, h: 0 }, dpr: 1,
+  vp: { tx: 0, ty: 0, scale: 1 }, fitNext: true, needsRender: true, lastRender: 0, shown: false, T: null,
+  selectedId: null, hoverId: null, nb: { id: null, nodes: new Map(), edges: [] }, pending: null,
+  nodeFilter: new Set(['Function', 'Class', 'File', 'Variable', 'Module', 'Cluster']), edgeFilter: new Set(EDGE_KINDS.map(k => k.id)),
+  focusHops: 0, focus: null, colorMode: 'kind', minConf: 0, hasConf: true, hasServerClusters: true,
+  hulls: false, hullCache: null, hullAt: 0, clusterNames: new Map(), communities: [],
+  overlay: null, overlayPos: new Map(), styleVersion: 1, layoutRunning: false, worker: null,
+  stats: { frames: 0, fpsT: 0, fps: 0, bytes: 0, tileMs: [], tilesLoaded: 0, firstFrameAt: 0, loadStart: 0 },
 };
-// Canvas edge visibility: kind filter + the min-confidence floor on CALLS edges.
-const edgeOn = (e) => G.edgeFilter.has(e.kind) && !(G.minConf > 0 && e.kind === 'CALLS' && e.confidence != null && e.confidence < G.minConf);
-// Community of a node: server Louvain cluster when the index has them, else the worker's label propagation.
-const commOf = (n) => G.hasServerClusters ? n.cluster : n.community;
+window.__dgStats = G.stats;
 const commColor = (c) => COMMUNITY_PALETTE[Math.abs(Number(c) || 0) % COMMUNITY_PALETTE.length];
 
 function hexA(hex, a) {
@@ -1110,56 +1006,355 @@ function hexA(hex, a) {
   const n = parseInt(f, 16);
   return `rgba(${(n >> 16) & 255},${(n >> 8) & 255},${n & 255},${a})`;
 }
+function rgbaBytes(hex, a = 1) {
+  const h = String(hex || '').trim().replace('#', '');
+  const f = h.length === 3 ? h.split('').map(c => c + c).join('') : h.length === 6 ? h : '888888';
+  const n = parseInt(f, 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255, Math.round(a * 255)];
+}
 function readTheme() {
   const cs = getComputedStyle(document.documentElement), v = (n) => cs.getPropertyValue(n).trim();
+  const kind = Object.fromEntries(NODE_KINDS.map(k => [k.id, v(k.tok)]));
   return {
     bg: v('--well'), text: v('--text'), faint: v('--faint'), accent: v('--accent'), err: v('--err'), warn: v('--warn'), mono: v('--mono') || 'monospace', sans: v('--sans') || 'sans-serif',
-    kind: Object.fromEntries(NODE_KINDS.map(k => [k.id, v(k.tok)])),
+    kind, kindRGBA: Object.fromEntries(Object.entries(kind).map(([k, c]) => [k, rgbaBytes(c)])),
     edge: Object.fromEntries(EDGE_KINDS.map(k => [k.id, hexA(v(k.tok), k.a)])),
+    edgeRGBA: EDGE_KINDS.map(k => rgbaBytes(v(k.tok), k.a)),
   };
 }
 const kindColor = (k) => (G.T && G.T.kind[k]) || '#888';
-
-/* Worker plumbing (unchanged protocol from the previous UI) */
 function spawnWorker() {
-  if (G.worker) G.worker.terminate();
-  const blob = new Blob([WORKER_SRC], { type: 'application/javascript' });
-  G.worker = new Worker(URL.createObjectURL(blob));
-  G.worker.onmessage = onWorkerMessage;
+  if (G.worker) return G.worker;
+  try { G.worker = new Worker(URL.createObjectURL(new Blob([WORKER_SRC], { type: 'application/javascript' }))); } catch { G.worker = null; }
+  return G.worker;
 }
-function onWorkerMessage(ev) {
-  const m = ev.data;
-  if (m.type === 'positions') {
-    const buf = new Float32Array(m.data), L = G.layout, N = Math.min(L.length, buf.length / 2);
-    for (let i = 0; i < N; i++) if (L[i] !== G.dragging) { L[i].x = buf[i * 2]; L[i].y = buf[i * 2 + 1]; }
-    G.needsRender = true;
-  } else if (m.type === 'communities') {
-    const arr = new Int32Array(m.data);
-    for (let i = 0; i < G.layout.length && i < arr.length; i++) G.layout[i].community = arr[i];
-    summarizeCommunities();
-    G.needsRender = true;
-  } else if (m.type === 'done') {
-    G.layoutRunning = false; G.hullCache = null; G.needsRender = true; updateLayoutUI();
+
+/* ---- world / tile math ---- */
+const worldSide = () => G.man ? (G.man.bbox[2] - G.man.bbox[0]) : 1;
+function levelFor(scale) {
+  if (!G.man) return 0;
+  const l = Math.ceil(Math.log2(Math.max(1e-9, worldSide() * scale / tilePx())));
+  return Math.max(0, Math.min(G.man.max_level, l));
+}
+function viewWorld(pad = 0) {
+  const vp = G.vp, x0 = -vp.tx / vp.scale, y0 = -vp.ty / vp.scale;
+  return { x0: x0 - pad, y0: y0 - pad, x1: x0 + G.size.w / vp.scale + pad, y1: y0 + G.size.h / vp.scale + pad };
+}
+function tilesIn(level, ring) {
+  const b = G.man.bbox, n = 2 ** level, tw = worldSide() / n, v = viewWorld();
+  const cl = (t) => Math.max(0, Math.min(n - 1, t));
+  const x0 = cl(Math.floor((v.x0 - b[0]) / tw) - ring), x1 = cl(Math.floor((v.x1 - b[0]) / tw) + ring);
+  const y0 = cl(Math.floor((v.y0 - b[1]) / tw) - ring), y1 = cl(Math.floor((v.y1 - b[1]) / tw) + ring);
+  const out = [];
+  for (let x = x0; x <= x1; x++) for (let y = y0; y <= y1; y++) out.push([x, y]);
+  return out;
+}
+const tileKey = (l, x, y) => `${l}/${x}/${y}@${DETAIL_BUDGET[G.detail] || 800}`;
+function tileBounds(t) {
+  const b = G.man.bbox, tw = worldSide() / 2 ** t.level;
+  return { x0: b[0] + t.tx * tw, y0: b[1] + t.ty * tw, x1: b[0] + (t.tx + 1) * tw, y1: b[1] + (t.ty + 1) * tw };
+}
+
+/* ---- tile decoding (format: docgraph/tiles.py TileStore.tile) ---- */
+const TD = new TextDecoder();
+function parseTile(buf) {
+  const dv = new DataView(buf);
+  if (dv.getUint32(0, true) !== 0x31544744) throw new Error('bad tile');
+  const lod = dv.getUint8(6), level = dv.getUint8(7), tx = dv.getUint32(8, true), ty = dv.getUint32(12, true);
+  const n = dv.getUint32(16, true), m = dv.getUint32(20, true), g = dv.getUint32(24, true), k = dv.getUint32(28, true), nb = dv.getUint32(32, true);
+  let o = 40;
+  const a4 = (C, c) => { const a = new C(buf, o, c); o += c * 4; return a; };
+  const a1 = (c) => { const a = new Uint8Array(buf, o, c); o += (c + 3) & ~3; return a; };
+  const t = { lod, level, tx, ty, n, m, g };
+  t.ids = a4(Int32Array, n); t.x = new Float32Array(a4(Float32Array, n)); t.y = new Float32Array(a4(Float32Array, n));
+  t.pr = a4(Float32Array, n); t.size = a4(Uint32Array, n); t.clu = a4(Int32Array, n); t.kind = a1(n); t.flags = a1(n);
+  t.gids = a4(Int32Array, g); t.gx = a4(Float32Array, g); t.gy = a4(Float32Array, g); t.gclu = a4(Int32Array, g); t.gkind = a1(g);
+  t.eid = a4(Uint32Array, m); t.ea = a4(Uint32Array, m); t.eb = a4(Uint32Array, m); t.ew = a4(Uint32Array, m); t.ek = a1(m); t.ec = a1(m);
+  const nl = a4(Uint32Array, k), off = a4(Uint32Array, k + 1), blob = new Uint8Array(buf, o, nb);
+  t.names = new Map();
+  for (let i = 0; i < k; i++) t.names.set(nl[i], TD.decode(blob.subarray(off[i], off[i + 1])));
+  return t;
+}
+const tileRadius = (t, i) => {
+  if (t.lod === 2) return 7 * Math.sqrt(t.size[i]);
+  if (t.lod === 1) return 6.2 * Math.sqrt(t.size[i]) + 8;
+  const prm = (G.man && G.man.pr_max) || 1e-4, s = Math.sqrt(Math.max(0, t.pr[i]) / prm);
+  return t.kind[i] === 0 ? 4.5 + 3 * s : 1.6 + 3.6 * s;
+};
+function nodeRec(t, i) {
+  return { id: t.ids[i], x: t.x[i], y: t.y[i], r: tileRadius(t, i), kind: TILE_NODE_KINDS[t.kind[i]] || 'Function', lod: t.lod,
+    cluster: t.clu[i], pagerank: t.pr[i], size: t.size[i], name: t.names.get(i) || null, test: !!(t.flags[i] & 1) };
+}
+
+/* ---- Cache API (per-viewer tile cache across reloads; optional) ---- */
+const TCACHE = 'docgraph-tiles-v2';
+async function cacheGet(key) {
+  try { if (!('caches' in self)) return null; const c = await caches.open(TCACHE); const r = await c.match(`/__tiles/${ROOT.slug}/${key}`); if (!r) return null; return { buf: await r.arrayBuffer(), gen: Number(r.headers.get('x-gen') || 0), etag: r.headers.get('x-etag') || '' }; } catch { return null; }
+}
+async function cachePut(key, buf, etag) {
+  try { if (!('caches' in self)) return; const c = await caches.open(TCACHE); await c.put(`/__tiles/${ROOT.slug}/${key}`, new Response(buf, { headers: { 'x-gen': String(G.gen), 'x-etag': etag || '' } })); } catch { /* cache optional */ }
+}
+
+/* ---- scheduling ---- */
+function updateWanted() {
+  if (!G.man || !G.size.w) return;
+  const L = levelFor(G.vp.scale);
+  const vis = tilesIn(L, 0), ring = tilesIn(L, 1);
+  G.level = L;
+  const want = new Set(vis.map(([x, y]) => tileKey(L, x, y)));
+  const ringSet = new Set(ring.map(([x, y]) => tileKey(L, x, y)));
+  G.want = want; G.ring = ringSet;
+  const v = viewWorld(), cx = (v.x0 + v.x1) / 2, cy = (v.y0 + v.y1) / 2, b = G.man.bbox, tw = worldSide() / 2 ** L;
+  const pri = (x, y, isVis) => (isVis ? 0 : 1e12) + Math.hypot(b[0] + (x + 0.5) * tw - cx, b[1] + (y + 0.5) * tw - cy);
+  const q = [];
+  for (const [x, y] of ring) {
+    const key = tileKey(L, x, y);
+    if (G.tiles.has(key)) { G.tiles.get(key).lastUsed = performance.now(); continue; }
+    if (G.inflight.some(f => f.keys.includes(key))) continue;
+    q.push({ key, level: L, x, y, p: pri(x, y, want.has(key)) });
+  }
+  q.sort((a, b2) => a.p - b2.p);
+  G.queue = q;
+  // cancel batches whose tiles all scrolled away
+  for (const f of G.inflight) if (!f.keys.some(k => ringSet.has(k))) { try { f.ctrl.abort(); } catch { /* ignore */ } }
+  G.inflight = G.inflight.filter(f => !f.ctrl.signal.aborted);
+  pump();
+  updateVisCount();
+}
+function pump() {
+  while (G.inflight.length < 3 && G.queue.length) {
+    const batch = G.queue.splice(0, 6);
+    const f = { keys: batch.map(b => b.key), ctrl: new AbortController() };
+    G.inflight.push(f);
+    loadBatch(batch, f).finally(() => { G.inflight = G.inflight.filter(x => x !== f); pump(); });
   }
 }
-function postLayoutInit() {
-  if (!G.worker) spawnWorker();
-  const L = G.layout, N = L.length, xy = new Float32Array(N * 2), idIdx = new Map();
-  for (let i = 0; i < N; i++) { L[i].idx = i; idIdx.set(L[i].id, i); xy[i * 2] = L[i].x; xy[i * 2 + 1] = L[i].y; }
-  const eb = new Int32Array(G.graph.edges.length * 2); let ec = 0;
-  for (const e of G.graph.edges) { const si = idIdx.get(e.src), di = idIdx.get(e.dst); if (si == null || di == null) continue; eb[ec * 2] = si; eb[ec * 2 + 1] = di; ec++; }
-  const es = eb.slice(0, ec * 2);
-  G.worker.postMessage({ type: 'init', positions: xy.buffer, edges: es.buffer }, [xy.buffer, es.buffer]);
+async function loadBatch(batch, f) {
+  const token = G.token, t0 = performance.now(), need = [];
+  for (const b of batch) {
+    const c = await cacheGet(b.key);
+    if (token !== G.token || f.ctrl.signal.aborted) return;
+    if (c && c.gen === G.gen) { installTile(b.key, c.buf); continue; }
+    need.push({ ...b, cached: c });
+  }
+  // revalidate stale cache entries one by one (304 -> reuse the bytes), batch the rest
+  const fresh = need.filter(b => !b.cached || !b.cached.etag), stale = need.filter(b => b.cached && b.cached.etag);
+  const budget = DETAIL_BUDGET[G.detail] || 800;
+  for (const b of stale) {
+    try {
+      const r = await fetch(withRoot(`/api/tiles?level=${b.level}&x=${b.x}&y=${b.y}&budget=${budget}`), { headers: { 'If-None-Match': `"${b.cached.etag}"` }, signal: f.ctrl.signal });
+      if (token !== G.token) return;
+      if (r.status === 304) { installTile(b.key, b.cached.buf); cachePut(b.key, b.cached.buf, b.cached.etag); continue; }
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      const buf = await r.arrayBuffer(); G.stats.bytes += buf.byteLength;
+      const et = (r.headers.get('etag') || '').replace(/"/g, '');
+      installTile(b.key, buf); cachePut(b.key, buf, et);
+    } catch (e) { if (e.name === 'AbortError') return; fresh.push(b); }
+  }
+  if (fresh.length) {
+    let buf;
+    try {
+      const keys = fresh.map(b => `${b.level}/${b.x}/${b.y}`).join(',');
+      const r = await fetch(withRoot(`/api/tiles/batch?keys=${q(keys)}&budget=${budget}`), { signal: f.ctrl.signal });
+      if (!r.ok) throw new Error('HTTP ' + r.status);
+      buf = await r.arrayBuffer();
+    } catch (e) { if (e.name !== 'AbortError') console.warn('tile batch failed', e); return; }
+    if (token !== G.token) return;
+    G.stats.bytes += buf.byteLength;
+    const dv = new DataView(buf); let o = 4; const cnt = dv.getUint32(0, true);
+    for (let i = 0; i < cnt; i++) {
+      const lv = dv.getUint32(o, true), x = dv.getUint32(o + 4, true), y = dv.getUint32(o + 8, true), len = dv.getUint32(o + 12, true);
+      const et = [...new Uint8Array(buf, o + 16, 10)].map(v => v.toString(16).padStart(2, '0')).join('');
+      o += 28;
+      const body = buf.slice(o, o + len); o += (len + 3) & ~3;
+      const key = tileKey(lv, x, y);
+      installTile(key, body); cachePut(key, body, et);
+    }
+  }
+  const dt = performance.now() - t0; G.stats.tileMs.push(dt / Math.max(1, batch.length)); if (G.stats.tileMs.length > 4000) G.stats.tileMs.splice(0, 2000);
 }
-const wpost = (m) => { if (G.worker) G.worker.postMessage(m); };
-function startLayout() { G.layoutRunning = true; updateLayoutUI(); wpost({ type: 'run', maxFrames: LAYOUT_HARD_CAP_FRAMES }); }
-function pauseLayout() { G.layoutRunning = false; wpost({ type: 'stop' }); updateLayoutUI(); }
-function updateLayoutUI() {
-  const pill = $('#layout-pill'); if (pill) pill.classList.toggle('hidden', !G.layoutRunning);
-  const b = $('#pause-btn'); if (b) { b.innerHTML = ic(G.layoutRunning ? 'pause' : 'play'); b.title = G.layoutRunning ? 'Pause layout' : 'Resume layout'; }
+let VIS_T = 0;
+function installTile(key, buf) {
+  let t;
+  try { t = parseTile(buf); } catch (e) { console.warn('bad tile', key, e); return; }
+  t.key = key; t.alpha = 0; t.lastUsed = performance.now(); t.bufs = null; t.ver = 0;
+  const old = G.tiles.get(key); if (old) dropTile(old);
+  G.tiles.set(key, t); G.resident += t.n; G.stats.tilesLoaded++;
+  for (let i = 0; i < t.n; i++) G.nodeRef.set(t.ids[i], { t, i });
+  evict(); G.needsRender = true;
+  if (!VIS_T) VIS_T = setTimeout(() => { VIS_T = 0; updateVisCount(); }, 250);
+  if (G.status === 'ready' && !G.stats.firstFrameAt && G.want.has(key)) G.stats.firstFrameAt = performance.now();
+}
+function dropTile(t) {
+  if (t.bufs && G.gl) { G.gl.deleteBuffer(t.bufs.nodes); G.gl.deleteBuffer(t.bufs.edges); }
+  t.bufs = null; G.resident -= t.n; G.tiles.delete(t.key);
+  for (let i = 0; i < t.n; i++) { const r = G.nodeRef.get(t.ids[i]); if (r && r.t === t) G.nodeRef.delete(t.ids[i]); }
+}
+function evict() {
+  const cap = residentBudget();
+  if (G.resident <= cap && G.tiles.size <= 900) return;
+  const cand = [...G.tiles.values()].filter(t => !G.want.has(t.key) && !G.ring.has(t.key)).sort((a, b) => a.lastUsed - b.lastUsed);
+  for (const t of cand) { if (G.resident <= cap * 0.85 && G.tiles.size <= 800) break; dropTile(t); }
+}
+function lookup(id) {
+  const r = G.nodeRef.get(id);
+  if (r && G.tiles.get(r.t.key) === r.t) return nodeRec(r.t, r.i);
+  const nb = G.nb.nodes.get(id); if (nb && nb.x != null) return nb;
+  const ov = G.overlayPos.get(id); if (ov) return ov;
+  return null;
 }
 
-/* Load / build */
+/* ---- WebGL ---- */
+const VS_NODE = `attribute vec2 a_corner;attribute vec2 a_pos;attribute float a_r;attribute vec4 a_col;
+uniform vec3 u_view;uniform vec2 u_size;uniform float u_minpx;varying vec2 v_uv;varying vec4 v_col;varying float v_px;
+void main(){float rpx=max(a_r*u_view.x,u_minpx);vec2 c=a_pos*u_view.x+u_view.yz;vec2 p=c+a_corner*(rpx+1.0);
+vec2 clip=p/u_size*2.0-1.0;gl_Position=vec4(clip.x,-clip.y,0.0,1.0);v_uv=a_corner*(rpx+1.0)/rpx;v_col=a_col;v_px=rpx;}`;
+const FS_NODE = `precision mediump float;varying vec2 v_uv;varying vec4 v_col;varying float v_px;uniform float u_alpha;
+void main(){float d=length(v_uv);float aa=1.5/max(v_px,1.0);float a=1.0-smoothstep(1.0-aa,1.0,d);if(a<=0.0)discard;
+float ring=v_col.a<0.99?0.0:smoothstep(1.0-aa*2.5,1.0-aa,d)*0.35;gl_FragColor=vec4(v_col.rgb*(1.0-ring),a*u_alpha*max(v_col.a,0.35));}`;
+const VS_EDGE = `attribute vec2 a_pos;attribute vec4 a_col;uniform vec3 u_view;uniform vec2 u_size;varying vec4 v_col;
+void main(){vec2 p=a_pos*u_view.x+u_view.yz;vec2 clip=p/u_size*2.0-1.0;gl_Position=vec4(clip.x,-clip.y,0.0,1.0);v_col=a_col;}`;
+const FS_EDGE = `precision mediump float;varying vec4 v_col;uniform float u_alpha;void main(){gl_FragColor=vec4(v_col.rgb,v_col.a*u_alpha);}`;
+function glInit(cv) {
+  let gl = null, inst = null;
+  try {
+    gl = cv.getContext('webgl2', { antialias: false, premultipliedAlpha: false, alpha: true, powerPreference: 'high-performance' });
+    if (gl) inst = { div: (l, d) => gl.vertexAttribDivisor(l, d), draw: (m, f, c, n) => gl.drawArraysInstanced(m, f, c, n) };
+    else {
+      gl = cv.getContext('webgl', { antialias: false, premultipliedAlpha: false, alpha: true, powerPreference: 'high-performance' });
+      const ext = gl && gl.getExtension('ANGLE_instanced_arrays');
+      if (ext) inst = { div: (l, d) => ext.vertexAttribDivisorANGLE(l, d), draw: (m, f, c, n) => ext.drawArraysInstancedANGLE(m, f, c, n) };
+      else gl = null;
+    }
+  } catch { gl = null; }
+  if (!gl) return null;
+  const prog = (vs, fs) => {
+    const p = gl.createProgram();
+    for (const [type, src] of [[gl.VERTEX_SHADER, vs], [gl.FRAGMENT_SHADER, fs]]) {
+      const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+      gl.attachShader(p, s);
+    }
+    gl.linkProgram(p); if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(p));
+    return p;
+  };
+  try {
+    const node = prog(VS_NODE, FS_NODE), edge = prog(VS_EDGE, FS_EDGE);
+    const corner = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, corner);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+    const L = (p, n) => gl.getAttribLocation(p, n), U = (p, n) => gl.getUniformLocation(p, n);
+    return { gl, inst, node, edge, corner,
+      na: { corner: L(node, 'a_corner'), pos: L(node, 'a_pos'), r: L(node, 'a_r'), col: L(node, 'a_col') },
+      nu: { view: U(node, 'u_view'), size: U(node, 'u_size'), minpx: U(node, 'u_minpx'), alpha: U(node, 'u_alpha') },
+      ea: { pos: L(edge, 'a_pos'), col: L(edge, 'a_col') },
+      eu: { view: U(edge, 'u_view'), size: U(edge, 'u_size'), alpha: U(edge, 'u_alpha') } };
+  } catch (e) { console.warn('WebGL init failed, using 2D fallback:', e); return null; }
+}
+
+/* Per-tile buffers: rebuilt only when filters / colours / focus change (styleVersion). */
+function nodeVisible(t, i) {
+  const k = TILE_NODE_KINDS[t.kind[i]];
+  if (!G.nodeFilter.has(k)) return false;
+  if (G.focus && t.lod === 0 && !G.focus.has(t.ids[i])) return false;
+  return true;
+}
+function nodeColor(t, i) {
+  const k = TILE_NODE_KINDS[t.kind[i]];
+  if (G.colorMode === 'community' || t.lod === 2) {
+    const c = t.clu[i]; if (c != null && c !== -1) return rgbaBytes(commColor(c), t.lod ? 0.85 : 1);
+  }
+  const base = (G.T.kindRGBA[k === 'Cluster' ? 'Module' : k] || [136, 136, 136, 255]).slice();
+  if (t.lod) base[3] = 216;
+  return base;
+}
+function buildTileArrays(t) {
+  const NV = new Float32Array(t.n * 4), NU = new Uint8Array(NV.buffer);
+  let c = 0;
+  const vis = new Uint8Array(t.n);
+  for (let i = 0; i < t.n; i++) {
+    if (!nodeVisible(t, i)) continue;
+    vis[i] = 1;
+    NV[c * 4] = t.x[i]; NV[c * 4 + 1] = t.y[i]; NV[c * 4 + 2] = tileRadius(t, i);
+    const col = nodeColor(t, i); NU.set(col, c * 16 + 12); c++;
+  }
+  const EV = new Float32Array(t.m * 6), EU = new Uint8Array(EV.buffer);
+  let e = 0;
+  const px = (j) => j < t.n ? t.x[j] : t.gx[j - t.n], py = (j) => j < t.n ? t.y[j] : t.gy[j - t.n];
+  const okEnd = (j) => j < t.n ? vis[j] === 1 : (G.nodeFilter.has(TILE_NODE_KINDS[t.gkind[j - t.n]]) && (!G.focus || t.lod !== 0 || G.focus.has(t.gids[j - t.n])));
+  for (let k = 0; k < t.m; k++) {
+    const kind = EDGE_KINDS[t.ek[k]]; if (!kind || !G.edgeFilter.has(kind.id)) continue;
+    if (G.minConf > 0 && kind.id === 'CALLS' && t.ec[k] / 255 < G.minConf) continue;
+    const a = t.ea[k], b = t.eb[k]; if (!okEnd(a) || !okEnd(b)) continue;
+    const col = G.T.edgeRGBA[t.ek[k]] || [128, 128, 128, 60];
+    const w = t.lod ? Math.min(1, 0.35 + Math.log2(1 + t.ew[k]) * 0.12) : 1;
+    EV[e * 6] = px(a); EV[e * 6 + 1] = py(a); EU.set([col[0], col[1], col[2], Math.round(col[3] * w)], e * 24 + 8);
+    EV[e * 6 + 3] = px(b); EV[e * 6 + 4] = py(b); EU.set([col[0], col[1], col[2], Math.round(col[3] * w)], e * 24 + 20);
+    e++;
+  }
+  return { nodes: NV.subarray(0, c * 4), nNodes: c, edges: EV.subarray(0, e * 6), nEdges: e };
+}
+function ensureBuffers(t) {
+  if (t.ver === G.styleVersion && (t.bufs || !G.glx)) return;
+  const a = buildTileArrays(t);
+  t.cpu = a; t.ver = G.styleVersion;
+  const X = G.glx; if (!X) return;
+  const gl = X.gl;
+  if (!t.bufs) t.bufs = { nodes: gl.createBuffer(), edges: gl.createBuffer() };
+  gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.nodes); gl.bufferData(gl.ARRAY_BUFFER, a.nodes, gl.STATIC_DRAW);
+  gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.edges); gl.bufferData(gl.ARRAY_BUFFER, a.edges, gl.STATIC_DRAW);
+  t.nNodes = a.nNodes; t.nEdges = a.nEdges;
+  if (t.cpu && G.glx) t.cpu = null;
+}
+function drawGL(order, dim) {
+  const X = G.glx, gl = X.gl, W = G.size.w, H = G.size.h, vp = G.vp;
+  gl.viewport(0, 0, G.canvas.width, G.canvas.height);
+  gl.clearColor(0, 0, 0, 0); gl.clear(gl.COLOR_BUFFER_BIT);
+  gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+  // edges
+  gl.useProgram(X.edge);
+  gl.uniform3f(X.eu.view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.eu.size, W, H);
+  for (const t of order) {
+    if (!t.nEdges) continue;
+    gl.uniform1f(X.eu.alpha, t.alpha * (dim ? 0.3 : 1));
+    gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.edges);
+    gl.enableVertexAttribArray(X.ea.pos); gl.vertexAttribPointer(X.ea.pos, 2, gl.FLOAT, false, 12, 0);
+    gl.enableVertexAttribArray(X.ea.col); gl.vertexAttribPointer(X.ea.col, 4, gl.UNSIGNED_BYTE, true, 12, 8);
+    gl.drawArrays(gl.LINES, 0, t.nEdges * 2);
+  }
+  // nodes (instanced quads)
+  gl.useProgram(X.node);
+  gl.uniform3f(X.nu.view, vp.scale, vp.tx, vp.ty); gl.uniform2f(X.nu.size, W, H);
+  gl.bindBuffer(gl.ARRAY_BUFFER, X.corner);
+  gl.enableVertexAttribArray(X.na.corner); gl.vertexAttribPointer(X.na.corner, 2, gl.FLOAT, false, 0, 0); X.inst.div(X.na.corner, 0);
+  for (const t of order) {
+    if (!t.nNodes) continue;
+    gl.uniform1f(X.nu.alpha, t.alpha * (dim ? 0.28 : 1));
+    gl.uniform1f(X.nu.minpx, t.lod === 0 ? 1.3 : t.lod === 1 ? 2.2 : 3.5);
+    gl.bindBuffer(gl.ARRAY_BUFFER, t.bufs.nodes);
+    gl.enableVertexAttribArray(X.na.pos); gl.vertexAttribPointer(X.na.pos, 2, gl.FLOAT, false, 16, 0); X.inst.div(X.na.pos, 1);
+    gl.enableVertexAttribArray(X.na.r); gl.vertexAttribPointer(X.na.r, 1, gl.FLOAT, false, 16, 8); X.inst.div(X.na.r, 1);
+    gl.enableVertexAttribArray(X.na.col); gl.vertexAttribPointer(X.na.col, 4, gl.UNSIGNED_BYTE, true, 16, 12); X.inst.div(X.na.col, 1);
+    X.inst.draw(gl.TRIANGLE_STRIP, 0, 4, t.nNodes);
+  }
+  X.inst.div(X.na.pos, 0); X.inst.div(X.na.r, 0); X.inst.div(X.na.col, 0);
+}
+function draw2D(order, dim) {
+  // Fallback when WebGL is unavailable: same tiles, drawn with Canvas 2D batches.
+  const ctx = G.ctx2d, vp = G.vp;
+  ctx.setTransform(G.dpr, 0, 0, G.dpr, 0, 0); ctx.clearRect(0, 0, G.size.w, G.size.h);
+  ctx.save(); ctx.translate(vp.tx, vp.ty); ctx.scale(vp.scale, vp.scale); ctx.lineWidth = 0.7 / vp.scale;
+  for (const t of order) {
+    const a = t.cpu || buildTileArrays(t); t.cpu = a;
+    ctx.globalAlpha = t.alpha * (dim ? 0.3 : 1);
+    const EU = new Uint8Array(a.edges.buffer, a.edges.byteOffset, a.edges.byteLength);
+    for (let e = 0; e < a.nEdges; e++) { const o = e * 24 + 8; ctx.strokeStyle = `rgba(${EU[o]},${EU[o + 1]},${EU[o + 2]},${EU[o + 3] / 255})`; ctx.beginPath(); ctx.moveTo(a.edges[e * 6], a.edges[e * 6 + 1]); ctx.lineTo(a.edges[e * 6 + 3], a.edges[e * 6 + 4]); ctx.stroke(); }
+    const NU = new Uint8Array(a.nodes.buffer, a.nodes.byteOffset, a.nodes.byteLength);
+    for (let i = 0; i < a.nNodes; i++) { const o = i * 16 + 12; ctx.fillStyle = `rgb(${NU[o]},${NU[o + 1]},${NU[o + 2]})`; ctx.beginPath(); ctx.arc(a.nodes[i * 4], a.nodes[i * 4 + 1], Math.max(a.nodes[i * 4 + 2], 1.3 / vp.scale), 0, Math.PI * 2); ctx.fill(); }
+  }
+  ctx.restore(); ctx.globalAlpha = 1;
+}
+
+/* ---- load ---- */
 function setOverlay(kind, title = '', sub = '', actions = '') {
   const o = $('#stage-over'); if (!o) return;
   if (!kind) { o.classList.add('hidden'); o.innerHTML = ''; return; }
@@ -1168,13 +1363,17 @@ function setOverlay(kind, title = '', sub = '', actions = '') {
   o.innerHTML = `<div class="over-card glass">${iconHtml}<div class="t">${esc(title)}</div>${sub ? `<div class="s">${sub}</div>` : ''}${actions ? `<div class="row wrap" style="justify-content:center;margin-top:4px">${actions}</div>` : ''}</div>`;
   hydrateIcons(o);
 }
-async function loadGraph(mode = G.lodMode) {
+function clearTiles() {
+  for (const t of [...G.tiles.values()]) dropTile(t);
+  for (const f of G.inflight) { try { f.ctrl.abort(); } catch { /* ignore */ } }
+  G.inflight = []; G.queue = []; G.tiles.clear(); G.nodeRef.clear(); G.resident = 0;
+}
+async function loadGraph() {
   const token = ++G.token;
-  G.status = 'loading'; G.error = null;
-  setOverlay('loading', mode === 'levels' ? 'Loading all files…' : 'Loading graph…', 'Fetching from server');
-  await yieldFrame();
-  let data;
-  try { data = mode === 'levels' ? await api('/api/files') : await api(`/api/graph?limit_nodes=${ALL_NODES_CAP}`); }
+  G.status = 'loading'; G.error = null; G.stats.loadStart = performance.now(); G.stats.firstFrameAt = 0;
+  setOverlay('loading', 'Loading graph…', 'Fetching the tile manifest');
+  let man;
+  try { man = await api('/api/tiles/manifest'); }
   catch (e) {
     if (token !== G.token) return;
     G.status = 'error'; G.error = e;
@@ -1182,257 +1381,88 @@ async function loadGraph(mode = G.lodMode) {
     return;
   }
   if (token !== G.token) return;
-  G.graph = { nodes: data.nodes || [], edges: data.edges || [] };
-  if (!G.graph.nodes.length) {
-    G.status = 'empty'; G.layout = []; G.byId = new Map(); G.labelOrder = []; computeVisible(); renderGraphChrome(); G.needsRender = true;
+  const prevGen = G.gen;
+  if (!man || !man.ready || !man.counts || !man.counts.sym_nodes) {
+    clearTiles(); G.man = null; G.status = 'empty'; renderGraphChrome(); G.needsRender = true;
     const ri = rootInfo();
-    setOverlay('empty', `No graph yet for ${ROOT.slug || 'this root'}`, ri && !ri.last_indexed_at ? 'This root has never been indexed.' : 'The index is empty.',
+    setOverlay('empty', `No graph yet for ${ROOT.slug || 'this root'}`,
+      ri && !ri.last_indexed_at ? 'This root has never been indexed.' : (man && man.reason ? esc(man.reason) : 'The index is empty.'),
       '<button class="btn sm primary" data-act="index-now">Index now</button><a class="btn sm" href="#/index">Open Index</a>');
     return;
   }
-  setOverlay('loading', 'Building layout…', `${fmtNum(G.graph.nodes.length)} nodes · ${fmtNum(G.graph.edges.length)} edges`);
-  await yieldFrame();
-  if (token !== G.token) return;
-  G.expanded.clear(); G.revealed = new Set(); G.hoverId = null; G.nb = { id: null, set: new Set() };
-  const keepSel = G.selectedId;
-  buildLayout();
-  if (keepSel != null && !G.byId.has(keepSel)) G.selectedId = null;
-  computeVisible();
-  setOverlay('loading', 'Starting physics…', `${fmtNum(G.graph.nodes.length)} nodes settling`);
-  await yieldFrame();
-  if (token !== G.token) return;
-  G.fitNext = true; spawnWorker(); postLayoutInit(); startLayout();
-  G.status = 'ready'; G.needsRender = true;
-  renderGraphChrome();
-  await yieldFrame();
-  if (token !== G.token) return;
+  const sameWorld = G.man && prevGen && JSON.stringify(G.man.bbox) === JSON.stringify(man.bbox);
+  G.man = man; G.gen = man.generation;
+  G.clusterNames = new Map((man.clusters || []).map(c => [c.id, c]));
+  G.communities = (man.clusters || []).map(c => ({ id: c.id, size: c.size, label: c.name, server: c.id >= 0 }));
+  // a new generation keeps resident tiles until their replacements arrive (304s are cheap)
+  if (!sameWorld) { clearTiles(); G.fitNext = true; }
+  else for (const t of G.tiles.values()) t.lastUsed = 0;
+  if (sameWorld) { const keep = [...G.tiles.values()]; for (const t of keep) { G.tiles.delete(t.key); G.resident -= t.n; if (t.bufs && G.gl) { G.gl.deleteBuffer(t.bufs.nodes); G.gl.deleteBuffer(t.bufs.edges); } } G.nodeRef.clear(); }
+  G.status = 'ready';
   setOverlay(null);
+  renderGraphChrome(); renderLegend();
+  G.needsRender = true;
+  if (G.fitNext && G.size.w) { fitToScreen(); G.fitNext = false; }
+  updateWanted();
   if (G.pending) { const p = G.pending; G.pending = null; selectNode(p.id, p.opts); }
-  else if (G.selectedId != null) { lazyExpand(G.selectedId); }
-}
-function makeLayoutNode(n, maxPR, x, y) {
-  return { id: n.id, name: n.name, kind: n.kind, file: n.file, x, y, r: 2.5 + Math.sqrt((n.pagerank || 0) / maxPR) * 12, pagerank: n.pagerank || 0, community: null, cluster: n.cluster ?? null, idx: 0 };
-}
-function buildLayout() {
-  const nodes = G.graph.nodes, N = Math.max(1, nodes.length);
-  let maxPR = 0.0001; for (const n of nodes) if ((n.pagerank || 0) > maxPR) maxPR = n.pagerank;
-  G.maxPR = maxPR;
-  G.layout = nodes.map((n, i) => {
-    const a = (i / N) * Math.PI * 2, r0 = 200 + Math.sqrt(N) * 6 + (Math.random() - 0.5) * 30;
-    return makeLayoutNode(n, maxPR, Math.cos(a) * r0 + (Math.random() - 0.5) * 12, Math.sin(a) * r0 + (Math.random() - 0.5) * 12);
-  });
-  G.byId = new Map(G.layout.map(n => [n.id, n]));
-  G.level0 = new Set(G.layout.filter(n => n.kind === 'File').map(n => n.id));
-  G.revealed = new Set(); G.communities = []; G.hullCache = null;
-  G.hasServerClusters = G.layout.some(n => n.cluster != null);
-  G.hasConf = G.graph.edges.some(e => e.kind === 'CALLS' && e.confidence != null);
-  if (G.hasServerClusters) loadClusterNames();
-  sortLabels();
-}
-function sortLabels() { G.labelOrder = [...G.layout].sort((a, b) => b.pagerank - a.pagerank); }
-function summarizeCommunities() {
-  const m = new Map();
-  for (const n of G.layout) {
-    const cm = commOf(n);
-    if (cm == null) continue;
-    let c = m.get(cm); if (!c) { c = { id: cm, size: 0, dirs: new Map() }; m.set(cm, c); }
-    c.size++;
-    const d = n.file ? dirname(n.file) : '';
-    if (d) c.dirs.set(d, (c.dirs.get(d) || 0) + 1);
-  }
-  G.communities = [...m.values()].sort((a, b) => b.size - a.size).map(c => {
-    let best = '', bn = 0; for (const [d, k] of c.dirs) if (k > bn) { bn = k; best = d; }
-    const srv = G.hasServerClusters ? G.clusterNames.get(c.id) : null;
-    return { id: c.id, size: c.size, server: !!srv, label: srv ? srv.name : best === '.' ? '(root)' : (best.split('/').slice(-2).join('/') || `#${c.id}`) };
-  });
-  G.hullCache = null;
-  renderLegend();
+  else if (G.selectedId != null) loadNeighbors(G.selectedId);
 }
 
-/* Visibility (kind filter → LOD → focus hops) */
-function computeVisible() {
-  let allowed = new Set();
-  for (const n of G.layout) if (G.nodeFilter.has(n.kind)) allowed.add(n.id);
-  const focus = G.focusHops > 0 && G.selectedId !== null;
-  if (G.lodMode === 'levels' && !focus) {
-    const s = new Set(); for (const id of allowed) if (G.level0.has(id) || G.revealed.has(id)) s.add(id); allowed = s;
-  }
-  if (focus) {
-    const adj = new Map();
-    for (const e of G.graph.edges) {
-      if (!edgeOn(e)) continue;
-      (adj.get(e.src) || adj.set(e.src, []).get(e.src)).push(e.dst);
-      (adj.get(e.dst) || adj.set(e.dst, []).get(e.dst)).push(e.src);
+/* ---- frame loop ---- */
+function tick(now) {
+  requestAnimationFrame(tick);
+  if (!G.shown) return;
+  const dt = Math.min(64, now - (G.lastTick || now)); G.lastTick = now;
+  let animating = false;
+  const allReady = [...G.want].every(k => G.tiles.has(k));
+  for (const t of G.tiles.values()) {
+    const target = G.want.has(t.key) ? 1 : (allReady ? 0 : t.alpha);
+    if (t.alpha !== target) {
+      t.alpha = target > t.alpha ? Math.min(target, t.alpha + dt / 220) : Math.max(target, t.alpha - dt / 260);
+      animating = true;
     }
-    const seen = new Set([G.selectedId]); let fr = [G.selectedId];
-    for (let h = 0; h < G.focusHops && fr.length; h++) {
-      const nx = []; for (const id of fr) for (const o of (adj.get(id) || [])) if (!seen.has(o)) { seen.add(o); nx.push(o); } fr = nx;
-    }
-    const r = new Set(); for (const id of seen) if (allowed.has(id)) r.add(id); allowed = r;
   }
-  G.visibleIds = allowed; G.hullCache = null;
-  const vc = $('#vis-count'); if (vc) vc.innerHTML = allowed.size < G.layout.length ? `<b>${fmtNum(allowed.size)}</b> visible` : '';
-}
-function isNeighbor(id, sel) {
-  if (G.nb.id !== sel) {
-    const s = new Set();
-    for (const e of G.graph.edges) { if (!edgeOn(e)) continue; if (e.src === sel) s.add(e.dst); if (e.dst === sel) s.add(e.src); }
-    G.nb = { id: sel, set: s };
-  }
-  return G.nb.set.has(id);
-}
-
-/* Render: edges batched per colour, nodes per colour+alpha, viewport-culled, labels capped */
-function render() {
-  const ctx = G.ctx; if (!ctx) return;
-  const T = G.T || (G.T = readTheme());
-  const w = G.size.w, h = G.size.h, vp = G.vp;
-  ctx.clearRect(0, 0, w, h);
-  if (!G.layout.length) return;
-  if (G.fitNext) { fitToScreen(); G.fitNext = false; }
-  ctx.save(); ctx.translate(vp.tx, vp.ty); ctx.scale(vp.scale, vp.scale);
-  const vis = G.visibleIds, sel = G.selectedId;
-  const vMinX = -vp.tx / vp.scale, vMinY = -vp.ty / vp.scale, vMaxX = vMinX + w / vp.scale, vMaxY = vMinY + h / vp.scale;
-  ctx.lineWidth = 0.7 / vp.scale;
-  const byCol = new Map();
-  if (G.hulls) drawHulls(ctx, T, vp);
-  for (const e of G.graph.edges) {
-    if (!edgeOn(e)) continue;
-    if (vis && !(vis.has(e.src) && vis.has(e.dst))) continue;
-    const a = G.byId.get(e.src), b = G.byId.get(e.dst); if (!a || !b) continue;
-    if ((a.x < vMinX && b.x < vMinX) || (a.x > vMaxX && b.x > vMaxX) || (a.y < vMinY && b.y < vMinY) || (a.y > vMaxY && b.y > vMaxY)) continue;
-    const col = T.edge[e.kind] || hexA(T.faint, .2);
-    let arr = byCol.get(col); if (!arr) { arr = []; byCol.set(col, arr); }
-    arr.push(a.x, a.y, b.x, b.y);
-  }
-  if (sel !== null) ctx.globalAlpha = 0.35;
-  for (const [col, arr] of byCol) {
-    ctx.strokeStyle = col; ctx.beginPath();
-    for (let i = 0; i < arr.length; i += 4) { ctx.moveTo(arr[i], arr[i + 1]); ctx.lineTo(arr[i + 2], arr[i + 3]); }
-    ctx.stroke();
-  }
-  ctx.globalAlpha = 1;
-  if (sel !== null) {
-    ctx.lineWidth = 1.7 / vp.scale; ctx.strokeStyle = T.accent; ctx.beginPath();
-    for (const e of G.graph.edges) {
-      if ((e.src !== sel && e.dst !== sel) || !edgeOn(e)) continue;
-      if (vis && !(vis.has(e.src) && vis.has(e.dst))) continue;
-      const a = G.byId.get(e.src), b = G.byId.get(e.dst); if (!a || !b) continue;
-      ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y);
-    }
-    ctx.stroke();
-  }
-  const full = new Map(), dim = new Map();
-  for (const n of G.layout) {
-    if (vis && !vis.has(n.id)) continue;
-    if (n.x < vMinX - 30 || n.x > vMaxX + 30 || n.y < vMinY - 30 || n.y > vMaxY + 30) continue;
-    const ov = G.overlay;
-    const isDim = (sel !== null && n.id !== sel && !isNeighbor(n.id, sel)) || (ov && sel === null && !ov.changed.has(n.id) && !ov.affected.has(n.id));
-    const cm = commOf(n);
-    const col = (G.colorMode === 'community' && cm != null) ? commColor(cm) : kindColor(n.kind);
-    const m = isDim ? dim : full; let arr = m.get(col); if (!arr) { arr = []; m.set(col, arr); }
-    arr.push(n.x, n.y, n.r);
-  }
-  const drawBatch = (m, alpha) => {
-    ctx.globalAlpha = alpha;
-    for (const [col, arr] of m) {
-      ctx.fillStyle = col; ctx.beginPath();
-      for (let i = 0; i < arr.length; i += 3) { ctx.moveTo(arr[i] + arr[i + 2], arr[i + 1]); ctx.arc(arr[i], arr[i + 1], arr[i + 2], 0, Math.PI * 2); }
-      ctx.fill();
-    }
-  };
-  drawBatch(dim, 0.22); drawBatch(full, 1); ctx.globalAlpha = 1;
-  const ring = (id, width, color, pad) => { const n = G.byId.get(id); if (!n) return; ctx.lineWidth = width / vp.scale; ctx.strokeStyle = color; ctx.beginPath(); ctx.arc(n.x, n.y, n.r + pad / vp.scale, 0, Math.PI * 2); ctx.stroke(); };
-  if (G.overlay) {
-    for (const id of G.overlay.affected) if (!vis || vis.has(id)) ring(id, 1.6, hexA(T.warn, .85), 2);
-    for (const id of G.overlay.changed) if (!vis || vis.has(id)) ring(id, 3, T.err, 3.5);
-  }
-  if (sel !== null) ring(sel, 2.5, T.accent, 3);
-  if (G.hoverId !== null && G.hoverId !== sel) ring(G.hoverId, 1.6, T.text, 2);
-  // Labels: top-N by PageRank inside the viewport (N grows with zoom), + selection neighbours + hover.
-  const fs = 11.5 / vp.scale, lab = (n, weight, color, alpha) => {
-    const t = n.kind === 'File' ? basename(n.name) : n.name;
-    ctx.globalAlpha = alpha; ctx.font = `${weight} ${fs}px ${T.mono}`;
-    ctx.lineWidth = 3 / vp.scale; ctx.strokeStyle = T.bg; ctx.strokeText(t, n.x + n.r + 3 / vp.scale, n.y + 4 / vp.scale);
-    ctx.fillStyle = color; ctx.fillText(t, n.x + n.r + 3 / vp.scale, n.y + 4 / vp.scale);
-  };
-  const cap = vp.scale > 2.2 ? 400 : vp.scale > 1.2 ? 160 : vp.scale > 0.45 ? 50 : 15;
-  ctx.lineJoin = 'round';
-  let drawn = 0;
-  for (const n of G.labelOrder) {
-    if (drawn >= cap) break;
-    if (vis && !vis.has(n.id)) continue;
-    if (n.x < vMinX || n.x > vMaxX || n.y < vMinY || n.y > vMaxY) continue;
-    if (sel !== null && n.id !== sel && !isNeighbor(n.id, sel)) continue;
-    lab(n, 500, n.kind === 'File' ? T.text : T.faint, 0.9); drawn++;
-  }
-  if (sel !== null) {
-    let k = 0;
-    for (const id of G.nb.set) { if (k++ > 60) break; const n = G.byId.get(id); if (n && (!vis || vis.has(id))) lab(n, 500, T.text, 0.85); }
-    const s = G.byId.get(sel); if (s) lab(s, 650, T.text, 1);
-  }
-  if (G.overlay && sel === null) { let k = 0; for (const id of G.overlay.changed) { if (k++ > 40) break; const n = G.byId.get(id); if (n && (!vis || vis.has(id))) lab(n, 650, T.text, 1); } }
-  if (G.hoverId !== null) { const n = G.byId.get(G.hoverId); if (n) lab(n, 600, T.text, 1); }
-  ctx.globalAlpha = 1;
-  ctx.restore();
-}
-function tick() {
-  const now = performance.now();
-  if (G.needsRender && G.shown) {
+  if (G.needsRender || animating) {
     const throttled = G.layoutRunning && (now - G.lastRender < SETTLE_RENDER_MS);
     if (!throttled) { render(); G.needsRender = false; G.lastRender = now; }
   }
-  requestAnimationFrame(tick);
+  const s = G.stats; s.frames++;
+  if (now - s.fpsT > 1000) { s.fps = Math.round(s.frames * 1000 / (now - s.fpsT)); s.frames = 0; s.fpsT = now; }
 }
-function fitToScreen() {
-  if (!G.layout.length || !G.size.w) return;
-  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity; const vis = G.visibleIds;
-  for (const n of G.layout) { if (vis && !vis.has(n.id)) continue; if (n.x < minX) minX = n.x; if (n.y < minY) minY = n.y; if (n.x > maxX) maxX = n.x; if (n.y > maxY) maxY = n.y; }
-  if (!isFinite(minX)) return;
-  const w = G.size.w, h = G.size.h, dx = (maxX - minX) || 1, dy = (maxY - minY) || 1;
-  const s = Math.min(w / (dx + 100), h / (dy + 140), 1.5);
-  G.vp.scale = s; G.vp.tx = w / 2 - ((minX + maxX) / 2) * s; G.vp.ty = h / 2 - ((minY + maxY) / 2) * s;
-  G.needsRender = true;
+function render() {
+  if (!G.canvas || !G.size.w) return;
+  const T = G.T || (G.T = readTheme());
+  if (G.fitNext && G.man) { fitToScreen(); G.fitNext = false; }
+  const order = [...G.tiles.values()].filter(t => t.alpha > 0.001)
+    .sort((a, b) => (G.want.has(a.key) - G.want.has(b.key)) || (a.level - b.level));
+  const v = viewWorld(40);
+  const drawn = order.filter(t => { const b = tileBounds(t); return !(b.x1 < v.x0 || b.x0 > v.x1 || b.y1 < v.y0 || b.y0 > v.y1) || t.g; });
+  for (const t of drawn) ensureBuffers(t);
+  const dim = G.selectedId !== null || (G.overlay && G.selectedId === null);
+  if (G.glx) drawGL(drawn, dim); else draw2D(drawn, dim);
+  drawUnder(T); drawOver(T, drawn, dim);
 }
-function zoomAt(px, py, next) {
-  const vp = G.vp, wx = (px - vp.tx) / vp.scale, wy = (py - vp.ty) / vp.scale;
-  vp.scale = Math.max(0.05, Math.min(8, next)); vp.tx = px - wx * vp.scale; vp.ty = py - wy * vp.scale; G.needsRender = true;
-}
-const zoomBy = (f) => zoomAt(G.size.w / 2, G.size.h / 2, G.vp.scale * f);
-function centerOn(id) {
-  const n = G.byId.get(id); if (!n || !G.size.w) return;
-  const k = Math.max(G.vp.scale, 1.2), from = { ...G.vp };
-  const to = { scale: k, tx: G.size.w / 2 - n.x * k, ty: G.size.h / 2 - n.y * k };
-  let t = 0;
-  const step = () => { t = Math.min(1, t + 0.08); const e = 1 - Math.pow(1 - t, 3);
-    G.vp.scale = from.scale + (to.scale - from.scale) * e; G.vp.tx = from.tx + (to.tx - from.tx) * e; G.vp.ty = from.ty + (to.ty - from.ty) * e;
-    G.needsRender = true; if (t < 1) requestAnimationFrame(step); };
-  step();
-}
-function nodeAt(px, py) {
-  const wx = (px - G.vp.tx) / G.vp.scale, wy = (py - G.vp.ty) / G.vp.scale, vis = G.visibleIds, slop = 6 / G.vp.scale;
-  let best = null, bd = Infinity;
-  for (const n of G.layout) {
-    if (vis && !vis.has(n.id)) continue;
-    const dx = n.x - wx, dy = n.y - wy, d = dx * dx + dy * dy, hr = n.r + slop;
-    if (d < hr * hr && d < bd) { best = n; bd = d; }
+function drawUnder(T) {
+  const ctx = G.under; if (!ctx) return;
+  ctx.setTransform(G.dpr, 0, 0, G.dpr, 0, 0); ctx.clearRect(0, 0, G.size.w, G.size.h);
+  if (!G.hulls || !G.man) return;
+  const now = performance.now();
+  if (!G.hullCache || now - G.hullAt > 400) { G.hullCache = computeHulls(); G.hullAt = now; }
+  const vp = G.vp; ctx.save(); ctx.translate(vp.tx, vp.ty); ctx.scale(vp.scale, vp.scale);
+  const pad = 14 / vp.scale;
+  for (const h of G.hullCache) {
+    const col = commColor(h.c); ctx.beginPath();
+    h.hull.forEach((p, i) => { const dx = p[0] - h.cx, dy = p[1] - h.cy, len = Math.hypot(dx, dy) || 1, x = p[0] + dx / len * pad, y = p[1] + dy / len * pad; if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y); });
+    ctx.closePath(); ctx.globalAlpha = 0.07; ctx.fillStyle = col; ctx.fill();
+    ctx.globalAlpha = 0.45; ctx.lineWidth = 1.2 / vp.scale; ctx.strokeStyle = col; ctx.stroke();
   }
-  return best;
-}
-function resetLayout() {
-  const N = G.layout.length;
-  for (let i = 0; i < N; i++) { const a = (i / Math.max(1, N)) * Math.PI * 2, r0 = 200 + Math.sqrt(N) * 6; G.layout[i].x = Math.cos(a) * r0; G.layout[i].y = Math.sin(a) * r0; }
-  G.fitNext = true; postLayoutInit(); startLayout(); G.needsRender = true;
-}
-
-/* Cluster names (server Louvain) + convex hulls */
-const clustersList = () => cached('clusters', () => api('/api/clusters?limit=500'));
-function loadClusterNames() {
-  clustersList().then(d => {
-    G.clusterNames = new Map((d.clusters || []).map(c => [c.id, c]));
-    summarizeCommunities(); G.needsRender = true;
-    if (S.page === 'graph' && S.sel && S.detTab === 'overview') renderDetail();
-  }).catch(() => { /* names optional: legend falls back to directories */ });
+  ctx.globalAlpha = 1;
+  const fs = 12 / vp.scale; ctx.font = `600 ${fs}px ${T.sans}`; ctx.textAlign = 'center'; ctx.lineJoin = 'round';
+  for (const h of G.hullCache.slice(0, 12)) {
+    const info = G.clusterNames.get(h.c), t = info ? info.name : '#' + h.c, y = h.top - pad - 4 / vp.scale;
+    ctx.lineWidth = 3 / vp.scale; ctx.strokeStyle = T.bg; ctx.strokeText(t, h.cx, y); ctx.fillStyle = commColor(h.c); ctx.fillText(t, h.cx, y);
+  }
+  ctx.restore(); ctx.textAlign = 'left';
 }
 function convexHull(pts) {
   if (pts.length < 3) return pts.slice();
@@ -1443,87 +1473,221 @@ function convexHull(pts) {
   for (let i = pts.length - 1; i >= 0; i--) { const p = pts[i]; while (up.length >= 2 && cross(up[up.length - 2], up[up.length - 1], p) <= 0) up.pop(); up.push(p); }
   up.pop(); lo.pop(); return lo.concat(up);
 }
-// Hulls are recomputed at most every 400 ms (layout ticks arrive far more often); top 40 clusters only.
 function computeHulls() {
-  const groups = new Map(), vis = G.visibleIds;
-  for (const n of G.layout) {
-    if (vis && !vis.has(n.id)) continue;
-    const c = commOf(n); if (c == null) continue;
-    let g = groups.get(c); if (!g) { g = []; groups.set(c, g); } g.push([n.x, n.y]);
+  // top 40 clusters over the nodes of the current display tiles
+  const groups = new Map();
+  for (const key of G.want) {
+    const t = G.tiles.get(key); if (!t) continue;
+    for (let i = 0; i < t.n; i++) {
+      // files carry the layout cluster (symbols sit inside their file's disc)
+      if (t.lod === 0 && t.kind[i] !== 0) continue;
+      const c = t.clu[i]; if (c === -1 || !nodeVisible(t, i)) continue;
+      let g = groups.get(c); if (!g) { g = []; groups.set(c, g); }
+      if (t.lod) { const r = tileRadius(t, i); for (let a = 0; a < 8; a++) g.push([t.x[i] + Math.cos(a * 0.785) * r, t.y[i] + Math.sin(a * 0.785) * r]); }
+      else { const r = 6.2 * Math.sqrt(t.size[i]) + 8; for (let a = 0; a < 6; a++) g.push([t.x[i] + Math.cos(a * 1.047) * r, t.y[i] + Math.sin(a * 1.047) * r]); }
+    }
   }
   const out = [];
   for (const [c, pts] of groups) {
     if (pts.length < 3) continue;
     let cx = 0, cy = 0, minY = Infinity; for (const p of pts) { cx += p[0]; cy += p[1]; if (p[1] < minY) minY = p[1]; }
-    out.push({ c, n: pts.length, hull: convexHull(pts), cx: cx / pts.length, cy: cy / pts.length, top: minY });
+    out.push({ c, n: pts.length, hull: convexHull(pts.length > 4000 ? pts.filter((_, i) => i % Math.ceil(pts.length / 4000) === 0) : pts), cx: cx / pts.length, cy: cy / pts.length, top: minY });
   }
   out.sort((a, b) => b.n - a.n);
   return out.slice(0, 40);
 }
-function drawHulls(ctx, T, vp) {
-  const now = performance.now();
-  if (!G.hullCache || now - G.hullAt > 400) { G.hullCache = computeHulls(); G.hullAt = now; }
-  const pad = 14 / vp.scale;
-  for (const h of G.hullCache) {
-    const col = commColor(h.c);
-    ctx.beginPath();
-    h.hull.forEach((p, i) => {
-      // Push each hull vertex `pad` away from the centroid so the outline clears the node discs.
-      const dx = p[0] - h.cx, dy = p[1] - h.cy, len = Math.hypot(dx, dy) || 1;
-      const x = p[0] + (dx / len) * pad, y = p[1] + (dy / len) * pad;
-      if (i) ctx.lineTo(x, y); else ctx.moveTo(x, y);
-    });
-    ctx.closePath();
-    ctx.globalAlpha = 0.07; ctx.fillStyle = col; ctx.fill();
-    ctx.globalAlpha = 0.45; ctx.lineWidth = 1.2 / vp.scale; ctx.strokeStyle = col; ctx.stroke();
+const LABEL_W = new Map();
+function drawOver(T, drawn, dim) {
+  const ctx = G.over; if (!ctx) return;
+  const vp = G.vp, W = G.size.w, H = G.size.h;
+  ctx.setTransform(G.dpr, 0, 0, G.dpr, 0, 0); ctx.clearRect(0, 0, W, H);
+  const sx = (x) => x * vp.scale + vp.tx, sy = (y) => y * vp.scale + vp.ty;
+  const sel = G.selectedId;
+  // selection neighbourhood (and focus set): edges + nodes on top of the dimmed world
+  if (sel !== null && G.nb.id === sel) {
+    ctx.lineWidth = 1.5; ctx.strokeStyle = hexA(T.accent, 0.9); ctx.beginPath();
+    for (const e of G.nb.edges) {
+      if (!G.edgeFilter.has(e.kind)) continue;
+      if (G.minConf > 0 && e.kind === 'CALLS' && e.confidence != null && e.confidence < G.minConf) continue;
+      if (G.focusHops <= 1 && e.src !== sel && e.dst !== sel) continue;
+      const a = lookup(e.src), b = lookup(e.dst); if (!a || !b) continue;
+      ctx.moveTo(sx(a.x), sy(a.y)); ctx.lineTo(sx(b.x), sy(b.y));
+    }
+    ctx.stroke();
+    for (const n of G.nb.nodes.values()) {
+      const r = lookup(n.id) || n; if (r.x == null) continue;
+      if (!G.nodeFilter.has(r.kind)) continue;
+      const x = sx(r.x), y = sy(r.y); if (x < -20 || y < -20 || x > W + 20 || y > H + 20) continue;
+      const rad = Math.max(2.5, (r.r || 3) * vp.scale);
+      const ghost = !G.nodeRef.has(n.id);
+      ctx.beginPath(); ctx.arc(x, y, rad, 0, Math.PI * 2);
+      if (ghost) { ctx.lineWidth = 1.2; ctx.strokeStyle = kindColor(r.kind); ctx.stroke(); }
+      else { ctx.fillStyle = G.colorMode === 'community' && r.cluster != null && r.cluster !== -1 ? commColor(r.cluster) : kindColor(r.kind); ctx.fill(); }
+    }
   }
-  ctx.globalAlpha = 1;
-  const fs = 12 / vp.scale; ctx.font = `600 ${fs}px ${T.sans}`; ctx.textAlign = 'center'; ctx.lineJoin = 'round';
-  for (const h of G.hullCache.slice(0, 24)) {
-    const info = G.communities.find(x => x.id === h.c);
-    const t = info ? info.label : '#' + h.c;
-    const y = h.top - pad - 4 / vp.scale;
-    ctx.lineWidth = 3 / vp.scale; ctx.strokeStyle = T.bg; ctx.strokeText(t, h.cx, y);
-    ctx.fillStyle = commColor(h.c); ctx.fillText(t, h.cx, y);
+  const ring = (id, width, color, pad) => { const n = lookup(id); if (!n) return; ctx.lineWidth = width; ctx.strokeStyle = color; ctx.beginPath(); ctx.arc(sx(n.x), sy(n.y), Math.max(3, (n.r || 3) * vp.scale) + pad, 0, Math.PI * 2); ctx.stroke(); };
+  if (G.overlay) {
+    for (const id of G.overlay.affected) ring(id, 1.6, hexA(T.warn, .85), 2);
+    for (const id of G.overlay.changed) ring(id, 3, T.err, 3.5);
   }
-  ctx.textAlign = 'left';
+  if (sel !== null) ring(sel, 2.5, T.accent, 3);
+  if (G.hoverId !== null && G.hoverId !== sel) ring(G.hoverId, 1.6, T.text, 2);
+  // labels: top-N by PageRank among visible named nodes, collision-avoided
+  const cap = isPhone() ? 70 : 260, cand = [];
+  const v = viewWorld();
+  for (const t of drawn) {
+    if (!G.want.has(t.key)) continue;
+    for (const [i, name] of t.names) {
+      if (t.x[i] < v.x0 || t.x[i] > v.x1 || t.y[i] < v.y0 || t.y[i] > v.y1) continue;
+      if (!nodeVisible(t, i)) continue;
+      if (dim && sel !== null && !G.nb.nodes.has(t.ids[i])) continue;
+      const w = t.lod === 2 ? t.size[i] * 1e6 : t.lod === 1 ? t.size[i] * 1e3 + t.pr[i] : t.pr[i] + (t.kind[i] === 0 ? 1 : 0);
+      cand.push([w, t, i, name]);
+    }
+  }
+  if (sel !== null && G.nb.id === sel) for (const n of G.nb.nodes.values()) { const r = lookup(n.id) || n; if (r.x != null && n.name) cand.push([1e9, null, r, n.name]); }
+  cand.sort((a, b) => b[0] - a[0]);
+  const occ = new Set(), CELL = 10;
+  const fits = (x, y, w, h) => { for (let gx = Math.floor(x / CELL); gx <= Math.floor((x + w) / CELL); gx++) for (let gy = Math.floor(y / CELL); gy <= Math.floor((y + h) / CELL); gy++) if (occ.has(gx * 4096 + gy)) return false; return true; };
+  const take = (x, y, w, h) => { for (let gx = Math.floor(x / CELL); gx <= Math.floor((x + w) / CELL); gx++) for (let gy = Math.floor(y / CELL); gy <= Math.floor((y + h) / CELL); gy++) occ.add(gx * 4096 + gy); };
+  ctx.lineJoin = 'round'; let placed = 0;
+  const label = (x, y, r, text, weight, color) => {
+    const font = `${weight} 11.5px ${T.mono}`; ctx.font = font;
+    let w = LABEL_W.get(font + text); if (w == null) { w = ctx.measureText(text).width; if (LABEL_W.size > 20000) LABEL_W.clear(); LABEL_W.set(font + text, w); }
+    const lx = x + r + 3, ly = y - 7;
+    if (!fits(lx, ly, w, 14)) return false;
+    take(lx, ly, w, 14);
+    ctx.lineWidth = 3; ctx.strokeStyle = T.bg; ctx.strokeText(text, lx, y + 4); ctx.fillStyle = color; ctx.fillText(text, lx, y + 4);
+    return true;
+  };
+  const selRec = sel !== null ? lookup(sel) : null;
+  if (selRec) { const nm = (S.sel && S.sel.name) || selRec.name; if (nm) label(sx(selRec.x), sy(selRec.y), Math.max(3, selRec.r * vp.scale), selRec.kind === 'File' ? basename(nm) : nm, 650, T.text); }
+  if (G.hoverId !== null) { const h = lookup(G.hoverId); if (h && (h.name || G.hoverName)) label(sx(h.x), sy(h.y), Math.max(3, h.r * vp.scale), (h.kind === 'File' ? basename(h.name || G.hoverName) : (h.name || G.hoverName)), 600, T.text); }
+  for (const [, t, i, name] of cand) {
+    if (placed >= cap) break;
+    let x, y, r, kind, lod;
+    if (t) { x = sx(t.x[i]); y = sy(t.y[i]); r = Math.max(t.lod === 0 ? 1.3 : 2.2, tileRadius(t, i) * vp.scale); kind = TILE_NODE_KINDS[t.kind[i]]; lod = t.lod; }
+    else { x = sx(i.x); y = sy(i.y); r = Math.max(2.5, (i.r || 3) * vp.scale); kind = i.kind; lod = 0; }
+    if (x < 0 || y < 0 || x > W || y > H) continue;
+    const text = kind === 'File' ? basename(name) : name;
+    if (label(x, y, r, text, lod === 2 ? 650 : 500, lod === 2 ? commColor(t ? t.clu[i] : 0) : kind === 'File' ? T.text : T.faint)) placed++;
+  }
+}
+function updateVisCount() {
+  const vc = $('#vis-count'); if (!vc) return;
+  if (!G.man) { vc.innerHTML = ''; return; }
+  let lod = null; for (const k of G.want) { const t = G.tiles.get(k); if (t) { lod = t.lod; break; } }
+  vc.innerHTML = `<span title="Quadtree level / level of detail of the visible tiles">L${G.level}${lod != null ? ' ' + LOD_NAMES[lod] : ''}</span> <span class="faint">· ${fmtNum(G.resident)} resident · ${fmtNum(G.tiles.size)} tiles</span>`;
 }
 
-/* Lazy 1-hop (or N-hop in focus mode) expansion via /api/node_neighbors */
-async function lazyExpand(id) {
-  const hops = Math.max(1, Math.min(G.focusHops || 1, 3)), key = `${id}:${hops}`;
-  if (G.expanded.has(key)) return false;
-  G.expanded.add(key);
-  const token = G.token;
+/* ---- viewport ---- */
+function fitToScreen() {
+  if (!G.man || !G.size.w) return;
+  let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+  const add = (x, y, r = 0) => { if (x - r < minX) minX = x - r; if (y - r < minY) minY = y - r; if (x + r > maxX) maxX = x + r; if (y + r > maxY) maxY = y + r; };
+  if (G.focus && G.nb.nodes.size) for (const n of G.nb.nodes.values()) { const r = lookup(n.id) || n; if (r.x != null) add(r.x, r.y); }
+  else if (G.man.content_bbox) { const cb = G.man.content_bbox; add(cb[0], cb[1]); add(cb[2], cb[3]); }
+  else for (const c of G.man.clusters || []) add(c.x, c.y, c.r + 20);
+  if (!isFinite(minX)) { const b = G.man.bbox; minX = b[0]; minY = b[1]; maxX = b[2]; maxY = b[3]; }
+  const w = G.size.w, h = G.size.h, dx = (maxX - minX) || 1, dy = (maxY - minY) || 1;
+  const s = Math.min(w / (dx * 1.08 + 40), h / (dy * 1.08 + 60), 4);
+  G.vp.scale = s; G.vp.tx = w / 2 - ((minX + maxX) / 2) * s; G.vp.ty = h / 2 - ((minY + maxY) / 2) * s;
+  G.needsRender = true; updateWanted();
+}
+function zoomAt(px, py, next) {
+  const vp = G.vp, wx = (px - vp.tx) / vp.scale, wy = (py - vp.ty) / vp.scale;
+  vp.scale = Math.max(1e-4, Math.min(60, next)); vp.tx = px - wx * vp.scale; vp.ty = py - wy * vp.scale;
+  G.needsRender = true; scheduleWanted();
+}
+const zoomBy = (f) => zoomAt(G.size.w / 2, G.size.h / 2, G.vp.scale * f);
+let WANT_T = 0;
+function scheduleWanted() { if (WANT_T) return; WANT_T = requestAnimationFrame(() => { WANT_T = 0; updateWanted(); }); }
+function flyTo(x, y, scale) {
+  if (!G.size.w) return;
+  const from = { ...G.vp }, k = scale || Math.max(G.vp.scale, 1.4);
+  const to = { scale: k, tx: G.size.w / 2 - x * k, ty: G.size.h / 2 - y * k };
+  let t = 0;
+  const step = () => { t = Math.min(1, t + 0.08); const e = 1 - Math.pow(1 - t, 3);
+    G.vp.scale = from.scale * Math.pow(to.scale / from.scale, e); G.vp.tx = from.tx + (to.tx - from.tx) * e; G.vp.ty = from.ty + (to.ty - from.ty) * e;
+    G.needsRender = true; scheduleWanted(); if (t < 1) requestAnimationFrame(step); };
+  step();
+}
+async function centerOn(id) {
+  let n = lookup(id);
+  if (!n) { try { const r = await api(`/api/tiles/locate?ids=${q(id)}`); n = (r.nodes || [])[0]; if (n) G.overlayPos.set(id, { ...n, r: 3 }); } catch { /* ignore */ } }
+  if (n) flyTo(n.x, n.y, n.lod ? null : Math.max(G.vp.scale, 1.6));
+}
+function nodeAt(px, py) {
+  const wx = (px - G.vp.tx) / G.vp.scale, wy = (py - G.vp.ty) / G.vp.scale, slop = 6 / G.vp.scale;
+  let best = null, bd = Infinity;
+  for (const key of G.want) {
+    const t = G.tiles.get(key); if (!t || t.alpha < 0.5) continue;
+    const b = tileBounds(t); if (wx < b.x0 - 200 || wx > b.x1 + 200 || wy < b.y0 - 200 || wy > b.y1 + 200) continue;
+    for (let i = 0; i < t.n; i++) {
+      const dx = t.x[i] - wx, dy = t.y[i] - wy, d = dx * dx + dy * dy;
+      const hr = Math.max(tileRadius(t, i), (t.lod === 0 ? 1.3 : 2.2) / G.vp.scale) + slop;
+      if (d < hr * hr && d < bd && nodeVisible(t, i)) { best = nodeRec(t, i); bd = d; }
+    }
+  }
+  if (G.selectedId !== null) for (const n of G.nb.nodes.values()) {
+    if (G.nodeRef.has(n.id) || n.x == null) continue;
+    const dx = n.x - wx, dy = n.y - wy, d = dx * dx + dy * dy, hr = 4 / G.vp.scale + slop;
+    if (d < hr * hr && d < bd) { best = { ...n, r: 3 }; bd = d; }
+  }
+  return best;
+}
+
+/* ---- refine (worker): only the loaded fine-level tiles, borders pinned ---- */
+function startLayout() {
+  const w = spawnWorker(); if (!w) { toast('Web Workers are unavailable in this browser', 'err'); return; }
+  const tiles = [...G.want].map(k => G.tiles.get(k)).filter(t => t && t.lod === 0);
+  if (!tiles.length) { toast('Zoom in to the symbol level to refine the local layout'); return; }
+  const idx = new Map(), P = [], pin = [], refs = [];
+  for (const t of tiles) {
+    const b = tileBounds(t), m = (b.x1 - b.x0) * 0.12;
+    for (let i = 0; i < t.n; i++) {
+      idx.set(t.ids[i], refs.length); refs.push([t, i]); P.push(t.x[i], t.y[i]);
+      pin.push(t.x[i] < b.x0 + m || t.x[i] > b.x1 - m || t.y[i] < b.y0 + m || t.y[i] > b.y1 - m || t.kind[i] === 0 ? 1 : 0);
+    }
+  }
+  const E = [];
+  for (const t of tiles) for (let k = 0; k < t.m; k++) { const a = t.ea[k] < t.n ? idx.get(t.ids[t.ea[k]]) : undefined, b = t.eb[k] < t.n ? idx.get(t.ids[t.eb[k]]) : undefined; if (a != null && b != null) E.push(a, b); }
+  G.layoutRunning = true; updateLayoutUI();
+  w.onmessage = (ev) => {
+    const pos = new Float32Array(ev.data.pos);
+    for (let j = 0; j < refs.length; j++) { const [t, i] = refs[j]; t.x[i] = pos[j * 2]; t.y[i] = pos[j * 2 + 1]; t.ver = 0; }
+    G.needsRender = true;
+    if (ev.data.done) { G.layoutRunning = false; updateLayoutUI(); }
+  };
+  const pf = new Float32Array(P), pe = new Int32Array(E), pp = new Uint8Array(pin);
+  w.postMessage({ type: 'refine', pos: pf.buffer, edges: pe.buffer, pin: pp.buffer, iters: 140 }, [pf.buffer, pe.buffer, pp.buffer]);
+}
+function pauseLayout() { if (G.worker) { G.worker.terminate(); G.worker = null; } G.layoutRunning = false; updateLayoutUI(); }
+function resetLayout() { pauseLayout(); clearTiles(); updateWanted(); G.needsRender = true; }
+function updateLayoutUI() {
+  const pill = $('#layout-pill'); if (pill) pill.classList.toggle('hidden', !G.layoutRunning);
+  const b = $('#pause-btn'); if (b) { b.innerHTML = ic(G.layoutRunning ? 'pause' : 'play'); b.title = G.layoutRunning ? 'Stop refining' : 'Refine the visible layout (local, in the browser)'; }
+}
+function restyle() { G.styleVersion++; G.hullCache = null; G.needsRender = true; }
+
+/* Cluster names come with the manifest; kept for callers of the old API. */
+const clustersList = () => cached('clusters', () => api('/api/clusters?limit=500'));
+function loadClusterNames() { renderLegend(); }
+
+/* Selection neighbourhood (+ focus hops) from /api/node_neighbors; ghosts for unloaded tiles. */
+async function loadNeighbors(id) {
+  const hops = Math.max(1, Math.min(G.focusHops || 1, 3)), token = G.token;
   try {
     const data = await api(`/api/node_neighbors?id=${q(id)}&hops=${hops}`);
-    if (token !== G.token || !data || !data.nodes) return false;
-    const added = mergeNeighbors(data.nodes, data.edges || []);
-    if (G.lodMode === 'levels') for (const nd of data.nodes) G.revealed.add(nd.id);
-    if (added.nodes) { postLayoutInit(); if (!G.layoutRunning) startLayout(); }
-    if (added.nodes || added.edges) { G.nb = { id: null, set: new Set() }; computeVisible(); renderGraphChrome(); G.needsRender = true; }
-    return true;
-  } catch (e) { G.expanded.delete(key); console.warn('lazy expand failed:', e); return false; }
+    if (token !== G.token || G.selectedId !== id || !data) return null;
+    const nodes = new Map();
+    for (const n of data.nodes || []) nodes.set(n.id, { id: n.id, kind: n.kind, name: n.name, file: n.file, pagerank: n.pagerank, cluster: n.cluster, x: n.x, y: n.y, r: 3 });
+    G.nb = { id, nodes, edges: data.edges || [] };
+    G.focus = G.focusHops > 0 ? new Set(nodes.keys()) : null;
+    restyle();
+    return nodes.get(id) || null;
+  } catch (e) { console.warn('neighbours failed:', e); return null; }
 }
-function mergeNeighbors(nodes, edges) {
-  const eKeys = new Set(G.graph.edges.map(e => `${e.src}:${e.dst}:${e.kind}`));
-  let cx = 0, cy = 0; const anchor = G.byId.get(G.selectedId);
-  if (anchor) { cx = anchor.x; cy = anchor.y; } else if (G.layout.length) { for (const n of G.layout) { cx += n.x; cy += n.y; } cx /= G.layout.length; cy /= G.layout.length; }
-  let nAdd = 0, eAdd = 0; const maxPR = G.maxPR || 0.0001;
-  for (const n of nodes) {
-    if (G.byId.has(n.id)) continue;
-    G.graph.nodes.push(n);
-    const a = Math.random() * Math.PI * 2, r0 = 30 + Math.random() * 60;
-    const ln = makeLayoutNode(n, maxPR, cx + Math.cos(a) * r0, cy + Math.sin(a) * r0);
-    G.layout.push(ln); G.byId.set(n.id, ln);
-    if (n.kind === 'File') G.level0.add(n.id);
-    nAdd++;
-  }
-  for (const e of edges) { const k = `${e.src}:${e.dst}:${e.kind}`; if (eKeys.has(k)) continue; eKeys.add(k); G.graph.edges.push(e); eAdd++; if (e.kind === 'CALLS' && e.confidence != null) G.hasConf = true; }
-  if (nAdd) { sortLabels(); if (!G.hasServerClusters && G.layout.some(n => n.cluster != null)) { G.hasServerClusters = true; loadClusterNames(); } if (G.hasServerClusters) summarizeCommunities(); }
-  return { nodes: nAdd, edges: eAdd };
-}
-
 /* ─────────────────────────── Selection ─────────────────────────── */
 const S = {
   page: 'graph', sel: null, detTab: 'overview', leftTab: 'explore', exploreKind: '', exploreQ: '', explore: null,
@@ -1541,24 +1705,36 @@ function dget(key, fn) {
 }
 function selectNode(id, opts = {}) {
   if (id == null) { clearSelection(); return; }
-  if (G.status === 'loading' && !G.byId.has(id)) { G.pending = { id, opts }; }
-  const n = G.byId.get(id);
+  if (G.status === 'loading') { G.pending = { id, opts }; }
+  const n = lookup(id);
+  if (n && n.kind === 'Cluster') {
+    // a cluster super-node: fly into it (tiles expand into files, then symbols)
+    const c = G.clusterNames.get(id);
+    const r = c ? c.r : (n.r || 50);
+    flyTo(n.x, n.y, Math.min(G.size.w, G.size.h) / Math.max(40, r * 2.4));
+    toast(`${c ? c.name : 'Cluster'}: zoom in for files and symbols`);
+    return;
+  }
   const changed = G.selectedId !== id;
-  G.selectedId = id; G.nb = { id: null, set: new Set() };
-  S.sel = n ? { id, name: n.name, kind: n.kind, file: n.file, pagerank: n.pagerank } : { id, name: '#' + id, kind: 'Function', file: null, pagerank: 0, ...(opts.info || {}) };
+  G.selectedId = id;
+  if (changed) G.nb = { id: null, nodes: new Map(), edges: [] };
+  const info = opts.info || {};
+  S.sel = n ? { id, name: n.name || info.name || '#' + id, kind: n.kind, file: info.file || (n.kind === 'File' ? n.name : null), pagerank: n.pagerank }
+    : { id, name: '#' + id, kind: 'Function', file: null, pagerank: 0, ...info };
   if (changed) { DC = {}; if (!detTabs(S.sel.kind).some(t => t[0] === S.detTab)) S.detTab = 'overview'; }
   if (opts.tab) S.detTab = opts.tab;
-  if (G.lodMode === 'levels') {
-    G.revealed.add(id);
-    for (const e of G.graph.edges) { if (!edgeOn(e)) continue; if (e.src === id) G.revealed.add(e.dst); else if (e.dst === id) G.revealed.add(e.src); }
-  }
-  computeVisible(); G.needsRender = true;
-  lazyExpand(id).then(() => {
+  G.needsRender = true;
+  loadNeighbors(id).then(seed => {
     if (G.selectedId !== id) return;
-    const m = G.byId.get(id);
-    if (m && (!n || S.sel.name.startsWith('#'))) { Object.assign(S.sel, { name: m.name, kind: m.kind, file: m.file, pagerank: m.pagerank }); renderDetail(); }
-    else renderMetrics();
+    if (seed) {
+      const upd = { name: seed.name || S.sel.name, kind: seed.kind || S.sel.kind, file: seed.file || S.sel.file, pagerank: seed.pagerank != null ? seed.pagerank : S.sel.pagerank };
+      const was = S.sel.name;
+      Object.assign(S.sel, upd);
+      if (was !== upd.name || was.startsWith('#')) renderDetail(); else renderMetrics();
+      renderSelChip();
+    } else renderMetrics();
     if (opts.center && !n) centerOn(id);
+    if (G.focusHops > 0) fitToScreen();
   });
   renderSelChip();
   const r = $('#right');
@@ -1568,9 +1744,10 @@ function selectNode(id, opts = {}) {
 }
 function clearSelection() {
   G.selectedId = null; S.sel = null; DC = {};
+  G.nb = { id: null, nodes: new Map(), edges: [] };
+  if (G.focus) { G.focus = null; restyle(); }
   const r = $('#right'); if (r) { r.classList.remove('open', 'peek'); }
   $('#scrim').classList.remove('open');
-  if (G.focusHops > 0 || G.lodMode === 'levels') computeVisible();
   G.needsRender = true; renderSelChip(); renderDetail(); highlightLeft();
 }
 // Open a symbol from anywhere: {id?, name, file?, kind?}. Resolves the id through
@@ -1578,10 +1755,6 @@ function clearSelection() {
 async function openSymbol(t, opts = {}) {
   if (!t) return;
   let id = t.id, info = { name: t.name, file: t.file || null, kind: t.kind || 'Function' };
-  if (id == null) {
-    const hit = G.layout.find(n => n.name === t.name && (!t.file || n.file === t.file)) || (t.file ? null : G.layout.find(n => n.name === t.name));
-    if (hit) id = hit.id;
-  }
   if (id == null && t.kind === 'File' && t.file) {
     try { const f = await filesDump(); const hit = (f.nodes || []).find(n => n.file === t.file || n.name === t.file); if (hit) { id = hit.id; info = { name: hit.name, file: hit.file, kind: 'File' }; } } catch { /* fall through */ }
   }
@@ -1612,12 +1785,14 @@ function buildGraphPage() {
     <div class="pane-body" id="left-body"></div>
   </aside>
   <section class="stage" id="stage">
+    <canvas id="cv-under" class="layer"></canvas>
     <canvas id="cv"></canvas>
+    <canvas id="cv-over" class="layer"></canvas>
     <div class="stage-over hidden" id="stage-over"></div>
     <div class="float tl">
       <button class="btn mobile-only glass" data-act="left-open" style="height:40px">${ic('menu')} Explore</button>
       <div class="glass stats-strip"><span><b id="st-nodes">0</b> nodes</span><span><b id="st-edges">0</b> edges</span><span id="vis-count"></span></div>
-      <div class="glass layout-pill hidden" id="layout-pill"><span class="spinner"></span>Layout settling…</div>
+      <div class="glass layout-pill hidden" id="layout-pill"><span class="spinner"></span>Refining the visible layout…</div>
       <div class="glass ov-chip hidden" id="ov-chip"></div>
     </div>
     <div class="float tr">
@@ -1630,8 +1805,8 @@ function buildGraphPage() {
       <button class="btn icon" title="Zoom out" data-act="zoom-out">${ic('minus')}</button>
       <button class="btn icon" title="Fit graph" data-act="fit">${ic('fit')}</button>
       <div class="sep"></div>
-      <button class="btn icon" title="Pause layout" id="pause-btn" data-act="pause">${ic('pause')}</button>
-      <button class="btn icon" title="Reset layout" data-act="relayout">${ic('refresh')}</button>
+      <button class="btn icon" title="Refine the visible layout (local, in the browser)" id="pause-btn" data-act="pause">${ic('play')}</button>
+      <button class="btn icon" title="Reset to the server layout" data-act="relayout">${ic('refresh')}</button>
       <button class="btn icon" title="Reload graph from the server" data-act="reload-graph">${ic('db')}</button>
     </div>
   </section>
@@ -1641,63 +1816,65 @@ function buildGraphPage() {
   return el;
 }
 function mountGraphPage() {
-  const cv = $('#cv'), stage = $('#stage');
-  G.canvas = cv; G.ctx = cv.getContext('2d'); G.T = readTheme();
+  const cv = $('#cv'), stage = $('#stage'), under = $('#cv-under'), over = $('#cv-over');
+  G.canvas = cv; G.T = readTheme();
+  G.glx = glInit(cv); G.gl = G.glx ? G.glx.gl : null;
+  if (!G.glx) G.ctx2d = cv.getContext('2d');
+  G.under = under.getContext('2d'); G.over = over.getContext('2d');
   const resize = () => {
     const r = stage.getBoundingClientRect(); if (!r.width || !r.height) return;
-    const dpr = Math.min(devicePixelRatio || 1, 2);
-    cv.width = Math.max(1, Math.floor(r.width * dpr)); cv.height = Math.max(1, Math.floor(r.height * dpr));
-    G.ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    const dpr = Math.min(devicePixelRatio || 1, 2); G.dpr = dpr;
+    for (const c of [cv, under, over]) { c.width = Math.max(1, Math.floor(r.width * dpr)); c.height = Math.max(1, Math.floor(r.height * dpr)); }
     const first = !G.size.w; G.size.w = r.width; G.size.h = r.height;
-    if (first && G.layout.length) G.fitNext = true;
-    G.needsRender = true;
+    if (first && G.man) G.fitNext = true;
+    G.needsRender = true; scheduleWanted();
   };
   new ResizeObserver(resize).observe(stage); resize();
-  // Pointer input: pan, drag-to-pin a node, click to select, pinch to zoom, wheel zoom.
-  const ptrs = new Map(); let down = null, pinch = null;
+  // Pointer input: pan, click to select, pinch to zoom, wheel zoom. Positions come from the server layout.
+  const ptrs = new Map(); let down = null, pinch = null, hoverT = 0;
+  over.style.pointerEvents = 'none'; under.style.pointerEvents = 'none';
   cv.addEventListener('pointerdown', e => {
     cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
-    if (ptrs.size === 2) {
-      const [a, b] = [...ptrs.values()]; pinch = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, s: G.vp.scale };
-      if (down && down.node) wpost({ type: 'unpin', idx: down.node.idx });
-      G.dragging = null; down = null; return;
-    }
-    const n = nodeAt(e.offsetX, e.offsetY);
-    down = { x: e.offsetX, y: e.offsetY, tx: G.vp.tx, ty: G.vp.ty, node: n, moved: false };
-    if (n) { G.dragging = n; wpost({ type: 'pin', idx: n.idx, x: n.x, y: n.y }); }
+    if (ptrs.size === 2) { const [a, b] = [...ptrs.values()]; pinch = { d: Math.hypot(a.x - b.x, a.y - b.y) || 1, s: G.vp.scale }; down = null; return; }
+    down = { x: e.offsetX, y: e.offsetY, tx: G.vp.tx, ty: G.vp.ty, node: nodeAt(e.offsetX, e.offsetY), moved: false };
     cv.classList.add('dragging');
   });
   cv.addEventListener('pointermove', e => {
     if (ptrs.has(e.pointerId)) ptrs.set(e.pointerId, { x: e.offsetX, y: e.offsetY });
     if (pinch && ptrs.size === 2) { const [a, b] = [...ptrs.values()]; zoomAt((a.x + b.x) / 2, (a.y + b.y) / 2, pinch.s * (Math.hypot(a.x - b.x, a.y - b.y) / pinch.d)); return; }
     if (!down) {
-      const n = nodeAt(e.offsetX, e.offsetY), hid = n ? n.id : null;
-      if (hid !== G.hoverId) { G.hoverId = hid; G.needsRender = true; cv.style.cursor = n ? 'pointer' : ''; }
+      if (hoverT) return;
+      const px = e.offsetX, py = e.offsetY;
+      hoverT = requestAnimationFrame(() => {
+        hoverT = 0;
+        const n = nodeAt(px, py), hid = n ? n.id : null;
+        if (hid !== G.hoverId) {
+          G.hoverId = hid; G.hoverName = null; G.needsRender = true; cv.style.cursor = n ? 'pointer' : '';
+          if (n && !n.name) api(`/api/tiles/locate?ids=${q(n.id)}`).then(r => { const x = (r.nodes || [])[0]; if (x && G.hoverId === n.id) { G.hoverName = x.name; G.needsRender = true; } }).catch(() => {});
+        }
+      });
       return;
     }
     const dx = e.offsetX - down.x, dy = e.offsetY - down.y;
     if (!down.moved && Math.abs(dx) + Math.abs(dy) > 4) down.moved = true;
     if (!down.moved) return;
-    if (down.node) {
-      const n = down.node; n.x = (e.offsetX - G.vp.tx) / G.vp.scale; n.y = (e.offsetY - G.vp.ty) / G.vp.scale;
-      wpost({ type: 'pin', idx: n.idx, x: n.x, y: n.y }); if (!G.layoutRunning) startLayout();
-    } else { G.vp.tx = down.tx + dx; G.vp.ty = down.ty + dy; }
-    G.needsRender = true;
+    G.vp.tx = down.tx + dx; G.vp.ty = down.ty + dy;
+    G.needsRender = true; scheduleWanted();
   });
   const up = e => {
     ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch = null;
     cv.classList.remove('dragging');
     if (!down) return;
-    if (!down.moved) { if (down.node) selectNode(down.node.id); else if (e.type === 'pointerup') clearSelection(); }
-    if (down.node) wpost({ type: 'unpin', idx: down.node.idx });
-    G.dragging = null; down = null;
+    if (!down.moved) { if (down.node) selectNode(down.node.id, { info: { name: down.node.name || undefined } }); else if (e.type === 'pointerup') clearSelection(); }
+    down = null;
   };
   cv.addEventListener('pointerup', up); cv.addEventListener('pointercancel', up);
   cv.addEventListener('pointerleave', () => { if (G.hoverId !== null) { G.hoverId = null; G.needsRender = true; } });
   cv.addEventListener('dblclick', e => {
     const n = nodeAt(e.offsetX, e.offsetY);
     if (!n) { fitToScreen(); return; }
-    G.focusHops = 1; selectNode(n.id, { center: true }); renderLeft(); toast(`Focused on the 1-hop neighbourhood of ${n.kind === 'File' ? basename(n.name) : n.name}`);
+    if (n.kind === 'Cluster' || n.lod) { selectNode(n.id); zoomAt(e.offsetX, e.offsetY, G.vp.scale * 3); return; }
+    G.focusHops = 1; selectNode(n.id, { center: true }); renderLeft(); toast(`Focused on the 1-hop neighbourhood of ${n.kind === 'File' ? basename(n.name || '') : (n.name || 'the node')}`);
   });
   cv.addEventListener('wheel', e => { e.preventDefault(); zoomAt(e.offsetX, e.offsetY, G.vp.scale * (e.deltaY < 0 ? 1.12 : 0.89)); }, { passive: false });
   $('#sheet-handle').onclick = () => { const r = $('#right'); if (r.classList.contains('open')) { r.classList.remove('open'); r.classList.add('peek'); } else { r.classList.remove('peek'); r.classList.add('open'); } };
@@ -1706,10 +1883,21 @@ function mountGraphPage() {
   renderLeft(); renderLegend(); renderDetail(); renderSelChip(); updateLayoutUI();
 }
 function renderGraphChrome() {
-  const a = $('#st-nodes'), b = $('#st-edges');
-  if (a) a.textContent = fmtNum(G.graph.nodes.length);
-  if (b) b.textContent = fmtNum(G.graph.edges.length);
+  const a = $('#st-nodes'), b = $('#st-edges'), c = G.man ? G.man.counts : null;
+  if (a) a.textContent = fmtNum(c ? c.sym_nodes : 0);
+  if (b) b.textContent = fmtNum(c ? c.sym_edges : 0);
+  updateVisCount();
   if (S.leftTab === 'filters') renderLeft(); else if (S.leftTab === 'explore' && !S.explore) renderLeft();
+}
+/* Named nodes of the visible tiles, best PageRank first (Explore list, palette, symbol links). */
+function residentTop(limit, pred) {
+  const out = [];
+  for (const key of G.want) {
+    const t = G.tiles.get(key); if (!t || t.lod !== 0) continue;
+    for (const [i, name] of t.names) { const n = nodeRec(t, i); n.name = name; if (!pred || pred(n)) out.push(n); }
+  }
+  out.sort((a, b) => b.pagerank - a.pagerank);
+  return limit ? out.slice(0, limit) : out;
 }
 function toggleLeft(o) { $('#left')?.classList.toggle('open', o); $('#scrim').classList.toggle('open', o); $('#scrim').onclick = () => toggleLeft(false); }
 function toggleRight(o) {
@@ -1756,10 +1944,10 @@ function resRow(x, { score, sub } = {}) {
 function renderExplore(b) {
   const sem = S.explore;
   b.innerHTML = `<div class="pane-pad">
-    <div class="search-box"><span class="ic" data-i="search"></span><input class="input" id="lq" placeholder="Filter loaded nodes · Enter = semantic search" autocomplete="off" value="${esc(S.exploreQ)}"/></div>
+    <div class="search-box"><span class="ic" data-i="search"></span><input class="input" id="lq" placeholder="Filter nodes in view · Enter = semantic search" autocomplete="off" value="${esc(S.exploreQ)}"/></div>
     <div class="chips" style="margin-top:8px" id="lk">${[['', 'All'], ['Function', 'Functions'], ['Class', 'Classes'], ['File', 'Files']].map(([k, l]) => `<button class="chip${S.exploreKind === k ? ' on' : ''}" data-k="${k}"${sem && k === 'File' ? ' disabled title="Semantic search covers functions and classes"' : ''}>${l}</button>`).join('')}</div>
   </div>
-  <div class="res-head"><span class="section-label" style="margin:0">${sem ? `Semantic results <span class="faint">· ${esc(sem.q)}</span>` : 'Top by PageRank'}</span><span class="grow"></span>${sem ? `<button class="btn quiet sm icon" data-act="explore-clear" title="Back to loaded nodes">${ic('x')}</button>` : ''}</div>
+  <div class="res-head"><span class="section-label" style="margin:0">${sem ? `Semantic results <span class="faint">· ${esc(sem.q)}</span>` : 'In view, by PageRank'}</span><span class="grow"></span>${sem ? `<button class="btn quiet sm icon" data-act="explore-clear" title="Back to loaded nodes">${ic('x')}</button>` : ''}</div>
   <div id="lres"></div>`;
   hydrateIcons(b);
   const inp = $('#lq', b);
@@ -1772,10 +1960,10 @@ function renderExplore(b) {
       return;
     }
     if (G.status === 'loading') { box.innerHTML = loadingHTML('Loading graph…'); return; }
-    if (!G.layout.length) { box.innerHTML = emptyHTML('No nodes loaded.', 'Index this root from the Index page.'); return; }
+    if (!G.man) { box.innerHTML = emptyHTML('No graph loaded.', 'Index this root from the Index page.'); return; }
     const qv = S.exploreQ.toLowerCase(), k = S.exploreKind;
-    const list = []; for (const n of G.labelOrder) { if (k && n.kind !== k) continue; if (qv && !n.name.toLowerCase().includes(qv) && !(n.file || '').toLowerCase().includes(qv)) continue; list.push(n); if (list.length >= 80) break; }
-    box.innerHTML = list.map(n => resRow(n, { score: n.pagerank.toFixed(3) })).join('') || emptyHTML('No loaded node matches.', 'Press Enter to run a semantic search instead.');
+    const list = residentTop(80, n => (!k || n.kind === k) && (!qv || n.name.toLowerCase().includes(qv)));
+    box.innerHTML = list.map(n => resRow(n, { score: Number(n.pagerank || 0).toFixed(3), sub: n.kind === 'File' ? n.name : (G.clusterNames.get(n.cluster) || {}).name || '' })).join('') || emptyHTML(G.tiles.size ? 'No node in view matches.' : 'Loading tiles...', 'Press Enter to run a semantic search over the whole index.');
   };
   inp.oninput = () => { S.exploreQ = inp.value; if (!S.explore) draw(); };
   inp.onkeydown = e => { if (e.key === 'Enter') { e.preventDefault(); const v = inp.value.trim(); if (v) runExploreSearch(v); } };
@@ -1802,45 +1990,49 @@ async function runExploreSearch(qv) {
 }
 function highlightLeft() { $$('#left-body .res').forEach(r => r.classList.toggle('on', !!S.sel && Number(r.dataset.id) === S.sel.id)); }
 function renderFilters(b) {
-  const nc = {}, ec = {};
-  for (const n of G.layout) nc[n.kind] = (nc[n.kind] || 0) + 1;
-  for (const e of G.graph.edges) ec[e.kind] = (ec[e.kind] || 0) + 1;
+  const man = G.man || {}, nc = man.kind_counts || {}, ec = man.edge_kind_counts || {};
   const sw = (on, attr) => `<span class="switch"><input type="checkbox" ${attr} ${on ? 'checked' : ''}><span></span></span>`;
+  const kinds = NODE_KINDS.filter(k => k.id !== 'Module');
   b.innerHTML = `
     <div class="group"><h4>Node types</h4><p>Hide kinds you don't need.</p>
-      ${NODE_KINDS.map(k => `<label class="toggle-row">${sw(G.nodeFilter.has(k.id), `data-nk="${k.id}"`)}${kindTag(k.id)}${k.label}<span class="n">${fmtNum(nc[k.id] || 0)}</span></label>`).join('')}</div>
-    <div class="group"><h4>Relationships</h4><p>Edge types drawn on the canvas.</p>
+      ${kinds.map(k => `<label class="toggle-row">${sw(G.nodeFilter.has(k.id), `data-nk="${k.id}"`)}${kindTag(k.id)}${k.label}<span class="n">${fmtNum(nc[k.id] || 0)}</span></label>`).join('')}</div>
+    <div class="group"><h4>Relationships</h4><p>Edge types drawn on the canvas (file / cluster views aggregate them).</p>
       ${EDGE_KINDS.map(k => `<label class="toggle-row">${sw(G.edgeFilter.has(k.id), `data-et="${k.id}"`)}<i style="width:14px;height:3px;border-radius:2px;background:${G.T ? G.T.edge[k.id] : 'var(--faint)'}"></i>${k.label}<span class="n">${fmtNum(ec[k.id] || 0)}</span></label>`).join('')}</div>
     <div class="group"><h4>Focus depth</h4><p>Keep only nodes within N hops of the selection.</p>
-      <div class="seg full" id="hops">${[[0, 'All'], [1, '1'], [2, '2'], [3, '3'], [5, '5']].map(([h, l]) => `<button data-h="${h}" class="${G.focusHops === h ? 'on' : ''}">${l}${h ? (h > 1 ? ' hops' : ' hop') : ''}</button>`).join('')}</div>
+      <div class="seg full" id="hops">${[[0, 'All'], [1, '1'], [2, '2'], [3, '3']].map(([h, l]) => `<button data-h="${h}" class="${G.focusHops === h ? 'on' : ''}">${l}${h ? (h > 1 ? ' hops' : ' hop') : ''}</button>`).join('')}</div>
       ${G.focusHops && !S.sel ? '<div class="lod-note">Select a node to apply the focus.</div>' : ''}</div>
     <div class="group"><h4>Call confidence</h4><p>Hide <code>CALLS</code> edges resolved below this confidence (0.95 import map … 0.3 fuzzy).</p>
-      ${G.hasConf ? `<div class="range-row"><input type="range" id="minconf" min="0" max="1" step="0.05" value="${G.minConf}"/><span class="v" id="minconf-v">${G.minConf.toFixed(2)}</span></div>
-      <div class="lod-note">${G.minConf > 0 ? `${fmtNum(G.graph.edges.filter(e => e.kind === 'CALLS' && e.confidence != null && e.confidence < G.minConf).length)} call edges hidden` : 'All call edges shown.'}</div>`
-        : '<div class="lod-note">This index has no edge confidences (built before schema v3) — run a full rebuild from the Index page.</div>'}</div>
-    <div class="group"><h4>Color by</h4><p>Node size is always PageRank.</p>
-      <div class="seg full" id="cmode"><button data-c="kind" class="${G.colorMode === 'kind' ? 'on' : ''}">Kind</button><button data-c="community" class="${G.colorMode === 'community' ? 'on' : ''}">${G.hasServerClusters ? 'Cluster' : 'Community'}</button></div>
-      <div class="lod-note">${G.hasServerClusters ? 'Clusters come from the server (Louvain at index time).' : 'Communities are estimated in the browser (label propagation); a schema-v3 index provides server clusters.'}</div>
+      ${!man.counts || man.has_conf !== false ? `<div class="range-row"><input type="range" id="minconf" min="0" max="1" step="0.05" value="${G.minConf}"/><span class="v" id="minconf-v">${G.minConf.toFixed(2)}</span></div>
+      <div class="lod-note">${G.minConf > 0 ? `Call edges below ${G.minConf.toFixed(2)} are hidden in every tile.` : 'All call edges shown.'}</div>`
+        : '<div class="lod-note">Every call edge of this index resolved with full confidence.</div>'}</div>
+    <div class="group"><h4>Color by</h4><p>Node size is PageRank (files and clusters: member count).</p>
+      <div class="seg full" id="cmode"><button data-c="kind" class="${G.colorMode === 'kind' ? 'on' : ''}">Kind</button><button data-c="community" class="${G.colorMode === 'community' ? 'on' : ''}">Cluster</button></div>
+      <div class="lod-note">Clusters come from the server (Louvain at index time).</div>
       <label class="toggle-row" style="margin-top:6px">${sw(G.hulls, 'id="hulls"')}Named cluster hulls<span class="n">${fmtNum(G.communities.length)}</span></label></div>
-    <div class="group"><h4>Level of detail</h4><p>Level 0 = every file; clicking a node reveals its 1-hop neighbours.</p>
-      <div class="seg full" id="lod"><button data-lod="all" class="${G.lodMode === 'all' ? 'on' : ''}">All nodes</button><button data-lod="levels" class="${G.lodMode === 'levels' ? 'on' : ''}">Files first, expand on click</button></div>
-      <div class="lod-note">${G.lodMode === 'all' ? `Top ${fmtNum(ALL_NODES_CAP)} nodes by PageRank.` : 'Loaded from /api/files — every file, no cap.'}</div></div>`;
+    <div class="group"><h4>Level of detail</h4><p>The graph streams in tiles: clusters when zoomed out, then files, then every symbol. Nothing is capped; detail sets how many nodes a tile may hold before a coarser view is shown.</p>
+      <div class="seg full" id="detail-seg">${[['low', 'Low'], ['normal', 'Normal'], ['high', 'High']].map(([k, l]) => `<button data-detail="${k}" class="${G.detail === k ? 'on' : ''}">${l}</button>`).join('')}</div>
+      <div class="lod-note">${G.man ? `${fmtNum(man.counts.sym_nodes)} symbols · ${fmtNum(man.counts.file_nodes)} files · ${fmtNum(man.counts.clu_nodes)} clusters · level ${G.level} of ${man.max_level}` : 'No tiles yet.'}</div></div>`;
   hydrateIcons(b);
   const mc = $('#minconf', b);
-  if (mc) mc.oninput = () => { G.minConf = +mc.value; $('#minconf-v', b).textContent = G.minConf.toFixed(2); G.nb = { id: null, set: new Set() }; computeVisible(); G.needsRender = true; };
+  if (mc) mc.oninput = () => { G.minConf = +mc.value; $('#minconf-v', b).textContent = G.minConf.toFixed(2); restyle(); };
   b.onchange = e => {
     const t = e.target;
     if (t.id === 'minconf') { renderFilters(b); return; }
     if (t.id === 'hulls') { G.hulls = t.checked; G.hullCache = null; G.needsRender = true; return; }
-    if (t.dataset.nk) { t.checked ? G.nodeFilter.add(t.dataset.nk) : G.nodeFilter.delete(t.dataset.nk); computeVisible(); }
-    if (t.dataset.et) { t.checked ? G.edgeFilter.add(t.dataset.et) : G.edgeFilter.delete(t.dataset.et); G.nb = { id: null, set: new Set() }; computeVisible(); }
+    if (t.dataset.nk) { t.checked ? G.nodeFilter.add(t.dataset.nk) : G.nodeFilter.delete(t.dataset.nk); if (t.dataset.nk === 'File') { t.checked ? G.nodeFilter.add('Cluster') : 0; } restyle(); }
+    if (t.dataset.et) { t.checked ? G.edgeFilter.add(t.dataset.et) : G.edgeFilter.delete(t.dataset.et); restyle(); }
     G.needsRender = true;
   };
   b.onclick = e => {
-    const h = e.target.closest('[data-h]'), c = e.target.closest('[data-c]'), l = e.target.closest('[data-lod]');
-    if (h) { G.focusHops = +h.dataset.h; if (G.selectedId != null && G.focusHops > 1) lazyExpand(G.selectedId); computeVisible(); renderFilters(b); if (G.focusHops && S.sel) fitToScreen(); }
-    if (c) { G.colorMode = c.dataset.c; renderFilters(b); renderLegend(); }
-    if (l && l.dataset.lod !== G.lodMode) { G.lodMode = l.dataset.lod; renderFilters(b); loadGraph(G.lodMode); }
+    const h = e.target.closest('[data-h]'), c = e.target.closest('[data-c]'), d = e.target.closest('[data-detail]');
+    if (h) {
+      G.focusHops = +h.dataset.h;
+      if (!G.focusHops) { G.focus = null; restyle(); }
+      if (G.selectedId != null) loadNeighbors(G.selectedId).then(() => { if (G.focusHops) fitToScreen(); });
+      renderFilters(b);
+    }
+    if (c) { G.colorMode = c.dataset.c; restyle(); renderFilters(b); renderLegend(); }
+    if (d && d.dataset.detail !== G.detail) { G.detail = d.dataset.detail; lsSet('docgraph.detail', G.detail); clearTiles(); updateWanted(); renderFilters(b); }
     G.needsRender = true;
   };
 }
@@ -1861,9 +2053,9 @@ function renderFiles(b) {
 }
 function renderLegend() {
   const l = $('#legend'); if (!l) return;
-  if (G.colorMode === 'kind') { l.innerHTML = NODE_KINDS.map(k => `<span><i style="background:var(${k.tok})"></i>${k.label}</span>`).join(''); return; }
+  if (G.colorMode === 'kind') { l.innerHTML = NODE_KINDS.filter(k => k.id !== 'Module').map(k => `<span><i style="background:var(${k.tok})"></i>${k.label}</span>`).join(''); return; }
   const top = G.communities.slice(0, 8);
-  l.innerHTML = top.length ? top.map(c => `<span title="${fmtNum(c.size)} nodes"><i style="background:${commColor(c.id)}"></i>${esc(c.label)}</span>`).join('') + (G.communities.length > 8 ? `<span class="faint">+${G.communities.length - 8} more</span>` : '') : `<span class="faint">${G.hasServerClusters ? 'Loading clusters…' : 'Detecting communities…'}</span>`;
+  l.innerHTML = top.length ? top.map(c => `<span title="${fmtNum(c.size)} nodes"><i style="background:${commColor(c.id)}"></i>${esc(c.label)}</span>`).join('') + (G.communities.length > 8 ? `<span class="faint">+${G.communities.length - 8} more</span>` : '') : `<span class="faint">${G.man ? 'No clusters in this index.' : 'Loading clusters…'}</span>`;
 }
 function renderSelChip() {
   const chip = $('#sel-chip'); if (!chip) return;
@@ -1874,31 +2066,30 @@ function renderSelChip() {
   chip.innerHTML = `${kindTag(n.kind)}<span class="nm ellipsis" title="${esc(n.name)}">${esc(n.kind === 'File' ? basename(n.name) : n.name)}</span><button class="btn quiet sm icon" title="Clear selection" data-act="sel-clear">${ic('x')}</button>`;
 }
 
-/* Diff overlay (Changes -> Show on graph): changed nodes ringed strongly, affected callers softly. */
+/* Diff overlay (Changes -> Show on graph): changed nodes ringed strongly, affected callers softly.
+   Positions of nodes outside the loaded tiles come from /api/tiles/locate. */
 async function showOverlay(ov, label) {
   G.overlay = { changed: new Set(ov.changed || []), affected: new Set(ov.affected || []), label: label || 'diff' };
   go('graph'); renderOverlayChip(); G.needsRender = true;
-  const missing = [...G.overlay.changed].filter(id => !G.byId.has(id)).slice(0, 30);
-  for (const id of missing) {
+  const ids = [...G.overlay.changed, ...G.overlay.affected].filter(id => !G.nodeRef.has(id)).slice(0, 2000);
+  if (ids.length) {
     try {
-      const d = await api(`/api/node_neighbors?id=${q(id)}&hops=1`);
-      if (d && d.nodes && mergeNeighbors(d.nodes, d.edges || []).nodes) { postLayoutInit(); if (!G.layoutRunning) startLayout(); }
-    } catch { /* node may be gone after a reindex */ }
+      const r = await api(`/api/tiles/locate?ids=${q(ids.join(','))}`);
+      for (const n of r.nodes || []) G.overlayPos.set(n.id, { ...n, r: 3 });
+    } catch { /* nodes may be gone after a reindex */ }
   }
-  if (missing.length) { computeVisible(); renderGraphChrome(); }
-  const first = [...G.overlay.changed].find(id => G.byId.has(id));
+  const first = [...G.overlay.changed].find(id => lookup(id));
   if (first != null) centerOn(first);
   renderOverlayChip(); G.needsRender = true;
 }
-function clearOverlay() { G.overlay = null; renderOverlayChip(); G.needsRender = true; }
+function clearOverlay() { G.overlay = null; G.overlayPos.clear(); renderOverlayChip(); G.needsRender = true; }
 function renderOverlayChip() {
   const c = $('#ov-chip'); if (!c) return;
   const ov = G.overlay; c.classList.toggle('hidden', !ov);
   if (!ov) { c.innerHTML = ''; return; }
-  const shown = [...ov.changed].filter(id => G.byId.has(id)).length;
+  const shown = [...ov.changed].filter(id => lookup(id)).length;
   c.innerHTML = `<span class="sw" style="background:var(--err)"></span>${fmtNum(shown)}/${fmtNum(ov.changed.size)} changed<span class="sw" style="background:var(--warn);margin-left:4px"></span>${fmtNum(ov.affected.size)} affected<button class="btn quiet sm icon" data-act="overlay-clear" title="Clear diff overlay">${ic('x')}</button>`;
 }
-
 /* ─────────────────────────── Detail pane ─────────────────────────── */
 function detTabs(kind) {
   let t;
@@ -1925,7 +2116,8 @@ function loadDef() {
     return (defs || []).find(d => d.id === s.id) || (defs || [])[0] || null;
   });
 }
-function edgeCount(id, kind, dir) { let c = 0; for (const e of G.graph.edges) if (e.kind === kind && (dir === 'in' ? e.dst === id : e.src === id)) c++; return c; }
+// Degree of the selection by edge kind, from its loaded neighbourhood (/api/node_neighbors).
+function edgeCount(id, kind, dir) { if (G.nb.id !== id) return '…'; let c = 0; for (const e of G.nb.edges) if (e.kind === kind && (dir === 'in' ? e.dst === id : e.src === id)) c++; return c; }
 function renderMetrics() {
   const m = $('#det-metrics'); if (!m || !S.sel) return;
   const s = S.sel, file = isFileSel();
@@ -1990,13 +2182,13 @@ function detOverview(body, n) {
     fill($('#ov-refs'), () => dget('refs', () => api(`/api/references?name=${q(n.name)}`)), refs => (refs || []).length ? refs.slice(0, 60).map(r => relRow({ name: r.caller_name || r.caller || '?', kind: r.caller_kind, file: r.file, meta: `${EDGE_LABELS[r.edge] || r.edge} · ${basename(r.file)}:${r.line}` })).join('') + (refs.length > 60 ? noneHTML(`+${refs.length - 60} more`) : '') : noneHTML('No references found.'), { after: wireRels });
     fill($('#ov-rel'), () => dget('neigh', () => api(`/api/neighborhood?name=${q(n.name)}&limit=20`)), rows => (rows || []).length ? rows.map(r => relRow({ name: r.name, kind: r.kind, file: r.file, meta: `${EDGE_LABELS[r.via] || r.via} · ${basename(r.file)}` })).join('') : noneHTML('No related entities.'), { after: wireRels });
   }
-  const ln = G.byId.get(n.id), cm = $('#ov-comm');
-  if (cm && ln && ln.cluster != null) {
+  const ln = lookup(n.id) || G.nb.nodes.get(n.id), cm = $('#ov-comm');
+  if (cm && ln && ln.cluster != null && ln.cluster !== -1) {
     const sc = G.clusterNames.get(ln.cluster);
-    cm.innerHTML = `<div class="section-label">Cluster</div><button class="pill" style="cursor:pointer" data-act="open-cluster" data-cid="${esc(ln.cluster)}" title="Open the cluster in Insights"><span class="dot" style="color:${commColor(ln.cluster)}"></span>${esc(sc ? sc.name : '#' + ln.cluster)}${sc ? ` · ${fmtNum(sc.size)} members · cohesion ${Number(sc.cohesion || 0).toFixed(2)}` : ''}</button>`;
-  } else if (cm && ln && ln.community != null) {
-    const c = G.communities.find(x => x.id === ln.community);
-    cm.innerHTML = `<div class="section-label">Community <span class="faint">estimated in the browser</span></div><span class="pill"><span class="dot" style="color:${commColor(ln.community)}"></span>${esc(c ? c.label : '#' + ln.community)}${c ? ` · ${fmtNum(c.size)} nodes` : ''}</span>`;
+    const txt = `<span class="dot" style="color:${commColor(ln.cluster)}"></span>${esc(sc ? sc.name : '#' + ln.cluster)}${sc ? ` · ${fmtNum(sc.size)} nodes` : ''}`;
+    cm.innerHTML = ln.cluster >= 0
+      ? `<div class="section-label">Cluster</div><button class="pill" style="cursor:pointer" data-act="open-cluster" data-cid="${esc(ln.cluster)}" title="Open the cluster in Insights">${txt}</button>`
+      : `<div class="section-label">Group <span class="faint">directory (no Louvain cluster)</span></div><span class="pill">${txt}</span>`;
   }
   const rl = $('#ov-rules');
   if (rl && file) fill(rl, () => dget('rules', () => api(`/api/rules_for?file=${q(file)}`)), rules => (rules || []).length ? `<div class="rules">${rules.map(r => `<details><summary>${ic('lock', 12)} ${esc(r.name)} <span class="faint">${esc(r.description || '')}${r.always_apply ? ' · always' : ''}</span></summary><div class="body md">${md(r.body || '')}</div></details>`).join('')}</div>` : noneHTML('No rules match this file.'));
@@ -3261,7 +3453,7 @@ const palRemote = debounce(async (qv) => {
 }, 260);
 function renderPal() {
   const qv = $('#pal-q').value.trim(), ql = qv.toLowerCase();
-  const syms = []; for (const n of G.labelOrder) { if (ql && !n.name.toLowerCase().includes(ql) && !(n.file || '').toLowerCase().includes(ql)) continue; syms.push({ t: 'sym', n }); if (syms.length >= 8) break; }
+  const syms = residentTop(8, n => !ql || n.name.toLowerCase().includes(ql)).map(n => ({ t: 'sym', n }));
   const seen = new Set(syms.map(s => s.n.id));
   const remote = PAL.remoteQ === qv ? PAL.remote.filter(r => !seen.has(r.id)).slice(0, 6).map(r => ({ t: 'sym', n: { id: r.id, name: r.name, kind: r.label, file: r.file, line: r.line } })) : [];
   const wiki = PAL.mode === 'jump' ? PAL.wiki.filter(w => !ql || (w.title || '').toLowerCase().includes(ql) || (w.module || '').toLowerCase().includes(ql)).slice(0, 4).map(w => ({ t: 'wiki', w })) : [];
@@ -3307,10 +3499,18 @@ function popMenu(anchor, items) {
 // Symbol name index (for linking `code` spans in wiki pages / chat answers to graph nodes).
 let SYM_IDX = { n: -1, map: new Map() };
 function symbolIndex() {
-  if (SYM_IDX.n === G.layout.length) return SYM_IDX.map;
+  // names of the loaded symbol tiles; openSymbol resolves anything else through /api/definition
+  if (SYM_IDX.n === G.stats.tilesLoaded) return SYM_IDX.map;
   const m = new Map();
-  for (const n of G.labelOrder) { if (n.kind === 'File') { if (!m.has(n.name)) m.set(n.name, n); continue; } if (n.name.length > 2 && !m.has(n.name)) m.set(n.name, n); }
-  SYM_IDX = { n: G.layout.length, map: m }; return m;
+  for (const t of G.tiles.values()) {
+    if (t.lod !== 0) continue;
+    for (const [i, name] of t.names) {
+      const n = { id: t.ids[i], name, kind: TILE_NODE_KINDS[t.kind[i]] };
+      if (n.kind === 'File') { if (!m.has(name)) m.set(name, n); if (!m.has(basename(name))) m.set(basename(name), n); continue; }
+      if (name.length > 2 && !m.has(name)) m.set(name, n);
+    }
+  }
+  SYM_IDX = { n: G.stats.tilesLoaded, map: m }; return m;
 }
 
 /* ─────────────────────────── Roots ─────────────────────────── */
@@ -3346,7 +3546,7 @@ function switchRoot(slug) {
   if (!slug || slug === ROOT.slug) return;
   ROOT.slug = slug; try { localStorage.setItem('docgraph.root', slug); } catch { /* storage unavailable */ }
   RC = {}; DC = {};
-  G.selectedId = null; S.sel = null; S.explore = null; S.search.results = null; S.search.near = false; S.change = null; S.changesRef = ''; S.wiki = null;
+  G.selectedId = null; S.sel = null; G.nb = { id: null, nodes: new Map(), edges: [] }; G.focus = null; G.overlay = null; G.overlayPos.clear(); G.man = null; clearTiles(); S.explore = null; S.search.results = null; S.search.near = false; S.change = null; S.changesRef = ''; S.wiki = null;
   Object.keys(CY_STATE).forEach(k => { CY_STATE[k].out = null; });
   renderRootPick(); renderSelChip(); renderDetail();
   if (S.leftTab === 'files') renderLeft();
@@ -3411,7 +3611,7 @@ function applyTheme(t) {
   if (t) document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
   const dark = t ? t === 'dark' : !matchMedia('(prefers-color-scheme: light)').matches;
   $('#theme-btn').innerHTML = ic(dark ? 'sun' : 'moon');
-  G.T = readTheme(); G.needsRender = true;
+  G.T = readTheme(); restyle();
   if (S.leftTab === 'filters') renderLeft();
 }
 
@@ -3422,12 +3622,12 @@ const ACTS = {
   'det-close': () => { if (innerWidth > 1180) clearSelection(); else toggleRight(false); },
   'sel-clear': () => clearSelection(),
   'zoom-in': () => zoomBy(1.25), 'zoom-out': () => zoomBy(0.8), 'fit': () => fitToScreen(),
-  'pause': () => { if (!G.layout.length) return; G.layoutRunning ? pauseLayout() : startLayout(); },
-  'relayout': () => { if (G.layout.length) resetLayout(); },
+  'pause': () => { if (!G.man) return; G.layoutRunning ? pauseLayout() : startLayout(); },
+  'relayout': () => { if (G.man) resetLayout(); },
   'reload-graph': () => loadGraph(), 'graph-retry': () => (ROOT.slug ? loadGraph() : boot()), 'boot': () => boot(),
   'index-now': () => reindex(ROOT.slug, false),
   'ask-about': () => askAboutSelection(),
-  'focus': () => { G.focusHops = 1; computeVisible(); G.needsRender = true; if (S.leftTab === 'filters') renderLeft(); fitToScreen(); toast('Focused on the 1-hop neighbourhood — Filters → Focus depth to change'); },
+  'focus': () => { G.focusHops = Math.max(1, G.focusHops); if (G.selectedId != null) loadNeighbors(G.selectedId).then(() => fitToScreen()); if (S.leftTab === 'filters') renderLeft(); toast('Focused on the 1-hop neighbourhood — Filters → Focus depth to change'); },
   'copy-ref': async () => { const s = S.sel; if (!s) return; let ref = selFile() || s.name; if (!isFileSel()) { const d = await loadDef().catch(() => null); ref = d ? `${d.file}:${d.line}` : `${s.file || ''}::${s.name}`; } copyText(ref); },
   'det-tab': (el) => { S.detTab = el.dataset.tab; renderDetail(); },
   'wk-open': () => $('#wk-nav')?.classList.add('open'), 'wk-close': () => $('#wk-nav')?.classList.remove('open'),

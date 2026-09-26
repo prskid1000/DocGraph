@@ -728,14 +728,19 @@ class Retriever:
             next_front: set[int] = set()
             ids = list(frontier)
             for edge in EDGE_TYPES:
-                try:
-                    rows = self.db.fetch_all(
-                        f"MATCH (a)-[r:{edge}]-(b) WHERE a.id IN $ids AND b.id IS NOT NULL "
-                        f"RETURN a.id AS src, b.id AS dst",
-                        {"ids": ids},
-                    )
-                except Exception:
-                    continue
+                # Two directed queries (out of / into the frontier) so the
+                # payload keeps each edge's real direction.
+                rows = []
+                for side in ("a", "b"):
+                    try:
+                        rows += self.db.fetch_all(
+                            f"MATCH (a)-[r:{edge}]->(b) WHERE {side}.id IN $ids "
+                            f"AND a.id IS NOT NULL AND b.id IS NOT NULL "
+                            f"RETURN a.id AS src, b.id AS dst",
+                            {"ids": ids},
+                        )
+                    except Exception:
+                        continue
                 for row in rows:
                     src, dst = int(row["src"]), int(row["dst"])
                     edge_records.append({"src": src, "dst": dst, "kind": edge})
@@ -1328,7 +1333,7 @@ class Retriever:
         self._annotate_graph(nodes, edges)
         return {"nodes": nodes, "edges": edges}
 
-    def files_dump(self) -> dict:
+    def files_dump(self, edges: bool = True) -> dict:
         """All File nodes + inter-file edges. Uncapped — used by the UI's
         Level-0 mode where the full file skeleton is intentional. Symbol
         nodes inside each file come in via lazy expansion on click.
@@ -1349,6 +1354,8 @@ class Retriever:
             r["kind"] = "File"
             nodes.append(r)
         node_ids = {n["id"] for n in nodes}
+        if not edges:
+            return {"nodes": nodes, "edges": []}
 
         edges: list[dict] = []
         for edge in ("IMPORTS", "CO_CHANGED_WITH", "LINKS_TO"):

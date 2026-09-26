@@ -499,8 +499,8 @@ def make_app(workspace: Workspace) -> FastAPI:
         return _r(root).graph_dump(limit_nodes=limit_nodes)
 
     @app.get("/api/files")
-    async def api_files(root: RootSlug = DEFAULT):
-        return _r(root).files_dump()
+    async def api_files(edges: bool = True, root: RootSlug = DEFAULT):
+        return _r(root).files_dump(edges=edges)
 
     @app.get("/api/node_neighbors")
     async def api_node_neighbors(id: int, hops: int = 1, root: RootSlug = DEFAULT):
