@@ -48,6 +48,11 @@ NODE_DDL = [
         llm_doc STRING,
         embedding DOUBLE[{dim}],
         pagerank DOUBLE,
+        ehash STRING,
+        first_seen_commit STRING,
+        first_seen_ts INT64,
+        last_changed_commit STRING,
+        last_changed_ts INT64,
         PRIMARY KEY (id)
     )""",
     """CREATE NODE TABLE IF NOT EXISTS Function(
@@ -64,6 +69,11 @@ NODE_DDL = [
         llm_doc STRING,
         embedding DOUBLE[{dim}],
         pagerank DOUBLE,
+        ehash STRING,
+        first_seen_commit STRING,
+        first_seen_ts INT64,
+        last_changed_commit STRING,
+        last_changed_ts INT64,
         PRIMARY KEY (id)
     )""",
     """CREATE NODE TABLE IF NOT EXISTS Variable(
@@ -87,6 +97,44 @@ NODE_DDL = [
         idx INT64,
         body STRING,
         embedding DOUBLE[{dim}],
+        ehash STRING,
+        PRIMARY KEY (id)
+    )""",
+    # Server-side communities (Louvain over the resolved call/type graph).
+    # Wiped + recomputed on every index pass that dirties the graph, like
+    # PageRank. `top_members` / `files` are JSON-encoded lists.
+    """CREATE NODE TABLE IF NOT EXISTS Community(
+        id INT64,
+        name STRING,
+        size INT64,
+        cohesion DOUBLE,
+        top_members STRING,
+        files STRING,
+        pagerank DOUBLE,
+        PRIMARY KEY (id)
+    )""",
+    # Framework HTTP routes (aiohttp / FastAPI / Flask / Express) and MCP
+    # tools / resources / prompts. Keyed by `file` like every other entity
+    # so the per-file delta can DETACH DELETE them.
+    """CREATE NODE TABLE IF NOT EXISTS Route(
+        id INT64,
+        name STRING,
+        method STRING,
+        path STRING,
+        framework STRING,
+        file STRING,
+        line INT64,
+        handler STRING,
+        PRIMARY KEY (id)
+    )""",
+    """CREATE NODE TABLE IF NOT EXISTS Tool(
+        id INT64,
+        name STRING,
+        kind STRING,
+        framework STRING,
+        file STRING,
+        line INT64,
+        handler STRING,
         PRIMARY KEY (id)
     )""",
 ]
@@ -99,12 +147,16 @@ EDGE_DDL = [
     "CREATE REL TABLE IF NOT EXISTS IMPORTS(FROM File TO File, FROM File TO Module)",
     "CREATE REL TABLE IF NOT EXISTS IMPORTS_SYMBOL(FROM File TO Class, FROM File TO Function)",
     # Tier 2 — Behavioral
-    "CREATE REL TABLE IF NOT EXISTS CALLS(FROM Function TO Function, line INT64)",
-    "CREATE REL TABLE IF NOT EXISTS INSTANTIATES(FROM Function TO Class, line INT64)",
+    # Resolved edges carry `confidence` (0..1) + `method` (which tier of the
+    # resolution cascade produced them -- see resolve.py). Ambiguous call
+    # sites are NOT turned into CALLS; their candidates go to CALLS_CANDIDATE.
+    "CREATE REL TABLE IF NOT EXISTS CALLS(FROM Function TO Function, line INT64, confidence DOUBLE, method STRING)",
+    "CREATE REL TABLE IF NOT EXISTS CALLS_CANDIDATE(FROM Function TO Function, line INT64, confidence DOUBLE, method STRING)",
+    "CREATE REL TABLE IF NOT EXISTS INSTANTIATES(FROM Function TO Class, line INT64, confidence DOUBLE, method STRING)",
     "CREATE REL TABLE IF NOT EXISTS REFERENCES_(FROM Function TO Class, FROM Function TO Variable, FROM Function TO Function, line INT64)",
     "CREATE REL TABLE IF NOT EXISTS RETURNS(FROM Function TO Class)",
     # Tier 3 — Type system
-    "CREATE REL TABLE IF NOT EXISTS INHERITS(FROM Class TO Class)",
+    "CREATE REL TABLE IF NOT EXISTS INHERITS(FROM Class TO Class, confidence DOUBLE, method STRING)",
     "CREATE REL TABLE IF NOT EXISTS IMPLEMENTS(FROM Class TO Class)",
     "CREATE REL TABLE IF NOT EXISTS OVERRIDES(FROM Function TO Function)",
     "CREATE REL TABLE IF NOT EXISTS DECORATED_BY(FROM Function TO Function, FROM Class TO Function)",
@@ -115,7 +167,33 @@ EDGE_DDL = [
     "CREATE REL TABLE IF NOT EXISTS CONTAINS_CHUNK(FROM Function TO Chunk, FROM Class TO Chunk)",
     # External-link structure: BFS parent→child hyperlinks from the web crawler.
     "CREATE REL TABLE IF NOT EXISTS LINKS_TO(FROM File TO File)",
+    # Communities + framework maps
+    "CREATE REL TABLE IF NOT EXISTS MEMBER_OF(FROM Function TO Community, FROM Class TO Community, FROM File TO Community)",
+    "CREATE REL TABLE IF NOT EXISTS HANDLES(FROM Route TO Function, FROM Tool TO Function)",
 ]
+
+# Bumped whenever the on-disk schema or the cache.json entry shape changes.
+# `Indexer.index_all` compares it with state.json["schema_version"] and
+# forces a full reindex on mismatch (an incremental run over an old-shape
+# DB would leave pre-upgrade edges without confidence, nodes without
+# ehash, etc.).
+SCHEMA_VERSION = 3
+
+# Columns added after the first public schema. `migrate()` ALTERs them onto
+# an existing DB opened read-write so an old DB never hard-errors on a new
+# query; readers additionally probe `table_props()` before using them.
+_ADDED_COLUMNS: dict[str, list[tuple[str, str]]] = {
+    "CALLS": [("confidence", "DOUBLE"), ("method", "STRING")],
+    "INSTANTIATES": [("confidence", "DOUBLE"), ("method", "STRING")],
+    "INHERITS": [("confidence", "DOUBLE"), ("method", "STRING")],
+    "Function": [("ehash", "STRING"), ("first_seen_commit", "STRING"),
+                 ("first_seen_ts", "INT64"), ("last_changed_commit", "STRING"),
+                 ("last_changed_ts", "INT64")],
+    "Class": [("ehash", "STRING"), ("first_seen_commit", "STRING"),
+              ("first_seen_ts", "INT64"), ("last_changed_commit", "STRING"),
+              ("last_changed_ts", "INT64")],
+    "Chunk": [("ehash", "STRING")],
+}
 
 
 class DatabaseBusy(RuntimeError):
@@ -130,17 +208,27 @@ class DatabaseBusy(RuntimeError):
     well-typed error, not crash with AttributeError on a None conn."""
 
 
+# Kuzu reserves `max_db_size` bytes of *virtual* address space per open
+# Database (default 8 TB). Windows gives a process 128 TB, so ~16 open
+# databases -- a host with many roots, or a test session -- fail with
+# "VirtualAlloc ... failed". 1 TB is still orders of magnitude above any
+# code graph.
+MAX_DB_SIZE = 1 << 40
+
+
 class GraphDB:
     def __init__(self, db_path: Path, embedding_dim: int = 384, read_only: bool = False):
         self.db_path = Path(db_path)
         self.embedding_dim = embedding_dim
-        self.db = kuzu.Database(str(self.db_path), read_only=read_only)
+        self.db = kuzu.Database(str(self.db_path), read_only=read_only, max_db_size=MAX_DB_SIZE)
         self.conn = kuzu.Connection(self.db)
         # Per-node-table id sets, populated lazily on first edge insert. Used
         # to filter dangling-endpoint rows before COPY FROM (which errors hard
         # on unknown PKs, vs. the old MATCH+CREATE which silently dropped).
         # `insert_nodes` extends the cache so freshly inserted nodes are seen.
         self._known_ids: dict[str, set[int]] = {}
+        self._props_cache: dict[str, set[str]] = {}
+        self.read_only = read_only
 
     def init_schema(self) -> None:
         # NODE_DDL templates contain `{dim}` placeholders for embedding columns
@@ -149,6 +237,179 @@ class GraphDB:
             self.conn.execute(ddl.format(dim=self.embedding_dim))
         for ddl in EDGE_DDL:
             self.conn.execute(ddl)
+        self.migrate()
+
+    def migrate(self) -> None:
+        """ALTER columns added in later schema versions onto an existing
+        table. Idempotent; no-op on a fresh DB. Values of the new columns
+        stay NULL until the next full reindex writes them."""
+        for table, cols in _ADDED_COLUMNS.items():
+            have = self.table_props(table, refresh=True)
+            if not have:
+                continue
+            for col, typ in cols:
+                if col in have:
+                    continue
+                try:
+                    self.conn.execute(f"ALTER TABLE {table} ADD {col} {typ}")
+                except Exception:
+                    pass
+            self._props_cache.pop(table, None)
+
+    def table_props(self, table: str, refresh: bool = False) -> set[str]:
+        """Property names of a node/rel table (empty if the table is
+        missing). Cached per connection; readers use it to degrade
+        gracefully on a DB written by an older schema version."""
+        if not refresh and table in self._props_cache:
+            return self._props_cache[table]
+        props: set[str] = set()
+        try:
+            for r in self.fetch_all(f"CALL table_info('{table}') RETURN *"):
+                name = r.get("name")
+                if name:
+                    props.add(str(name))
+        except Exception:
+            props = set()
+        self._props_cache[table] = props
+        return props
+
+    def has_table(self, table: str) -> bool:
+        return bool(self.table_props(table))
+
+    # ---- index-time helpers for the newer tables -------------------------
+
+    def replace_communities(self, communities: list[dict],
+                            members: dict[str, list[dict]]) -> None:
+        """Wipe Community + MEMBER_OF and write a fresh partition.
+        communities: rows for the Community table. members: {from_label:
+        [{from_id, to_id}]} for MEMBER_OF."""
+        try:
+            self.execute("MATCH ()-[r:MEMBER_OF]->() DELETE r")
+            self.execute("MATCH (c:Community) DETACH DELETE c")
+        except Exception:
+            pass
+        self._known_ids.pop("Community", None)
+        if communities:
+            self.insert_nodes("Community", communities)
+        for from_label, rows in members.items():
+            if rows:
+                self.insert_edges("MEMBER_OF", from_label, "Community", rows)
+
+    def upgrade_calls(self, rows: list[dict]) -> int:
+        """Raise existing CALLS edges to a precise confidence/method (SCIP).
+        rows: [{a, b, confidence, method}]. Returns the number of rows sent."""
+        if not rows:
+            return 0
+        self.execute(
+            "UNWIND $rows AS row "
+            "MATCH (a:Function {id: row.a})-[r:CALLS]->(b:Function {id: row.b}) "
+            "SET r.confidence = row.confidence, r.method = row.method",
+            {"rows": rows},
+        )
+        return len(rows)
+
+    def set_history(self, label: str, rows: list[dict]) -> None:
+        """Update history columns in place: rows [{id, fc, fts, lc, lts}]."""
+        if not rows:
+            return
+        self.execute(
+            f"UNWIND $rows AS row MATCH (n:{label} {{id: row.id}}) "
+            f"SET n.first_seen_commit = row.fc, n.first_seen_ts = row.fts, "
+            f"n.last_changed_commit = row.lc, n.last_changed_ts = row.lts",
+            {"rows": rows},
+        )
+
+    def community_graph(self) -> tuple[dict[int, dict], list[tuple[int, int, float]]]:
+        """Nodes + weighted edges for community detection (communities.py)."""
+        nodes: dict[int, dict] = {}
+        for label in ("Function", "Class"):
+            for r in self.fetch_all(
+                f"MATCH (n:{label}) RETURN n.id AS id, n.name AS name, n.file AS file, "
+                f"coalesce(n.pagerank, 0.0) AS pr"
+            ):
+                nodes[r["id"]] = {"label": label, "name": r["name"], "file": r["file"],
+                                  "pagerank": float(r["pr"] or 0.0)}
+        for r in self.fetch_all(
+            "MATCH (n:File) RETURN n.id AS id, n.path AS path, coalesce(n.pagerank, 0.0) AS pr"
+        ):
+            nodes[r["id"]] = {"label": "File", "name": r["path"], "file": r["path"],
+                              "pagerank": float(r["pr"] or 0.0)}
+        edges: list[tuple[int, int, float]] = []
+        conf_rel = {t: ("confidence" in self.table_props(t)) for t in ("CALLS", "INSTANTIATES", "INHERITS")}
+        for rel in ("CALLS", "INSTANTIATES", "INHERITS"):
+            w = "coalesce(r.confidence, 1.0)" if conf_rel[rel] else "1.0"
+            for r in self.fetch_all(f"MATCH (a)-[r:{rel}]->(b) RETURN a.id AS a, b.id AS b, {w} AS w"):
+                edges.append((r["a"], r["b"], float(r["w"] or 1.0)))
+        for r in self.fetch_all("MATCH (a)-[r:CONTAINS]->(b) RETURN a.id AS a, b.id AS b"):
+            edges.append((r["a"], r["b"], 0.5))
+        for r in self.fetch_all("MATCH (a:File)-[r:IMPORTS]->(b:File) RETURN a.id AS a, b.id AS b"):
+            edges.append((r["a"], r["b"], 0.3))
+        return nodes, edges
+
+    def embeddings_in_files(self, label: str, files: list[str]) -> dict[str, list]:
+        """{ehash: embedding} for every node of `label` in `files` -- the
+        pre-delete harvest of the embedding cache."""
+        if not files or "ehash" not in self.table_props(label):
+            return {}
+        out: dict[str, list] = {}
+        for r in self.fetch_all(
+            f"MATCH (n:{label}) WHERE n.file IN $files AND n.ehash IS NOT NULL "
+            f"RETURN n.ehash AS h, n.embedding AS e",
+            {"files": files},
+        ):
+            if r.get("h") and r.get("e") is not None:
+                out.setdefault(r["h"], r["e"])
+        return out
+
+    def entity_spans(self, files: list[str]) -> list[dict]:
+        """[{label, id, file, s, e}] for Function/Class nodes in `files`."""
+        out: list[dict] = []
+        if not files:
+            return out
+        for label in ("Function", "Class"):
+            for r in self.fetch_all(
+                f"MATCH (n:{label}) WHERE n.file IN $files "
+                f"RETURN n.id AS id, n.file AS file, n.line_start AS s, n.line_end AS e",
+                {"files": files},
+            ):
+                r["label"] = label
+                out.append(r)
+        return out
+
+    def framework_nodes(self) -> dict[tuple[str, int, str], tuple[str, int]]:
+        """{(file, line, name): (label, id)} for existing Route/Tool nodes."""
+        out: dict[tuple[str, int, str], tuple[str, int]] = {}
+        for label in ("Route", "Tool"):
+            if not self.has_table(label):
+                continue
+            for r in self.fetch_all(
+                f"MATCH (n:{label}) RETURN n.id AS id, n.file AS file, n.line AS line, n.name AS name"
+            ):
+                out[(r["file"], int(r["line"] or 0), r["name"])] = (label, r["id"])
+        return out
+
+    def embeddings_by_ehash(self, label: str, hashes: list[str],
+                            files: list[str] | None = None) -> dict[str, list]:
+        """Existing vectors for content hashes (the embedding cache). With
+        `files`, only nodes in those files are searched (the pre-delete
+        harvest); otherwise the whole table."""
+        if not hashes or "ehash" not in self.table_props(label):
+            return {}
+        out: dict[str, list] = {}
+        if files is not None:
+            q = (f"MATCH (n:{label}) WHERE n.file IN $files AND n.ehash IS NOT NULL "
+                 f"RETURN n.ehash AS h, n.embedding AS e")
+            params: dict = {"files": files}
+        else:
+            q = (f"MATCH (n:{label}) WHERE n.ehash IN $hs "
+                 f"RETURN n.ehash AS h, n.embedding AS e")
+            params = {"hs": hashes}
+        want = set(hashes)
+        for r in self.fetch_all(q, params):
+            h = r.get("h")
+            if h in want and h not in out and r.get("e") is not None:
+                out[h] = r["e"]
+        return out
 
     def execute(self, cypher: str, params: dict | None = None) -> Any:
         if self.conn is None:

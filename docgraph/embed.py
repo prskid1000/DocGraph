@@ -55,6 +55,51 @@ _KNOWN_DIMS: dict[str, int] = {
     "mixedbread-ai/mxbai-embed-large-v1":              1024,
 }
 
+# Per-model quirks for the code-specific embedders (and the few general
+# ones that need prefixes). Everything is derived from the model id so a
+# user only ever passes `--embed-model <id>`:
+#   dim                output size (sizes the Kuzu column without a download)
+#   query_prefix       prepended to search queries (asymmetric models)
+#   doc_prefix         prepended to indexed code/text
+#   trust_remote_code  only for models whose architecture ships as custom
+#                      code on the Hub (NomicBert, JinaBert, SFR "NewModel");
+#                      never switched on for anything else
+#   max_seq            cap on tokens per input (long-context models would
+#                      otherwise allocate 8k-token attention per chunk)
+MODEL_PROFILES: dict[str, dict] = {
+    "nomic-ai/CodeRankEmbed": {
+        "dim": 768, "trust_remote_code": True, "max_seq": 1024,
+        "query_prefix": "Represent this query for searching relevant code: ",
+        "notes": "137M code retriever (CoRNStack); query prefix required",
+    },
+    "jinaai/jina-embeddings-v2-base-code": {
+        "dim": 768, "trust_remote_code": True, "max_seq": 1024,
+        "notes": "161M, 30 languages; its Hub remote code needs transformers < 5",
+    },
+    "Qodo/Qodo-Embed-1-1.5B": {
+        "dim": 1536, "trust_remote_code": False, "max_seq": 1024,
+        "notes": "1.5B Qwen2-based code embedder; GPU strongly recommended",
+    },
+    "Salesforce/SFR-Embedding-Code-400M_R": {
+        "dim": 1024, "trust_remote_code": True, "max_seq": 1024,
+        "notes": "400M code retriever",
+    },
+    "nomic-ai/nomic-embed-text-v1.5": {
+        "dim": 768, "trust_remote_code": True, "max_seq": 1024,
+        "query_prefix": "search_query: ", "doc_prefix": "search_document: ",
+    },
+    "intfloat/e5-small-v2": {"dim": 384, "query_prefix": "query: ", "doc_prefix": "passage: "},
+    "intfloat/e5-base-v2": {"dim": 768, "query_prefix": "query: ", "doc_prefix": "passage: "},
+    "intfloat/e5-large-v2": {"dim": 1024, "query_prefix": "query: ", "doc_prefix": "passage: "},
+}
+for _m, _p in MODEL_PROFILES.items():
+    _KNOWN_DIMS.setdefault(_m, int(_p["dim"]))
+
+
+def model_profile(model_name: str) -> dict:
+    """Profile for a model id ({} for plain sentence-transformers models)."""
+    return MODEL_PROFILES.get(model_name or "", {})
+
 
 def resolve_device(gpu: bool) -> str | None:
     """Return `"cuda"` if GPU is requested AND torch sees a usable CUDA
@@ -95,7 +140,8 @@ def dim_for_model(model_name: str, default: int = 384) -> int:
         return _KNOWN_DIMS[model_name]
     try:
         from sentence_transformers import SentenceTransformer
-        m = SentenceTransformer(model_name, device="cpu")
+        m = SentenceTransformer(model_name, device="cpu",
+                                trust_remote_code=bool(model_profile(model_name).get("trust_remote_code")))
         d = int(m.get_sentence_embedding_dimension() or default)
         _KNOWN_DIMS[model_name] = d
         del m
@@ -192,11 +238,19 @@ class Embedder:
             # `model_kwargs={"torch_dtype": …}` is the supported way to
             # load straight into fp16 / bf16 — avoids a fp32 → fp16
             # round-trip.
+            prof = model_profile(self.model_name)
             model = SentenceTransformer(
                 self.model_name,
                 device=self._resolved_device,
                 model_kwargs={"torch_dtype": torch_dtype},
+                trust_remote_code=bool(prof.get("trust_remote_code")),
             )
+            if prof.get("max_seq"):
+                try:
+                    cur = int(getattr(model, "max_seq_length", 0) or 0)
+                    model.max_seq_length = min(cur, int(prof["max_seq"])) if cur else int(prof["max_seq"])
+                except Exception:
+                    pass
             model.eval()
             if self.torch_compile:
                 # `reduce-overhead` is the right mode for many small inference
@@ -215,11 +269,21 @@ class Embedder:
             _MODEL_CACHE[key] = model
         return self._model
 
+    def embed_query(self, text: str) -> np.ndarray:
+        """Embed one search query (applies the model's query prefix)."""
+        return self.embed([text], kind="query")[0]
+
+    def _prefixed(self, texts: list[str], kind: str) -> list[str]:
+        prof = model_profile(self.model_name)
+        pre = prof.get("query_prefix" if kind == "query" else "doc_prefix") or ""
+        return [pre + t for t in texts] if pre else texts
+
     def embed(
         self,
         texts: Iterable[str],
         batch_size: int | None = None,
         on_progress: Callable[[int], None] | None = None,
+        kind: str = "document",
     ) -> np.ndarray:
         """Embed a list of texts. Returns float32 ndarray of shape (N, dim).
 
@@ -228,7 +292,7 @@ class Embedder:
         across CLI invocations. Daemon path skipped when `on_progress` is
         set since the daemon returns one batch and progress hooks expect
         per-vector ticks. Falls back transparently on any daemon failure."""
-        texts_list = list(texts)
+        texts_list = self._prefixed(list(texts), kind)
         if batch_size is None:
             batch_size = 64
 

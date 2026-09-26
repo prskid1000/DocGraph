@@ -96,6 +96,21 @@ class Config:
     embed_daemon: bool = False
     daemon_port: int = 5577
     daemon_idle_exit_sec: float = 0.0
+    # Embedding cache keyed by content hash: vectors of re-parsed / moved
+    # entities are reused instead of re-embedded (incremental runs only).
+    embed_cache: bool = True
+    # Symbol history from `git blame` of changed files (first_seen /
+    # last_changed commit per symbol). Bounded by history_max_files per run.
+    history: bool = True
+    history_max_files: int = 5000
+    # Server-side community detection (Louvain) at index time.
+    communities: bool = True
+    # SCIP precise references: "auto" (use binaries / index if present),
+    # "on" (always re-run the binaries), "off". Binary paths override PATH.
+    scip: str = "auto"
+    scip_python: str = ""
+    scip_typescript: str = ""
+    scip_index: str = ""
     ignore_specs: dict[Path, pathspec.PathSpec] = field(init=False)
     ignore_spec: pathspec.PathSpec = field(init=False)  # primary root, kept for back-compat
 
@@ -297,6 +312,14 @@ def load_config(
     embed_daemon: bool = False,
     daemon_port: int = 5577,
     daemon_idle_exit_sec: float = 0.0,
+    embed_cache: bool = True,
+    history: bool = True,
+    history_max_files: int = 5000,
+    communities: bool = True,
+    scip: str = "auto",
+    scip_python: str = "",
+    scip_typescript: str = "",
+    scip_index: str = "",
 ) -> Config:
     """Build a Config from explicit kwargs.
 
@@ -359,5 +382,13 @@ def load_config(
         embed_daemon=embed_daemon,
         daemon_port=daemon_port,
         daemon_idle_exit_sec=daemon_idle_exit_sec,
+        embed_cache=embed_cache,
+        history=history,
+        history_max_files=history_max_files,
+        communities=communities,
+        scip=scip,
+        scip_python=scip_python,
+        scip_typescript=scip_typescript,
+        scip_index=scip_index,
         **({"workers": workers} if workers is not None else {}),
     )

@@ -55,16 +55,32 @@ def _bar() -> Progress:
     )
 
 from docgraph.config import Config, MAX_FILE_BYTES
-from docgraph.db import GraphDB
+from docgraph.db import GraphDB, SCHEMA_VERSION
 from docgraph.embed import Embedder, resolve_device
 from docgraph.parse import detect_language, parse_file, FileParse, Entity, RawEdge
 from docgraph.rank import compute_pagerank, write_pagerank
+from docgraph.resolve import ModuleIndex, SymbolResolver, candidate_confidence
 from docgraph.summary import build_embedding_text, chunk_body
 from docgraph.proc_util import NO_WINDOW
+from docgraph import history as _history
+from docgraph import merkle as _merkle
 
 log = logging.getLogger(__name__)
 
 ProgressCb = Callable[[str, int, int], None] | None
+
+# Bounded list of removed symbols kept in state.json for symbol_history.
+MAX_REMOVED_SYMBOLS = 500
+
+
+def _ehash(model: str, text: str) -> str:
+    """Content hash that keys the embedding cache: same text under the same
+    model -> same vector, wherever the entity moved to."""
+    h = hashlib.sha1()
+    h.update(model.encode("utf-8", "replace"))
+    h.update(b"\0")
+    h.update(text.encode("utf-8", "replace"))
+    return h.hexdigest()
 
 
 def _wire_extra_paths(cfg: Config) -> None:
@@ -275,12 +291,15 @@ class Indexer:
         )
         self._next_id = 1
         self.progress_cb: ProgressCb = None
+        self.embed_cache_hits = 0
+        self.embed_cache_misses = 0
 
     # ---- ID allocation ----
     def _seed_ids_from_db(self) -> None:
         """Continue allocating after the max id currently in the DB."""
         max_id = 0
-        for label in ("File", "Module", "Class", "Function", "Variable", "Chunk"):
+        for label in ("File", "Module", "Class", "Function", "Variable", "Chunk",
+                      "Community", "Route", "Tool"):
             try:
                 rows = self.db.fetch_all(f"MATCH (n:{label}) RETURN max(n.id) AS m")
                 m = rows[0]["m"] if rows and rows[0]["m"] is not None else 0
@@ -303,8 +322,16 @@ class Indexer:
         insert_batch: int = 5000,
         cancel_token: "CancelToken | None" = None,
         progress_emit: "Callable[[int], None] | None" = None,
+        vec_cache: "dict[str, list] | None" = None,
+        db_lookup: bool = False,
     ) -> None:
         """Stream-embed and insert. plan: [(row_dict, embed_text), ...].
+
+        Embedding cache: rows carry `ehash` (model + embed-text hash). A
+        row whose hash is in `vec_cache` (vectors harvested from the nodes
+        this pass deleted -- i.e. moved / renamed / re-parsed entities) or,
+        with `db_lookup`, already stored on another node, reuses that
+        vector instead of being re-embedded.
 
         Memory contract: at any moment we hold the source `plan` plus at most
         two batches of vectors (one being embedded, one in the writer queue).
@@ -364,19 +391,40 @@ class Indexer:
                                 progress_emit(n)
                             except Exception:
                                 pass
-                    vecs = self.embedder.embed(
-                        texts,
-                        batch_size=self.cfg.embed_batch_size,
-                        on_progress=_on_emb,
-                    )
-                    # Attach numpy slices (1.5 KB each) instead of list[float]
-                    # (12 KB each) — db.insert_nodes converts to list per
-                    # write batch just before the UNWIND call.
-                    for r, v in zip(rows, vecs):
-                        r["embedding"] = v
+                    todo = list(range(len(rows)))
+                    if vec_cache is not None:
+                        if db_lookup:
+                            missing = [rows[i].get("ehash") for i in todo
+                                       if rows[i].get("ehash") and rows[i]["ehash"] not in vec_cache]
+                            if missing:
+                                try:
+                                    vec_cache.update(self.db.embeddings_by_ehash(label, missing))
+                                except Exception:
+                                    log.debug("embedding cache lookup failed", exc_info=True)
+                        hit = [i for i in todo if rows[i].get("ehash") in vec_cache]
+                        for i in hit:
+                            rows[i]["embedding"] = vec_cache[rows[i]["ehash"]]
+                        if hit:
+                            self.embed_cache_hits += len(hit)
+                            _on_emb(len(hit))
+                        hit_set = set(hit)
+                        todo = [i for i in todo if i not in hit_set]
+                    self.embed_cache_misses += len(todo)
+                    if todo:
+                        vecs = self.embedder.embed(
+                            [texts[i] for i in todo],
+                            batch_size=self.cfg.embed_batch_size,
+                            on_progress=_on_emb,
+                        )
+                        # Attach numpy slices (1.5 KB each) instead of list[float]
+                        # (12 KB each) — db.insert_nodes converts to list per
+                        # write batch just before the UNWIND call.
+                        for i, v in zip(todo, vecs):
+                            rows[i]["embedding"] = v
+                        del vecs
                     write_q.put(rows)
                     # Free the embedding text strings for this slab.
-                    del texts, vecs
+                    del texts
         finally:
             write_q.put(None)
             t.join()
@@ -474,7 +522,9 @@ class Indexer:
         if not files:
             return
         # Delete entities first (matches all by .file property)
-        for label in ("Function", "Class", "Variable"):
+        for label in ("Function", "Class", "Variable", "Route", "Tool"):
+            if label in ("Route", "Tool") and not self.db.has_table(label):
+                continue
             self.db.execute(
                 f"MATCH (n:{label}) WHERE n.file IN $files DETACH DELETE n",
                 {"files": files},
@@ -550,6 +600,20 @@ class Indexer:
         _emit("start")
         t0 = time.perf_counter()
         cache = load_cache(self.cfg) if incremental else {}
+        state0 = self._load_state()
+        if incremental and cache and state0.get("schema_version") != SCHEMA_VERSION:
+            # The DB schema or the cache entry shape changed since this root
+            # was indexed (edges without confidence, nodes without ehash,
+            # raw edges without receivers ...). An incremental pass would mix
+            # both shapes, so rebuild once.
+            _console.print(
+                f"[yellow]Index format v{state0.get('schema_version', 1)} -> "
+                f"v{SCHEMA_VERSION}: running a full reindex[/]"
+            )
+            log.warning("schema v%s -> v%s: forcing full reindex of %s",
+                        state0.get("schema_version", 1), SCHEMA_VERSION, self.cfg.repo_root)
+            incremental = False
+            cache = {}
         # If the cache was empty AND we're "incremental", treat the run as a
         # full pass for Tier 4 purposes — there's no prior state to preserve.
         cache_was_present = bool(cache)
@@ -557,13 +621,19 @@ class Indexer:
         # logical_rel → absolute path
         on_disk_rel: dict[str, Path] = {rel: path for path, rel in files_on_disk}
 
-        # Compute hashes; identify changed/added/deleted
+        # Compute hashes via the file-hash tree: files whose (size, mtime)
+        # match the previous scan reuse their stored hash without a read.
+        merkle_path = self.cfg.data_dir / "merkle.json"
+        prev_tree = _merkle.load(merkle_path) if (incremental and cache) else {}
+        scan_res, scan_stats = _merkle.scan(files_on_disk, prev_tree)
         changed: list[tuple[Path, str]] = []  # (absolute_path, logical_rel)
         unchanged_rels: set[str] = set()
-        new_hashes: dict[str, str] = {}
+        new_hashes: dict[str, str] = scan_res.hashes
         for rel, path in on_disk_rel.items():
-            h = _file_hash(path)
-            new_hashes[rel] = h
+            h = new_hashes.get(rel)
+            if h is None:
+                h = _file_hash(path)
+                new_hashes[rel] = h
             cached = cache.get(rel)
             if cached and cached.get("hash") == h:
                 unchanged_rels.add(rel)
@@ -575,15 +645,24 @@ class Indexer:
             f"[cyan]Scanning[/]: {len(on_disk_rel)} files — "
             f"[green]{len(changed)}[/] changed/added, "
             f"[red]{len(deleted_rels)}[/] deleted, "
-            f"[dim]{len(unchanged_rels)}[/] unchanged"
+            f"[dim]{len(unchanged_rels)}[/] unchanged "
+            f"[dim](hashed {scan_res.hashed}, stat-reused {scan_res.reused})[/]"
         )
 
         # No changes: bail
         if incremental and not changed and not deleted_rels:
+            try:
+                _merkle.save(merkle_path, scan_res, scan_stats)
+            except Exception:
+                pass
+            hist_updated = self._refresh_pending_history(state0, set())
+            if hist_updated:
+                self._save_state(state0)
             return {
                 "files": len(on_disk_rel), "changed": 0, "deleted": 0,
                 "entities": sum(len(c.get("entities", [])) for c in cache.values()),
                 "elapsed": time.perf_counter() - t0, "errors": 0,
+                "hashed": scan_res.hashed, "hash_reused": scan_res.reused,
             }
 
         # Full reindex path
@@ -606,6 +685,23 @@ class Indexer:
         _ck()
         _emit("delete", 0, len(changed) + len(deleted_rels))
         affected = [rel for _path, rel in changed]
+        # Embedding cache: harvest the vectors of every node we are about to
+        # delete, keyed by content hash, so moved / renamed / unchanged-body
+        # entities are not re-embedded below.
+        vec_cache: dict[str, dict[str, list]] = {}
+        if incremental and getattr(self.cfg, "embed_cache", True) and (affected or deleted_rels):
+            for label in ("Function", "Class", "Chunk"):
+                try:
+                    vec_cache[label] = self.db.embeddings_in_files(label, affected + deleted_rels)
+                except Exception:
+                    vec_cache[label] = {}
+        # Old entities of affected files, to record removed symbols later.
+        old_entities: dict[str, list[tuple[str, str, str]]] = {}
+        for rel in affected + deleted_rels:
+            ents = (cache.get(rel) or {}).get("entities") or []
+            if ents:
+                old_entities[rel] = [(e.get("qname", ""), e.get("name", ""), e.get("kind", ""))
+                                     for e in ents]
         self._delete_files_from_db(affected + deleted_rels)
         for rel in deleted_rels:
             cache.pop(rel, None)
@@ -659,6 +755,21 @@ class Indexer:
                             "entities": result["entities"],
                             "edges": result["edges"],
                         }
+
+        # ---- Step 2b: symbol history (one `git blame` per parsed file) ----
+        blame_map: dict[str, list[tuple[str, int]]] = {}
+        if getattr(self.cfg, "history", True) and parsed:
+            _ck()
+            _emit("history", 0, len(parsed))
+            try:
+                blame_map = _history.blame_many(
+                    self._blame_jobs(list(parsed.keys())),
+                    workers=min(8, max(1, self.cfg.workers)),
+                    max_files=int(getattr(self.cfg, "history_max_files", 5000) or 0),
+                )
+            except Exception:
+                log.debug("history blame failed", exc_info=True)
+                blame_map = {}
 
         # ---- Step 3a: optional LLM docstring augmentation ----
         _ck()
@@ -715,6 +826,8 @@ class Indexer:
                         fp.language, ent.kind,
                         llm_doc=row["llm_doc"],
                     )
+                    row["ehash"] = _ehash(self.embedder.model_name, text)
+                    row.update(self._history_cols(blame_map.get(rel), ent.line_start, ent.line_end))
                     class_plan.append((row, text))
                 elif ent.kind in ("function", "method"):
                     is_test = (
@@ -741,6 +854,8 @@ class Indexer:
                         fp.language, ent.kind,
                         llm_doc=row["llm_doc"],
                     )
+                    row["ehash"] = _ehash(self.embedder.model_name, text)
+                    row.update(self._history_cols(blame_map.get(rel), ent.line_start, ent.line_end))
                     function_plan.append((row, text))
                 else:
                     variable_rows.append({
@@ -780,15 +895,20 @@ class Indexer:
         ent_emit = _throttled("embed_entities", ent_total) if ent_total else None
 
         # ---- Step 5b: stream embed + insert classes/functions ----
+        use_cache = incremental and getattr(self.cfg, "embed_cache", True)
         if class_plan:
             self._stream_embed_insert("Class", class_plan, "Embedding entities (classes)",
                                        cancel_token=cancel_token,
-                                       progress_emit=ent_emit)
+                                       progress_emit=ent_emit,
+                                       vec_cache=vec_cache.get("Class", {}) if use_cache else None,
+                                       db_lookup=use_cache)
             class_plan.clear()
         if function_plan:
             self._stream_embed_insert("Function", function_plan, "Embedding entities (functions)",
                                        cancel_token=cancel_token,
-                                       progress_emit=ent_emit)
+                                       progress_emit=ent_emit,
+                                       vec_cache=vec_cache.get("Function", {}) if use_cache else None,
+                                       db_lookup=use_cache)
             function_plan.clear()
 
         # ---- Step 5c: build chunk plan, then stream embed + insert ----
@@ -816,6 +936,7 @@ class Indexer:
                         "file": rel,
                         "idx": idx,
                         "body": body_truncated,
+                        "ehash": _ehash(self.embedder.model_name, body_truncated),
                     }
                     chunk_plan.append((row, body_truncated))
                     if parent_label == "Function":
@@ -829,7 +950,9 @@ class Indexer:
             chunk_emit = _throttled("embed_chunks", len(chunk_plan))
             self._stream_embed_insert("Chunk", chunk_plan, "Embedding chunks",
                                        cancel_token=cancel_token,
-                                       progress_emit=chunk_emit)
+                                       progress_emit=chunk_emit,
+                                       vec_cache=vec_cache.get("Chunk", {}) if use_cache else None,
+                                       db_lookup=False)
             chunk_plan.clear()
 
         # ---- Step 5d: CONTAINS_CHUNK edges ----
@@ -883,52 +1006,75 @@ class Indexer:
                 file_index[r["path"]] = r["id"]
                 prog.advance(stask)
 
-        # Scope-aware resolution: per-file set of files that file imports.
-        # Built from the same fuzzy IMPORTS-target match we use for the edge
-        # itself, so resolve() can prefer call-targets in imported files over
-        # same-named symbols in unrelated files. This is the best we can do
-        # without a real LSP — in practice it kills most cross-file CALLS
-        # hallucinations on overloads / generics / re-exports.
-        # Dedupe by target_path: many IMPORTS edges share the same target
-        # (e.g. "react", "os.path"). Resolve each unique target against
-        # file_index once, then fan out — cuts work from O(E × F) to
-        # O(T × F + E) where T ≪ E on real repos.
+        # Scope-aware resolution (resolve.py). ModuleIndex maps import
+        # strings to files (dotted / relative / JS specifiers, suffix
+        # matched); from the cached raw edges we build, per file:
+        #   file_imports  files it imports (module-level)
+        #   import_map    {symbol: files} for `from m import X` / `import {X}`
+        #   recv_map      {alias: files} for module aliases used as receivers
+        #   aliases       {alias: original} for `import X as Y`
+        # The SymbolResolver cascade turns each call site into an edge with a
+        # confidence + method, or keeps the candidates when it stays ambiguous.
+        mod_index = ModuleIndex(list(file_index.keys()))
         file_imports: dict[str, set[str]] = defaultdict(set)
-        import_pairs: list[tuple[str, str]] = []  # (rel, target_path)
+        import_map: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        recv_map: dict[str, dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
+        aliases: dict[str, dict[str, str]] = defaultdict(dict)
+        external: dict[str, set[str]] = defaultdict(set)
         for rel, file_data in cache.items():
             for raw in file_data.get("edges", []):
-                if raw.get("kind") != "IMPORTS":
-                    continue
-                target_path = (raw.get("target_name") or "").replace(".", "/")
-                if not target_path:
-                    continue
-                import_pairs.append((rel, target_path))
+                kind = raw.get("kind")
+                if kind == "IMPORTS":
+                    mod = raw.get("target_name") or ""
+                    files = [f for f in mod_index.resolve(mod, rel) if f != rel]
+                    if not files:
+                        m = mod.strip("'\"`")
+                        if m and not m.startswith("."):
+                            external[rel].add(m.split(".", 1)[0].split("/", 1)[0])
+                            external[rel].add(m.rsplit(".", 1)[-1].rsplit("/", 1)[-1])
+                        continue
+                    file_imports[rel].update(files)
+                    m = mod.strip("'\"`")
+                    tail = m.rstrip("/").rsplit("/", 1)[-1].rsplit(".", 1)[0] if "/" in m else m.rsplit(".", 1)[-1]
+                    if tail:
+                        recv_map[rel][tail].update(files)
+                    recv_map[rel][m].update(files)
+                elif kind == "IMPORTS_SYMBOL":
+                    ex = raw.get("extra") or {}
+                    sym = raw.get("target_name") or ""
+                    mod = ex.get("module") or ""
+                    alias = ex.get("alias") or ""
+                    if not sym:
+                        continue
+                    if alias:
+                        aliases[rel][alias] = sym
+                    if not mod:
+                        continue
+                    files = [f for f in mod_index.resolve(mod, rel) if f != rel]
+                    if not files and not mod.startswith("."):
+                        external[rel].add(alias or sym)
+                    if files:
+                        import_map[rel][sym].update(files)
+                        if alias:
+                            import_map[rel][alias].update(files)
+                        # JS default imports name the module itself
+                        if mod.startswith(".") and "/" in mod:
+                            recv_map[rel][alias or sym].update(files)
+                    # `from pkg import submodule` -> submodule usable as receiver
+                    sub = mod_index.resolve(f"{mod}.{sym}" if not mod.startswith("./") else f"{mod}/{sym}", rel)
+                    if sub:
+                        recv_map[rel][alias or sym].update(sub)
+                        file_imports[rel].update(f for f in sub if f != rel)
 
-        unique_targets = {tp for _, tp in import_pairs}
-        file_paths_list = list(file_index.keys())
-        # Keep up to 2 matches per target so fan-out can skip self-matches
-        # without re-scanning (preserves the original loop's semantics).
-        target_matches: dict[str, list[str]] = {}
-        if unique_targets:
-            with _bar() as prog:
-                task = prog.add_task(
-                    "Resolving import scope", total=len(unique_targets)
-                )
-                for tp in unique_targets:
-                    matches: list[str] = []
-                    for path in file_paths_list:
-                        if path.startswith(tp) or tp in path:
-                            matches.append(path)
-                            if len(matches) >= 2:
-                                break
-                    target_matches[tp] = matches
-                    prog.advance(task)
-
-        for rel, tp in import_pairs:
-            for m in target_matches.get(tp, ()):
-                if m != rel:
-                    file_imports[rel].add(m)
-                    break
+        resolver = SymbolResolver(
+            name_index, file_imports,
+            import_map={k: dict(v) for k, v in import_map.items()},
+            recv_map={k: dict(v) for k, v in recv_map.items()},
+            aliases=dict(aliases),
+            method_ids={i for q, (lab, i) in qname_index.items()
+                        if lab == "Function" and q.count("::") >= 2},
+            external={k: v for k, v in external.items()},
+        )
 
         def needs_insert(src_file: str, target_file: str | None) -> bool:
             """True if either endpoint was just (re)created."""
@@ -938,24 +1084,11 @@ class Indexer:
                 return True
             return False
 
-        def resolve(name: str, src_file: str, prefer_kind: str | None = None) -> tuple[str, int, str] | None:
-            """Resolve a name. Prefer same-file → imported-file → global.
-            Returns (label, id, file)."""
-            cands = name_index.get(name, [])
-            if not cands:
-                return None
-            same_file = [c for c in cands if c[2] == src_file]
-            if same_file:
-                pool = same_file
-            else:
-                imported = file_imports.get(src_file, ())
-                from_imports = [c for c in cands if c[2] in imported]
-                pool = from_imports or cands
-            if prefer_kind:
-                pref = [c for c in pool if c[0] == prefer_kind]
-                if pref:
-                    pool = pref
-            return pool[0]
+        def resolve(name: str, src_file: str, prefer_kind: str | None = None,
+                    raw_extra: dict | None = None):
+            ex = raw_extra or {}
+            return resolver.resolve(name, src_file, prefer_kind=prefer_kind,
+                                    recv=ex.get("recv"), attr=bool(ex.get("attr")))
 
         _ck()
         _emit("edges")
@@ -1024,6 +1157,18 @@ class Indexer:
                         if plabel == "Class":
                             contains_groups[("Class", label)].append({"from_id": pid, "to_id": eid})
 
+        # Framework routes / MCP tools: node rows for changed files, HANDLES
+        # edges for any route whose route-file or handler-file changed.
+        route_rows: list[dict] = []
+        tool_rows: list[dict] = []
+        handles_route_rows: list[dict] = []
+        handles_tool_rows: list[dict] = []
+        try:
+            existing_fw = self.db.framework_nodes()
+        except Exception:
+            existing_fw = {}
+        calls_cand_rows: list[dict] = []
+
         # Other edges from cached RawEdges
         for rel, file_data in cache.items():
             for raw in file_data.get("edges", []):
@@ -1034,25 +1179,18 @@ class Indexer:
                 target_name = raw.get("target_name")
                 src_file = rel
                 line = raw.get("line", 0)
+                rex = raw.get("extra") or {}
 
                 if kind == "IMPORTS":
-                    if not needs_insert(src_file, None):
-                        # Try to find the resolved file target to also check
-                        pass
                     src_fid = file_index.get(src_file)
                     if src_fid is None:
                         continue
-                    target_path = (target_name or "").replace(".", "/")
-                    matched_fid = None
-                    matched_path = None
-                    for path, fid_ in file_index.items():
-                        if path.startswith(target_path) or target_path in path:
-                            matched_fid = fid_
-                            matched_path = path
-                            break
-                    if matched_fid:
-                        if needs_insert(src_file, matched_path):
-                            imports_file_rows.append({"from_id": src_fid, "to_id": matched_fid})
+                    matched = [f for f in mod_index.resolve(target_name or "", src_file)
+                               if f != src_file and f in file_index]
+                    if matched:
+                        for mpath in matched[:2]:
+                            if needs_insert(src_file, mpath):
+                                imports_file_rows.append({"from_id": src_fid, "to_id": file_index[mpath]})
                     else:
                         if not needs_insert(src_file, None):
                             continue
@@ -1067,25 +1205,62 @@ class Indexer:
                     continue
 
                 if kind == "IMPORTS_SYMBOL":
-                    # Resolve the named symbol against the importing file's
-                    # imported-file scope first, then fall back to global
-                    # name match. Skip if the symbol name is too generic to
-                    # disambiguate (heuristic: same name appears in 5+ files).
+                    # The symbol's own module (extra.module) makes this an
+                    # import_map hit in the cascade; otherwise the usual
+                    # same-file -> imported-file -> global order applies.
                     src_fid = file_index.get(src_file)
                     if src_fid is None:
                         continue
                     if not target_name:
                         continue
-                    target = resolve(target_name, src_file)
-                    if not target:
+                    res = resolve(target_name, src_file)
+                    if res.target is None:
                         continue
-                    tlabel, tid, tfile = target
+                    tlabel, tid, tfile = res.target
                     if tlabel == "Class":
                         if needs_insert(src_file, tfile):
                             imports_symbol_class_rows.append({"from_id": src_fid, "to_id": tid})
                     elif tlabel == "Function":
                         if needs_insert(src_file, tfile):
                             imports_symbol_func_rows.append({"from_id": src_fid, "to_id": tid})
+                    continue
+
+                if kind in ("ROUTE", "TOOL"):
+                    # Handler: exact qname from a decorator, else a name the
+                    # cascade resolves (registration style), else nothing.
+                    hid = hfile = None
+                    if src_qname and src_qname in qname_index and qname_index[src_qname][0] == "Function":
+                        hid, hfile = qname_index[src_qname][1], src_file
+                    elif target_name:
+                        res = resolve(target_name, src_file, prefer_kind="Function")
+                        if res.target is not None and res.target[0] == "Function":
+                            hid, hfile = res.target[1], res.target[2]
+                    label = "Route" if kind == "ROUTE" else "Tool"
+                    name = rex.get("name") or target_name or ""
+                    if src_file in changed_set:
+                        nid = self._new_id()
+                        if label == "Route":
+                            route_rows.append({
+                                "id": nid, "name": name, "method": rex.get("method") or "",
+                                "path": rex.get("path") or "", "framework": rex.get("framework") or "",
+                                "file": src_file, "line": int(line or 0),
+                                "handler": src_qname or target_name or "",
+                            })
+                        else:
+                            tool_rows.append({
+                                "id": nid, "name": name, "kind": rex.get("tool_kind") or "tool",
+                                "framework": rex.get("framework") or "mcp",
+                                "file": src_file, "line": int(line or 0),
+                                "handler": src_qname or target_name or "",
+                            })
+                    else:
+                        found = existing_fw.get((src_file, int(line or 0), name))
+                        nid = found[1] if found else None
+                        if nid is None or not (hfile and hfile in changed_set):
+                            continue
+                    if hid is not None and nid is not None:
+                        (handles_route_rows if label == "Route" else handles_tool_rows).append(
+                            {"from_id": nid, "to_id": hid})
                     continue
 
                 if not src_qname or src_qname not in qname_index:
@@ -1095,32 +1270,50 @@ class Indexer:
                 if kind == "CALLS":
                     if src_label != "Function":
                         continue
-                    target = resolve(target_name, src_file, prefer_kind="Function")
-                    if target and target[0] == "Function":
-                        if needs_insert(src_file, target[2]):
-                            calls_rows.append({"from_id": src_id, "to_id": target[1], "line": line})
+                    res = resolve(target_name, src_file, prefer_kind="Function", raw_extra=rex)
+                    if res.target is not None and res.target[0] == "Function":
+                        if needs_insert(src_file, res.target[2]):
+                            calls_rows.append({"from_id": src_id, "to_id": res.target[1], "line": line,
+                                               "confidence": float(res.confidence),
+                                               "method": res.method})
+                        alts = [c for c in res.candidates if c[0] == "Function" and c[1] != res.target[1]]
+                        for c in alts[:4]:
+                            if needs_insert(src_file, c[2]):
+                                calls_cand_rows.append({"from_id": src_id, "to_id": c[1], "line": line,
+                                                        "confidence": candidate_confidence(len(alts) + 1),
+                                                        "method": "alternative"})
+                    elif res.candidates:
+                        cands = [c for c in res.candidates if c[0] == "Function"]
+                        for c in cands[:5]:
+                            if needs_insert(src_file, c[2]):
+                                calls_cand_rows.append({"from_id": src_id, "to_id": c[1], "line": line,
+                                                        "confidence": candidate_confidence(len(cands)),
+                                                        "method": res.method})
                 elif kind == "INSTANTIATES":
                     if src_label != "Function":
                         continue
-                    target = resolve(target_name, src_file, prefer_kind="Class")
-                    if target and target[0] == "Class":
-                        if needs_insert(src_file, target[2]):
-                            inst_rows.append({"from_id": src_id, "to_id": target[1], "line": line})
+                    res = resolve(target_name, src_file, prefer_kind="Class", raw_extra=rex)
+                    if res.target is not None and res.target[0] == "Class":
+                        if needs_insert(src_file, res.target[2]):
+                            inst_rows.append({"from_id": src_id, "to_id": res.target[1], "line": line,
+                                              "confidence": float(res.confidence), "method": res.method})
                 elif kind == "INHERITS":
                     if src_label != "Class":
                         continue
-                    target = resolve(target_name, src_file, prefer_kind="Class")
-                    if target and target[0] == "Class":
-                        if needs_insert(src_file, target[2]):
-                            inherits_rows.append({"from_id": src_id, "to_id": target[1]})
+                    res = resolve(target_name, src_file, prefer_kind="Class", raw_extra=rex)
+                    if res.target is not None and res.target[0] == "Class":
+                        if needs_insert(src_file, res.target[2]):
+                            inherits_rows.append({"from_id": src_id, "to_id": res.target[1],
+                                                  "confidence": float(res.confidence),
+                                                  "method": res.method})
                 elif kind == "DECORATED_BY":
-                    target = resolve(target_name, src_file, prefer_kind="Function")
-                    if target and target[0] == "Function":
-                        if needs_insert(src_file, target[2]):
+                    res = resolve(target_name, src_file, prefer_kind="Function", raw_extra=rex)
+                    if res.target is not None and res.target[0] == "Function":
+                        if needs_insert(src_file, res.target[2]):
                             if src_label == "Function":
-                                decorated_func_rows.append({"from_id": src_id, "to_id": target[1]})
+                                decorated_func_rows.append({"from_id": src_id, "to_id": res.target[1]})
                             elif src_label == "Class":
-                                decorated_class_rows.append({"from_id": src_id, "to_id": target[1]})
+                                decorated_class_rows.append({"from_id": src_id, "to_id": res.target[1]})
 
         # Insert new modules
         new_modules = [
@@ -1193,8 +1386,13 @@ class Indexer:
             + len(decorated_func_rows) + len(decorated_class_rows)
             + len(imports_file_rows) + len(imports_module_rows)
             + len(imports_symbol_class_rows) + len(imports_symbol_func_rows)
-            + len(overrides_rows)
+            + len(overrides_rows) + len(calls_cand_rows)
+            + len(handles_route_rows) + len(handles_tool_rows)
         )
+        if route_rows:
+            self.db.insert_nodes("Route", route_rows)
+        if tool_rows:
+            self.db.insert_nodes("Tool", tool_rows)
         if n_edges:
             with _bar() as prog:
                 task = prog.add_task("Writing graph edges", total=n_edges)
@@ -1211,6 +1409,40 @@ class Indexer:
                 self.db.insert_edges("IMPORTS_SYMBOL", "File", "Class", imports_symbol_class_rows, on_progress=cb)
                 self.db.insert_edges("IMPORTS_SYMBOL", "File", "Function", imports_symbol_func_rows, on_progress=cb)
                 self.db.insert_edges("OVERRIDES", "Function", "Function", overrides_rows, on_progress=cb)
+                self.db.insert_edges("CALLS_CANDIDATE", "Function", "Function", calls_cand_rows, on_progress=cb)
+                self.db.insert_edges("HANDLES", "Route", "Function", handles_route_rows, on_progress=cb)
+                self.db.insert_edges("HANDLES", "Tool", "Function", handles_tool_rows, on_progress=cb)
+        resolution_stats = dict(resolver.stats)
+
+        # ---- Step 8a: optional precise references (SCIP) ----
+        scip_status: dict = {}
+        try:
+            from docgraph import scip as _scip
+            _ck()
+            scip_status = _scip.maybe_ingest(self.cfg, self.db, full=not incremental or not cache_was_present,
+                                             changed=bool(changed_set) or bool(deleted_rels),
+                                             console=_console)
+        except Exception as exc:  # noqa: BLE001 - never fail the index over SCIP
+            log.warning("SCIP ingest failed: %s", exc)
+            scip_status = {"status": "error", "detail": str(exc)}
+
+        # ---- Step 8c: history of unchanged files blamed while uncommitted ----
+        state_hist = self._load_state()
+        pending_before = set(state_hist.get("history_pending") or [])
+        new_pending = {rel for rel, b in blame_map.items()
+                       if any(sha == _history.UNCOMMITTED for sha, _ in b)}
+        removed = list(state_hist.get("removed_symbols") or [])
+        now_ts = time.time()
+        head_now = self._primary_head()
+        for rel, olds in old_entities.items():
+            new_q = set()
+            if rel in cache:
+                new_q = {e.get("qname") for e in cache[rel].get("entities", [])}
+            for qn, nm, kd in olds:
+                if qn and qn not in new_q and kd in ("function", "method", "class", "interface"):
+                    removed.append({"qname": qn, "name": nm, "kind": kd, "file": rel,
+                                    "removed_at": now_ts, "head": head_now or ""})
+        removed = removed[-MAX_REMOVED_SYMBOLS:]
 
         # ---- Step 8b: LINKS_TO edges from BFS web crawl ----
         # page_links.json is written by fetch_all whenever pages are crawled.
@@ -1249,6 +1481,7 @@ class Indexer:
         full_recompute = (not incremental) or (not cache_was_present)
         state = self._load_state()
 
+        n_communities = None
         if not graph_dirty and not full_recompute:
             _console.print("[dim]Tier 4 + PageRank: no changes — skipped[/]")
         else:
@@ -1258,9 +1491,32 @@ class Indexer:
                 full=full_recompute,
                 state=state,
             )
+            if getattr(self.cfg, "communities", True):
+                _ck()
+                _emit("communities")
+                try:
+                    n_communities = self._recompute_communities()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("community detection failed: %s", exc)
+
+        # History: files blamed while they had uncommitted lines get
+        # re-blamed once HEAD has moved (a commit does not change their hash).
+        state["history_pending"] = sorted(pending_before | new_pending)
+        self._refresh_pending_history(state, changed_set)
+        state["removed_symbols"] = removed
 
         # Persist state (last-known git HEAD, last_indexed_at, etc.)
         state["last_indexed_at"] = time.time()
+        state["schema_version"] = SCHEMA_VERSION
+        state["embedding_model"] = self.embedder.model_name
+        state["resolution"] = resolution_stats
+        state["embed_cache"] = {"hits": self.embed_cache_hits, "misses": self.embed_cache_misses}
+        state["scan"] = {"hashed": scan_res.hashed, "reused": scan_res.reused,
+                         "root_hash": scan_res.root_hash}
+        if n_communities is not None:
+            state["communities"] = n_communities
+        if scip_status:
+            state["scip"] = scip_status
         self._save_state(state)
 
         # ---- Step 10: persist cache (strip embeddings/IDs from entity dicts) ----
@@ -1275,6 +1531,10 @@ class Indexer:
                     prog.advance(task)
             save_cache(self.cfg, cache)
             prog.advance(task)
+        try:
+            _merkle.save(merkle_path, scan_res, scan_stats)
+        except Exception:
+            log.debug("merkle save failed", exc_info=True)
 
         elapsed = time.perf_counter() - t0
         total_entities = sum(len(c.get("entities", [])) for c in cache.values())
@@ -1291,7 +1551,114 @@ class Indexer:
             "entities": sum(len(c.get("entities", [])) for c in cache.values()),
             "elapsed": elapsed,
             "errors": len(errors),
+            "hashed": scan_res.hashed,
+            "hash_reused": scan_res.reused,
+            "embed_cache_hits": self.embed_cache_hits,
+            "embedded": self.embed_cache_misses,
+            "communities": n_communities if n_communities is not None else -1,
         }
+
+    # ---- History helpers ----
+    def _owner(self, rel: str) -> tuple[Path, str] | None:
+        for root, prefix in self.cfg.roots_with_prefix():
+            if prefix == "":
+                return root, rel
+            if rel.startswith(prefix):
+                return root, rel[len(prefix):]
+        return None
+
+    def _git_roots(self) -> set[Path]:
+        if not hasattr(self, "_git_roots_cache"):
+            roots = set()
+            for root, _p in self.cfg.roots_with_prefix():
+                if root == self.cfg.external_dir:
+                    continue
+                if _history.is_git_repo(root):
+                    roots.add(root)
+            self._git_roots_cache = roots
+        return self._git_roots_cache
+
+    def _blame_jobs(self, rels: list[str]) -> list[tuple[str, Path, str]]:
+        git_roots = self._git_roots()
+        jobs = []
+        for rel in rels:
+            own = self._owner(rel)
+            if own and own[0] in git_roots:
+                jobs.append((rel, own[0], own[1]))
+        return jobs
+
+    def _primary_head(self) -> str | None:
+        if self.cfg.repo_root in self._git_roots():
+            return _history.head(self.cfg.repo_root)
+        return None
+
+    @staticmethod
+    def _history_cols(blame: list | None, s: int, e: int) -> dict:
+        h = _history.symbol_span_history(blame or [], s, e) if blame else {}
+        return {
+            "first_seen_commit": h.get("fc", ""), "first_seen_ts": int(h.get("fts", 0) or 0),
+            "last_changed_commit": h.get("lc", ""), "last_changed_ts": int(h.get("lts", 0) or 0),
+        }
+
+    def _refresh_pending_history(self, state: dict, changed: set[str]) -> bool:
+        """Re-blame files that had uncommitted lines at their last blame, if
+        HEAD moved since. Updates the history columns in place."""
+        pending = [f for f in (state.get("history_pending") or []) if f not in changed]
+        if not pending or not getattr(self.cfg, "history", True):
+            return False
+        head_now = self._primary_head() or ""
+        if head_now and head_now == state.get("history_head"):
+            return False
+        try:
+            blames = _history.blame_many(self._blame_jobs(pending), workers=4)
+            spans = self.db.entity_spans(list(blames.keys()))
+        except Exception:
+            log.debug("history refresh failed", exc_info=True)
+            return False
+        by_label: dict[str, list[dict]] = defaultdict(list)
+        still: set[str] = set()
+        for sp in spans:
+            b = blames.get(sp["file"])
+            if not b:
+                continue
+            h = _history.symbol_span_history(b, int(sp["s"] or 1), int(sp["e"] or 1))
+            if not h:
+                continue
+            if h.get("lc") == _history.UNCOMMITTED:
+                still.add(sp["file"])
+            by_label[sp["label"]].append({"id": sp["id"], "fc": h["fc"], "fts": int(h["fts"]),
+                                          "lc": h["lc"], "lts": int(h["lts"])})
+        for label, rows in by_label.items():
+            try:
+                self.db.set_history(label, rows)
+            except Exception:
+                log.debug("set_history failed", exc_info=True)
+        state["history_pending"] = sorted(
+            (set(state.get("history_pending") or []) - set(pending)) | still
+            | {f for f in pending if f not in blames})
+        state["history_head"] = head_now
+        return True
+
+    # ---- Communities ----
+    def _recompute_communities(self) -> int:
+        from docgraph.communities import detect
+        nodes, edges = self.db.community_graph()
+        comms = detect(nodes, edges)
+        rows: list[dict] = []
+        members: dict[str, list[dict]] = defaultdict(list)
+        for c in comms:
+            cid = self._new_id()
+            rows.append({
+                "id": cid, "name": c.name, "size": c.size, "cohesion": float(c.cohesion),
+                "top_members": json.dumps(c.top_members), "files": json.dumps(c.files),
+                "pagerank": float(c.pagerank),
+            })
+            for m in c.members:
+                lab = nodes[m]["label"]
+                members[lab].append({"from_id": m, "to_id": cid})
+        self.db.replace_communities(rows, members)
+        _console.print(f"[cyan]Communities[/]: {len(rows)} detected")
+        return len(rows)
 
     # ---- Persistent state (separate from cache: smaller, global) ----
     def _state_path(self) -> Path:

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import importlib
 import logging
+import re
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
@@ -410,6 +411,84 @@ _KIND_PRIORITY = {
 }
 
 
+_MEMBER_PARENTS = {
+    "attribute": "object",                   # python
+    "member_expression": "object",           # js / ts
+    "selector_expression": "operand",        # go
+    "field_expression": "value",             # rust
+    "member_access_expression": "expression",  # c#
+    "method_invocation": "object",           # java (name is a field of the call)
+    "call": "receiver",                      # ruby
+    "navigation_expression": None,           # kotlin
+}
+_SIMPLE_RECV = re.compile(r"^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*){0,3}$")
+
+
+def _receiver_text(node: ts.Node, source: bytes) -> str | None:
+    """For a call-name node, return the receiver text of a member call
+    (`auth` in `auth.login()`), "" when the receiver is a complex
+    expression, or None when the call is a bare name."""
+    parent = node.parent
+    if parent is None:
+        return None
+    field_name = _MEMBER_PARENTS.get(parent.type, "missing")
+    if field_name == "missing":
+        return None
+    recv_node = parent.child_by_field_name(field_name) if field_name else None
+    if recv_node is None:
+        # method_invocation without an object / ruby call without receiver
+        if parent.type in ("method_invocation", "call"):
+            return None
+        recv_node = parent.named_children[0] if parent.named_children else None
+    if recv_node is None or recv_node.id == node.id:
+        return None
+    text = source[recv_node.start_byte:recv_node.end_byte].decode("utf-8", errors="replace")
+    if len(text) > 80 or not _SIMPLE_RECV.match(text):
+        return ""
+    return text
+
+
+def _import_module_for(sym_node: ts.Node, module_nodes: list[ts.Node],
+                       source: bytes) -> str | None:
+    """The module a symbol import belongs to: the @import.module capture
+    inside the nearest ancestor import statement."""
+    anc = sym_node.parent
+    for _ in range(5):
+        if anc is None:
+            return None
+        for m in module_nodes:
+            if anc.start_byte <= m.start_byte and m.end_byte <= anc.end_byte:
+                return source[m.start_byte:m.end_byte].decode(
+                    "utf-8", errors="replace").strip("'\"<>`")
+        anc = anc.parent
+    return None
+
+
+def _import_alias(sym_node: ts.Node, source: bytes) -> str | None:
+    parent = sym_node.parent
+    if parent is None:
+        return None
+    alias = parent.child_by_field_name("alias")
+    if alias is None or alias.id == sym_node.id:
+        return None
+    return source[alias.start_byte:alias.end_byte].decode("utf-8", errors="replace").strip()
+
+
+def _string_comment_lines(root: ts.Node) -> set[int]:
+    """1-based line numbers covered by comments or multi-line strings."""
+    out: set[int] = set()
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        t = node.type
+        if "comment" in t or ("string" in t and node.start_point.row != node.end_point.row):
+            for r in range(node.start_point.row, node.end_point.row + 1):
+                out.add(r + 1)
+            continue
+        stack.extend(node.children)
+    return out
+
+
 def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> FileParse | None:
     lang_key = detect_language(path)
     if lang_key is None:
@@ -521,11 +600,19 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
                 entities[i].qname = new_q
         defs = [(n, node_to_qname.get(id(n), q), k) for (n, q, k) in defs]
 
-    # Edges: refs
+    # Edges: refs. For member calls (`auth.login()`, `this.x()`) we keep the
+    # receiver text -- the resolution cascade (resolve.py) uses it to pick
+    # between same-named candidates.
     for ref_cap, edge_kind in [("ref.call", "CALLS"), ("ref.new", "INSTANTIATES")]:
         for r_node in caps.get(ref_cap, []):
             target = source[r_node.start_byte:r_node.end_byte].decode("utf-8", errors="replace")
             enc = _enclosing(r_node, defs)
+            extra: dict = {}
+            recv = _receiver_text(r_node, source)
+            if recv is not None:
+                extra["attr"] = True
+                if recv:
+                    extra["recv"] = recv
             raw_edges.append(RawEdge(
                 kind=edge_kind,
                 src_file=rel,
@@ -533,6 +620,7 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
                 target_name=target,
                 line=r_node.start_point.row + 1,
                 column=r_node.start_point.column + 1,
+                extra=extra,
             ))
 
     # Inheritance
@@ -575,10 +663,18 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
     # exported entities, falling back to a global lookup. Java's qualified
     # imports (`import a.b.C;`) already terminate in the symbol name, so the
     # last component of @import.module is the symbol — handled in index.py.
+    module_nodes = caps.get("import.module", [])
     for s_node in caps.get("import.symbol", []):
         sym = source[s_node.start_byte:s_node.end_byte].decode("utf-8", errors="replace").strip()
         if not sym:
             continue
+        extra = {}
+        mod = _import_module_for(s_node, module_nodes, source)
+        if mod:
+            extra["module"] = mod
+        alias = _import_alias(s_node, source)
+        if alias and alias != sym:
+            extra["alias"] = alias
         raw_edges.append(RawEdge(
             kind="IMPORTS_SYMBOL",
             src_file=rel,
@@ -586,7 +682,35 @@ def parse_file(path: Path, repo_root: Path, rel_override: str | None = None) -> 
             target_name=sym,
             line=s_node.start_point.row + 1,
             column=s_node.start_point.column + 1,
+            extra=extra,
         ))
+
+    # Framework routes + MCP tools (table-driven regexes, see frameworks.py).
+    # Hits inside docstrings / comments are dropped via the syntax tree.
+    try:
+        from docgraph.frameworks import detect as _detect_frameworks
+        text = source.decode("utf-8", errors="replace")
+        ent_defs = [(e.kind, e.qname, e.line_start, e.line_end) for e in entities]
+        hits = _detect_frameworks(text, lang_key, ent_defs)
+        if hits:
+            skip = _string_comment_lines(tree.root_node)
+            for h in hits:
+                if h.line in skip:
+                    continue
+                raw_edges.append(RawEdge(
+                    kind=h.kind,
+                    src_file=rel,
+                    src_qname=h.handler_qname,
+                    target_name=h.handler_name,
+                    line=h.line,
+                    extra={
+                        "name": h.name, "framework": h.framework,
+                        "method": h.method, "path": h.path,
+                        "tool_kind": h.tool_kind, **h.extra,
+                    },
+                ))
+    except Exception as exc:  # noqa: BLE001 - detection must never fail a parse
+        log.debug("framework detection failed for %s: %s", rel, exc)
 
     return FileParse(
         file=rel,
