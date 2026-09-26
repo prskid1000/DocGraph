@@ -29,13 +29,33 @@ Local code knowledge graph. Tree-sitter parses, sentence-transformers (torch) em
 | `embed.py` | `sentence-transformers` wrapper. Process-wide `_MODEL_CACHE` keyed `(model, device, dtype)`. **Routes to the daemon** when client mode is on (chunked so `on_progress` ticks during indexing); transparent in-process fallback. CPU-fallback recovery on CUDA OOM/illegal-memory/cuBLAS/cuDNN. |
 | `rerank.py` | Lazy `CrossEncoder`. Same `device=`/daemon-routing/CPU-fallback story as `Embedder`. |
 | `daemon.py` | Optional shared embed+rerank daemon (loopback TCP). Owns one warm model each; serializes inference under one lock (the queue); two-stage idle (unload weights → exit to free context); lazy start. Client helpers route + lazily respawn (`ensure_daemon`). `configure_client` registers the spec at host startup. |
-| `retrieve.py` | Hybrid retrieval + `explore`/`impact_of`/`test_impact`/`cypher`/`git_*`/`rules_for`. **All Cypher lives here or in `db.py`.** |
-| `parse.py` | tree-sitter wrappers + tags queries. Method qname rescoping keyed on `id(node)`, not the qname string. |
+| `retrieve.py` | Hybrid retrieval + `explore`/`impact_of`/`test_impact`/`cypher`/`git_*`/`rules_for` + the analysis tools (`context`, `detect_changes`, `repo_map`, `list_clusters`/`cluster`, `route_map`/`api_impact`, `trace`, `health`, `symbol_history`, `rename_plan`, `processes`/`flow`, `index_info`). **All Cypher lives here or in `db.py`.** |
+| `resolve.py` | Call-resolution confidence cascade (`ModuleIndex` import strings -> files, `SymbolResolver` tiers). Pure Python, fed by the indexer. |
+| `frameworks.py` | Table-driven route / MCP-tool regexes (FastAPI, Flask, aiohttp, Starlette, Express, `@mcp.tool/resource/prompt`). Run by `parse.py`; hits on comment / docstring lines are dropped via the syntax tree. |
+| `communities.py` | Louvain (networkx built-in) over calls + containment + imports; names, cohesion. |
+| `insights.py` | Pure helpers: unified-diff parser, explainable risk score, token budgeting (`trim_sections`, `fit_to_budget`), Aider-style repo-map rendering, signatures. |
+| `merkle.py` / `history.py` / `scip.py` | File-hash tree (stat reuse) / `git blame` symbol history + `git log -L` / dependency-free SCIP protobuf decoder + ingest. |
+| `rename.py` / `agent_setup.py` / `bench.py` (+ `bench_questions.json`) | Apply a rename plan (API only, line-verified) / `agent-setup` skill + hook writer and the `hook` runtime / benchmark harness + runners. |
+| `parse.py` | tree-sitter wrappers + tags queries. Method qname rescoping keyed on `id(node)`, not the qname string. Records call receivers (`extra.recv`/`attr`) and the module of each symbol import (`extra.module`/`alias`). |
 | `watch.py` | `watchfiles` loop, N per-root tasks. Workspace `Semaphore(1)` serializes reindexes. Index uses the **pooled** embedder. |
-| `mcp_tools.py` / `server.py` | 15 retriever tools + `list_roots`; FastAPI + SSE + FastMCP at `/mcp`. **No `from __future__ import annotations`** (Pydantic can't resolve closure-local `RootSlug`). uvicorn needs `lifespan="on"` or `/mcp` 500s. |
+| `mcp_tools.py` / `server.py` | 26 tools (15 retriever + `list_roots` + 11 analysis) + MCP resources (`docgraph://schema|clusters|cluster/{id}|flows|flow/{id}|routes`, root-scoped `docgraph://roots/{slug}/...`) + prompts (`detect_impact`, `architecture_map`); FastAPI + SSE + FastMCP at `/mcp`. **No `from __future__ import annotations`** (Pydantic can't resolve closure-local `RootSlug`). uvicorn needs `lifespan="on"` or `/mcp` 500s. |
 | `rank.py` `git_tools.py` `rules.py` `llm.py` `wiki.py` `links.py` `fetch.py` `ignores.py` `summary.py` | PageRank / git-joined-to-graph / `.cursor/rules` + `AGENTS.md` matching / LLM client / module wiki / external-link crawl / 3-layer ignores / sub-function chunking. |
 
-Runtime data: `<repo>/.docgraph/{graph.kuzu/, cache.json, state.json, repos.json, llm_docstrings.json, wiki/}`.
+Runtime data: `<repo>/.docgraph/{graph.kuzu/, cache.json, state.json, merkle.json, repos.json, llm_docstrings.json, wiki/, scip-*.scip}`. `state.json` carries `schema_version`, `resolution` (edges per cascade tier), `embed_cache`, `scan`, `communities`, `scip`, `history_pending`, `removed_symbols`.
+
+## Schema v3 (confidence, clusters, routes, history)
+
+- **`db.SCHEMA_VERSION` gates the index format.** `index_all` compares it with `state.json["schema_version"]` and forces a full reindex on mismatch. Bump it whenever the DDL **or the cache.json entry shape** changes (e.g. new `RawEdge.extra` keys the resolver depends on). `GraphDB.migrate()` ALTERs added columns onto an old DB opened RW so queries never hard-error; readers probe `table_props()` / `Retriever._cap()` and degrade (`reindex_required`).
+- **Resolution cascade** (`resolve.py`): import_map 0.95 > same_module 0.90 > import_suffix 0.85 > unique_global 0.75 > import_distance 0.55 > fuzzy 0.4/0.3 (common method names like `get` on a unique repo symbol: `common_name` 0.4). Receiver rules matter more than tiers: a call on an *external* module alias (`re.search`, `json.dumps`) resolves to nothing; a call on any other object can only hit methods; a bare call cannot hit a method in another file; fuzzy only for bare/self calls with non-CapWords names differing by underscores. Still-ambiguous sites write **CALLS_CANDIDATE** rows, never CALLS. SCIP edges are `scip` / 1.0 and upgrade heuristic edges in place.
+- **Traversals are Python BFS** (`_bfs_calls` = one `frontier IN $ids` query per hop, confidence-filtered; `_mem_graph` = whole CALLS graph in memory for tools that fan out per symbol, e.g. `detect_changes` went 48 s -> 0.2 s). Don't reintroduce var-length Cypher for backward walks.
+- **Communities, PageRank, Tier-4 are recomputed on every dirty run**, so Community ids change between index runs. Never persist them client-side.
+- Kuzu reserves `max_db_size` of virtual address space per open Database (default 8 TB; Windows allows 128 TB per process). `GraphDB` passes `MAX_DB_SIZE = 1 TB`; without it ~16 simultaneously open DBs (many roots, or the test session) fail with `VirtualAlloc ... failed`.
+- Kuzu: `RETURN n.*` is not supported -- `RETURN n AS n` gives a dict (with `_id`, `_label`). Unused query params: only pass params the query references.
+- Routes/tools: `Route`/`Tool` nodes are per file (deleted with it); `HANDLES` to a handler in another file is re-linked through `db.framework_nodes()` when only the handler file changed.
+- Embedding cache: vectors keyed by `ehash` = sha1(model + embed text). Incremental runs harvest vectors of the nodes they are about to delete, so moved/renamed/unchanged-body entities are not re-embedded. Full reindex does not use it.
+- History: one `git blame --line-porcelain` per changed file. Files blamed with uncommitted lines go to `history_pending` and are re-blamed (SET in place) once HEAD moves -- a commit does not change a file hash, so the delta would never revisit them. `symbol_history` adds `git log -L` on demand.
+- Embedding models: `embed.MODEL_PROFILES` holds dims, query/doc prefixes, `trust_remote_code` (only for models whose architecture is Hub code) and `max_seq`. `Embedder.embed(kind="query")` / `embed_query()` applies the query prefix; the daemon receives already-prefixed text. `jinaai/jina-embeddings-v2-base-code` cannot load on transformers >= 5 (its remote code); `nomic-ai/CodeRankEmbed` needs `pip install einops`.
+- `agent-setup` writes only when invoked; `apply()` is idempotent (merges JSON hooks by the `docgraph hook pre-edit` marker, Markdown between `<!-- docgraph:begin/end -->`, git hooks between marker comments).
 
 ## Embedding daemon + GPU
 
@@ -72,16 +92,22 @@ GPU off by default; `--gpu` flips embedder to CUDA. `resolve_device(gpu)` return
 
 ## Web UI (`docgraph/ui/index.html`)
 
-One self-contained file, read fresh on every `GET /` (edit + reload, no restart). No CDN, no build. Hash routes `#/graph #/search #/wiki #/flows #/changes #/ask #/index`; Ctrl K palette; tokens on `:root` with light/dark; breakpoints 1180 (detail pane → drawer) and 820 (bottom tab bar, explorer drawer, detail bottom sheet).
+One self-contained file, read fresh on every `GET /` (edit + reload, no restart). No CDN, no build. Hash routes `#/graph #/search #/wiki #/flows #/changes #/insights #/ask #/index` (phones: Wiki / Flows / Insights under the "More" tab); Ctrl K palette; tokens on `:root` with light/dark; breakpoints 1180 (detail pane → drawer) and 820 (bottom tab bar, explorer drawer, detail bottom sheet).
 - **Every call goes through `request()` / `withRoot()`**, which appends `?root=<slug>` for the active root. Exception: `/api/jobs` — its `root` filter is a repo *path*, so the UI passes `{root:false}` and maps `job.root` back to a slug via `/api/roots`.
 - **The graph page DOM is persistent** (built once; other pages render into `#pg-other`), so the canvas, worker layout and selection survive page switches. Engine: the Web Worker (`WORKER_SRC`, FA2-style + label propagation) is the same as the pre-redesign UI; render batches by colour, culls to the viewport and labels only the top-N by PageRank for the zoom level. Keep it that way — real roots have thousands of nodes.
 - Graph load: `/api/graph?limit_nodes=50000` (all) or `/api/files` (level-of-detail "files first"); a click lazily merges `/api/node_neighbors` (1..3 hops). Colours come from CSS tokens via `readTheme()` — re-read on theme change.
+- Colour-by-cluster uses the server `cluster` id when nodes carry it (worker label propagation is only the fallback for pre-v3 indexes); named hulls are recomputed at most every 400 ms for the top 40 clusters. The min-confidence slider filters CALLS edges on the canvas. The Changes page is driven by `detect_changes` and can push a diff overlay (changed = red ring, affected callers = amber) onto the graph. Flows draw inline-SVG sequence diagrams; Insights = health + clusters + trace + repo map. Rename shows the dry-run plan; "Apply graph edits" sits behind a typed-confirmation dialog.
 - Controls the API cannot back are hidden or disabled with a reason (e.g. "Add root": roots are fixed for the host's lifetime). Never render placeholder data.
 - Per-viewer state only in `localStorage` (theme, active root, pane widths, Ask threads, last Cypher query), always in try/catch.
 
 ## Testing
 
-`.venv/Scripts/python -m pytest` (~90s, ~250 tests). `test_index_html` only smoke-checks the UI; exercise UI changes in a real browser against a host on a spare port. Notable: `test_cli_flags` locks every flag telecode passes + the env-free contract; `test_daemon` exercises the daemon (ping/embed/rerank/status/idle-exit); `test_embed_fallback` the CUDA→CPU recovery; `test_workspace` the pool + shadow-page recovery. Kuzu writer-visibility: close the writer + reopen RO or test reads come back empty.
+`.venv/Scripts/python -m pytest -p no:cacheprovider` (~310 tests). `test_index_html` only smoke-checks the UI; exercise UI changes in a real browser against a host on a spare port. Notable: `test_cli_flags` locks every flag telecode passes + the env-free contract; `test_daemon` exercises the daemon (ping/embed/rerank/status/idle-exit); `test_embed_fallback` the CUDA->CPU recovery; `test_workspace` the pool + shadow-page recovery; `test_graph_features` covers schema v3 on the `fw_indexed` fixture (`tests/fw_fixture.py`: routes for four frameworks, MCP tools, an ambiguous call, an external receiver, an import cycle, dead code, two commits, a synthetic SCIP index) plus incremental cache / merkle / history on a mutable copy. Kuzu writer-visibility: close the writer + reopen RO or test reads come back empty.
+
+- Don't run pytest with `PYTHONIOENCODING=utf-8`: `test_cli_flags` decodes child `--help` output as cp1252 and rich's UTF-8 box characters then fail to decode.
+- pytest's `addopts` already has `-q`; adding another `-q` hides the pass/fail summary line.
+- A shell with `OMP_NUM_THREADS=1` makes CPU embedding ~10x slower (a 900-entity index took 7 min); use `--gpu` for scratch runs.
+- Starting a host from `C:\Users\prith\.telecode` picks up telecode's own `docgraph/` package (`No module named docgraph.__main__`): set the working directory to this repo.
 
 ## Telecode integration
 
