@@ -49,7 +49,9 @@ def make_mcp(workspace: Workspace) -> FastMCP:
         # Members of `(str, Enum)` subclasses have a `.value` attribute
         # holding the actual slug. `str(member)` would give 'RootSlug.X'
         # instead, which is what we don't want.
-        return _slot(root).retriever
+        slot = _slot(root)
+        workspace.touch(slot)
+        return slot.retriever
 
     @mcp.tool()
     def list_roots() -> list[dict]:

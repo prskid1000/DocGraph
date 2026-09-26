@@ -345,3 +345,12 @@ def test_file_content_redacts_ai_blocked(tmp_path: Path):
         r2 = c.get("/api/file_content", params={"file": "public.py"})
         assert r2.status_code == 200
         assert r2.json().get("redacted") is not True
+
+
+def test_memory_route(client: TestClient):
+    client.get("/api/search", params={"q": "login", "limit": 3})
+    body = client.get("/api/memory").json()
+    assert body["rss_mb"] > 0 and body["private_mb"] > 0
+    (slug, info), = body["roots"].items()
+    assert info["graph_loaded"] is True and info["db_buffer_mb"] >= 1
+    assert "graph_idle_unload_sec" in body

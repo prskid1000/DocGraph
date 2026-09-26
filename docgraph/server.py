@@ -162,7 +162,7 @@ def make_app(workspace: Workspace) -> FastAPI:
         "/api/events", "/api/jobs", "/api/locks", "/api/roots", "/api/admin", "/api/tiles",
         "/api/file_content", "/api/detect_changes", "/api/health", "/api/symbol_history",
         "/api/llm_config", "/api/chat", "/api/git_", "/api/index_info", "/api/repos",
-        "/api/links", "/api/wiki", "/api/rules_for", "/api/maintenance",
+        "/api/links", "/api/wiki", "/api/rules_for", "/api/maintenance", "/api/memory",
     )
 
     @app.middleware("http")
@@ -255,7 +255,9 @@ def make_app(workspace: Workspace) -> FastAPI:
         return workspace.resolve(slug)
 
     def _r(root):
-        return _slot(root).retriever
+        slot = _slot(root)
+        workspace.touch(slot)
+        return slot.retriever
 
     # --- UI ---
     @app.get("/", response_class=HTMLResponse)
@@ -444,6 +446,28 @@ def make_app(workspace: Workspace) -> FastAPI:
         result = await asyncio.to_thread(apply_plan, slot.cfg, plan, sources)
         plan.update(dry_run=False, applied=result)
         return plan
+
+    @app.get("/api/memory")
+    async def api_memory():
+        """This host process's working set / private bytes, and which roots
+        hold their in-memory graph structures right now."""
+        from docgraph import procmem
+        roots = {}
+        for sl in workspace.slugs():
+            slot = workspace.resolve(sl)
+            r = slot.retriever
+            roots[sl] = {
+                "graph_loaded": bool(slot.maint.get("graph_loaded", True)),
+                "live_state": bool(getattr(slot.live, "symtab", None) is not None
+                                   and slot.live.symtab.qname_index),
+                "call_graph": getattr(r, "_mem_graph_cache", None) is not None,
+                "node_table": getattr(r, "_node_table_cache", None) is not None,
+                "tiles": slot.tile_store.manifest is not None,
+                "db_buffer_mb": round(getattr(slot.db_ro, "buffer_pool_bytes", 0) / 2 ** 20),
+            }
+        import sys as _sys
+        return dict(procmem.memory(), roots=roots, torch_loaded="torch" in _sys.modules,
+                    graph_idle_unload_sec=float(getattr(workspace, "graph_unload_after", 0.0)))
 
     @app.get("/api/index_info")
     async def api_index_info(root: RootSlug = DEFAULT):

@@ -24,6 +24,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from docgraph import procmem as _procmem
 from docgraph.cancel import CancelToken
 from docgraph.config import Config
 from docgraph.db import GraphDB
@@ -41,6 +42,21 @@ def _host_live(cfg):
     live = LiveIndex(cfg)
     live.keep_pool = True
     return live
+
+
+_RETRIEVER_CACHES = ("_mem_graph_cache", "_node_table_cache", "_trace_graph_cache",
+                     "_explore_adj_cache", "_symbol_pr_cache", "_processes_memo",
+                     "_graph_dump_memo", "_clusters_memo", "_pr_sorted", "_local_vec_cache")
+
+
+def _drop_retriever_caches(r) -> None:
+    d = getattr(r, "__dict__", {})
+    for name in _RETRIEVER_CACHES:
+        d.pop(name, None)
+    if hasattr(r, "_ranker"):
+        r._ranker = None
+    if hasattr(r, "_bm25"):
+        r._bm25 = {}
 
 
 def _lower_thread_priority() -> None:
@@ -119,6 +135,8 @@ class Workspace:
         # when the lifespan boots.
         self.embed_unload_after: float = 0.0
         self.rerank_unload_after: float = 0.0
+        # host --graph-idle-unload-sec (see unload_graph)
+        self.graph_unload_after: float = float(getattr(configs[0], "graph_unload_after", 0.0) or 0.0)
         self._idle_task: asyncio.Task | None = None
         # Lock timeouts (read gate / writer queue / wiki) — surfaced via
         # CLI flags + telecode settings. The host caches the running
@@ -384,6 +402,8 @@ class Workspace:
         """Under self._lock: end a write session -- keep the handle serving
         reads (keep_warm) or close it and reopen read-only."""
         slot.maint["writer_taken"] = False
+        if getattr(slot.db_writer, "bulk", False):
+            keep_warm = False          # never keep the bulk-sized buffer pool around
         if keep_warm and self.RW_KEEP_SEC > 0 and slot.db_writer is not None \
                 and slot.db_writer.conn is not None:
             slot.db_ro = slot.db_writer
@@ -559,10 +579,28 @@ class Workspace:
                         pass
                 try:
                     _tiles.write(slot.cfg.data_dir / "tiles", arrays, man)
+                    self._remap_tiles(slot, gen)
                 except Exception:
                     log.warning("tile persist failed for %s", slot.slug, exc_info=True)
             self._persist_pool().submit(job)
         return sink
+
+    def _remap_tiles(self, slot, gen: int) -> None:
+        """A generation just persisted: serve it from the memory-mapped file
+        instead of the in-RAM arrays the pass built (same bytes)."""
+        from docgraph import tiles as _tiles
+        try:
+            loaded = _tiles.load(slot.cfg.data_dir / "tiles")
+        except Exception:
+            return
+        if loaded is None or int(loaded[0].get("generation", -1)) != int(gen):
+            return
+        live = slot.live
+        cur = live.tiles
+        if cur is not None and int(cur[0].get("generation", -1)) != int(gen):
+            return                                   # a newer one is in memory
+        live.tiles = loaded
+        slot.tile_store.install(*loaded)
 
     def _tile_patcher(self, slot):
         """Indexer hook: apply an incremental tile patch on the persist
@@ -582,7 +620,12 @@ class Workspace:
                     return
                 try:
                     if live.tiles is None:
-                        live.tiles = _tiles.load(slot.cfg.data_dir / "tiles")
+                        # share the arrays the store already serves (one copy)
+                        st = slot.tile_store
+                        if st.manifest is not None and st.a:
+                            live.tiles = (st.manifest, st.a)
+                        else:
+                            live.tiles = _tiles.load(slot.cfg.data_dir / "tiles")
                     if live.tiles is None or "sym_file" not in live.tiles[1]:
                         raise RuntimeError("no patchable tile sidecar")
                     man, arrays = live.tiles
@@ -600,6 +643,7 @@ class Workspace:
                             pass
                     if int(slot.maint.get("tiles_pending", 1)) <= 1:
                         _tiles.write(slot.cfg.data_dir / "tiles", new_arrays, new_man)
+                        self._remap_tiles(slot, gen)
                 except Exception as exc:
                     log.warning("tile patch for %s failed (%s): full rebuild scheduled", slot.slug, exc)
                     slot.maint["tiles_stale"] = True
@@ -670,20 +714,150 @@ class Workspace:
                         except Exception:
                             pass
                     try:
-                        slot.tile_store.ready()
+                        slot.tile_store.ready()          # memory-mapped, cheap
                     except Exception:
                         pass
-                    # the in-memory call graph behind every multi-hop tool
-                    # (impact_of, call_graph, processes, detect_changes, ...)
-                    try:
-                        r._mem_graph()
-                        r._node_table()
-                    except Exception:
-                        pass
+                    # The in-memory call graph / node table are NOT built
+                    # here: the first tool that needs them builds them
+                    # (~0.3 s on 200k functions) and idle unload drops them.
                     log.info("warm-up of %s done in %.1fs", slot.slug, time.perf_counter() - t0)
                 except Exception as exc:  # noqa: BLE001
                     log.info("warm-up skipped for %s: %s", root, exc)
+            # Loading torch + the first CUDA encode maps ~1.4 GB of DLL and
+            # kernel images that are touched once and never again: give the
+            # working set back now.
+            _procmem.trim("warm-up")
         threading.Thread(target=run, name="docgraph-warmup", daemon=True).start()
+        self.start_graph_unloader()
+
+    # -- idle memory ------------------------------------------------------
+    GRAPH_CHECK_SEC = 15.0
+    # a root with no tool call / pass for this long gets a working-set trim
+    # (nothing is dropped; touched pages fault back cheaply)
+    LIGHT_TRIM_IDLE_SEC = 60.0
+    # a working set above this is trimmed by the idle thread even while the
+    # host is busy, at most every WS_CAP_INTERVAL_SEC: pages still in use
+    # fault back from the standby list (a slower call or two), the rest --
+    # freed heap, stale Kuzu pages, torch images -- stays out
+    WS_SOFT_CAP_MB = 1024
+    WS_CAP_INTERVAL_SEC = 60.0
+
+    def touch(self, slot) -> None:
+        """A tool / API call used this root's retriever."""
+        slot.maint["last_use"] = time.time()
+        slot.maint["graph_loaded"] = True
+
+    def _last_activity(self, slot) -> float:
+        m = slot.maint
+        return max(float(m.get("last_use", 0.0)), float(m.get("last_pass", 0.0)),
+                   float(m.get("maint_end", 0.0)), float(m.get("started", 0.0)))
+
+    def start_graph_unloader(self) -> None:
+        """Background thread: light working-set trim after LIGHT_TRIM_IDLE_SEC
+        of inactivity, and the full graph unload after `graph_unload_after`."""
+        if getattr(self, "_graph_unloader", None) is not None:
+            return
+        now = time.time()
+        for slot in self._slots.values():
+            slot.maint.setdefault("started", now)
+
+        def run() -> None:
+            _lower_thread_priority()
+            while not getattr(self, "_closing", False):
+                time.sleep(self.GRAPH_CHECK_SEC)
+                try:
+                    self._idle_memory_tick()
+                except Exception as exc:  # noqa: BLE001 - never kill the host
+                    log.debug("idle memory tick failed: %s", exc)
+        t = threading.Thread(target=run, name="docgraph-graph-unloader", daemon=True)
+        self._graph_unloader = t
+        t.start()
+
+    def _idle_memory_tick(self) -> None:
+        now = time.time()
+        thr = float(getattr(self, "graph_unload_after", 0.0) or 0.0)
+        trimmed = False
+        for slot in list(self._slots.values()):
+            m = slot.maint
+            if m.get("running") or m.get("writer_taken"):
+                continue
+            idle = now - self._last_activity(slot)
+            if thr > 0 and idle >= thr and m.get("graph_loaded", True):
+                self.unload_graph(slot)
+                trimmed = True
+            elif idle >= self.LIGHT_TRIM_IDLE_SEC and m.get("trimmed_at", 0.0) < self._last_activity(slot):
+                m["trimmed_at"] = now
+                if not trimmed:
+                    _procmem.trim("idle")
+                    trimmed = True
+        if not trimmed and _procmem.memory().get("rss_mb", 0) > self.WS_SOFT_CAP_MB:
+            _procmem.trim("soft cap", min_interval=self.WS_CAP_INTERVAL_SEC)
+
+    def unload_graph(self, slot) -> bool:
+        """Drop the in-memory structures of an idle root -- retriever caches
+        (call-graph CSRs, node table, trace / explore graphs, memos, the PPR
+        graph), tile arrays, the incremental live state and the parse pool --
+        reopen the read handle (releases Kuzu's buffer pool) and trim the
+        working set. Everything is rebuilt lazily: the next tool call builds
+        what it needs, the next index pass reloads the live state."""
+        live = slot.live
+        if live is not None and not live.lock.acquire(blocking=False):
+            return False
+        try:
+            if slot.maint.get("running") or slot.maint.get("writer_taken"):
+                return False
+            if live is not None:
+                kw = live.kw
+                live.close_pool()
+                live.reset()
+                live.kw = kw                      # search keeps its keyword index
+            try:
+                slot.tile_store.unload()
+            except Exception:
+                pass
+            self._release_read_handle(slot)
+            slot.maint.pop("warm", None)          # nothing to prewarm after this
+            slot.maint["graph_loaded"] = False
+        finally:
+            if live is not None:
+                live.lock.release()
+        _procmem.trim("graph unload")
+        log.info("idle unload of %s done: %s", slot.slug, _procmem.memory())
+        return True
+
+    def _release_read_handle(self, slot) -> None:
+        """Fresh read handle + retriever (drops every per-generation cache
+        and Kuzu's buffer pool), under the root's write lock so no request
+        sees a closed handle."""
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            _drop_retriever_caches(slot.retriever)
+            return
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                slot.lock.acquire_write("graph-unload", timeout=10.0), loop)
+            fut.result(timeout=11.0)
+        except Exception:
+            _drop_retriever_caches(slot.retriever)
+            return
+        try:
+            with self._lock:
+                if slot.maint.get("writer_taken"):
+                    _drop_retriever_caches(slot.retriever)
+                    return
+                if slot.db_writer is not None:
+                    self._close_writer(slot, keep_warm=False)
+                else:
+                    old = slot.db_ro
+                    try:
+                        old.close()
+                    except Exception:
+                        pass
+                    slot.db_ro = self._reopen_ro(slot)
+                    self._new_retriever(slot)
+                _drop_retriever_caches(slot.retriever)
+        finally:
+            asyncio.run_coroutine_threadsafe(slot.lock.release_write(), loop)
 
     def _persist_pool(self):
         pool = getattr(self, "_persist", None)
@@ -703,6 +877,7 @@ class Workspace:
         from docgraph.index import Indexer
         slot = self.resolve(root)
         slot.maint["last_pass"] = time.time()
+        slot.maint["graph_loaded"] = True
         writer = self.take_writer(root, label=label)
         indexer = None
         try:
@@ -719,6 +894,10 @@ class Workspace:
                                           cancel_token=cancel_token, progress_cb=progress_cb,
                                           fetch_links=fetch_links, force_fetch=force_fetch)
             slot.maint["last_pass"] = time.time()
+            if not incremental:
+                # a full pass leaves hundreds of MB of freed Arrow batches /
+                # parse results in the heaps: hand them back
+                _procmem.trim("full index")
             return stats
         except BaseException:
             # a failed / cancelled pass may leave the in-memory state ahead
@@ -891,6 +1070,7 @@ class Workspace:
                 except Exception as exc:  # noqa: BLE001 - never kill the host
                     log.warning("maintenance for %s failed: %s", slot.slug, exc, exc_info=True)
                     slot.maint["error"] = str(exc)
+                slot.maint["maint_end"] = time.time()
                 with self._lock:
                     if not slot.maint.get("again"):
                         slot.maint["running"] = False
@@ -1167,6 +1347,7 @@ class Workspace:
 
     # ── lifecycle ───────────────────────────────────────────────────────
     def close(self) -> None:
+        self._closing = True
         # Cancel the idle unloader first so it doesn't race with the
         # embedder cache being emptied beneath it.
         if self._idle_task is not None and not self._idle_task.done():
