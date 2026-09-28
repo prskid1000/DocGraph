@@ -19,3 +19,6 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# locally built wheels with no PyPI build for this Python (e.g. kuzu cp314 win)
+wheels/

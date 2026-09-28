@@ -18,7 +18,7 @@
 #   .\setup.ps1 -PredownloadModels         # warm the HF cache with default embed + rerank
 #
 # Supported -CudaVersion values mirror what https://download.pytorch.org/whl/
-# publishes: cu118, cu121, cu124, cu126, cu128, cu129, cu130, cpu. The set
+# publishes: cu118, cu121, cu124, cu126, cu128, cu129, cu130, cu132, cpu. The set
 # moves with PyTorch; if a new index appears, extend ValidateSet below.
 
 [CmdletBinding()]
@@ -27,7 +27,7 @@ param(
     [switch]$Recreate,
     [switch]$NoShim,
     [string]$ShimDir = (Join-Path $HOME ".local\bin"),
-    [ValidateSet("cu118", "cu121", "cu124", "cu126", "cu128", "cu129", "cu130", "cpu", "auto")]
+    [ValidateSet("cu118", "cu121", "cu124", "cu126", "cu128", "cu129", "cu130", "cu132", "cpu", "auto")]
     [string]$CudaVersion = "auto",
     [switch]$PredownloadModels
 )
@@ -41,7 +41,7 @@ $VenvCli = Join-Path $VenvDir "Scripts\docgraph.exe"
 
 # When the user doesn't pick a torch wheel explicitly, probe nvidia-smi.
 # An NVIDIA GPU + the WDDM driver that ships with CUDA 13.x → default to
-# cu130. Anything older or no GPU → cpu. The detection is best-effort;
+# cu132 (any 13.x driver runs 13.2 wheels via minor-version compat). Anything older or no GPU → cpu. The detection is best-effort;
 # users can always override with -CudaVersion.
 function Resolve-CudaVersion {
     $smi = & nvidia-smi.exe --query-gpu=driver_version --format=csv,noheader 2>$null
@@ -53,7 +53,9 @@ function Resolve-CudaVersion {
     # supports CUDA 13.x; pre-570 needs an older CUDA wheel.
     $driver = ($smi -split "`n")[0].Trim()
     $major = [int]($driver -split "\.")[0]
-    if ($major -ge 570) {
+    if ($major -ge 580) {
+        return "cu132"
+    } elseif ($major -ge 570) {
         return "cu130"
     } elseif ($major -ge 525) {
         return "cu124"
@@ -96,6 +98,19 @@ $TorchIndex = "https://download.pytorch.org/whl/$CudaVersion"
 Write-Host "Installing torch from $TorchIndex ..."
 & $VenvPython -m pip install --index-url $TorchIndex torch
 if ($LASTEXITCODE -ne 0) { throw "torch install failed (exit $LASTEXITCODE)" }
+
+# kuzu 0.11.3 is the last release and PyPI has no Windows wheel for newer
+# Pythons (3.14+). A locally built wheel in wheels\ (gitignored; build with
+# `uv pip install --no-binary kuzu kuzu==0.11.3` inside a VS dev shell with
+# GNU make on PATH) is installed first so the editable install doesn't try
+# to compile it.
+$PyTag = & $VenvPython -c "import sys; print(f'cp{sys.version_info[0]}{sys.version_info[1]}')"
+$KuzuWheel = Get-ChildItem (Join-Path $Root "wheels") -Filter "kuzu-*-$PyTag-$PyTag-win_amd64.whl" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($KuzuWheel) {
+    Write-Host "Installing local kuzu wheel $($KuzuWheel.Name) ..."
+    & $VenvPython -m pip install $KuzuWheel.FullName
+    if ($LASTEXITCODE -ne 0) { throw "kuzu wheel install failed (exit $LASTEXITCODE)" }
+}
 
 Write-Host "Installing docgraph (editable) ..."
 & $VenvPython -m pip install -e $Root
