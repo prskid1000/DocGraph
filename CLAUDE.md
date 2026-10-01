@@ -160,7 +160,7 @@ One self-contained file, read fresh on every `GET /` (edit + reload, no restart)
 - Don't run pytest with `PYTHONIOENCODING=utf-8`: `test_cli_flags` decodes child `--help` output as cp1252 and rich's UTF-8 box characters then fail to decode.
 - pytest's `addopts` already has `-q`; adding another `-q` hides the pass/fail summary line.
 - A shell with `OMP_NUM_THREADS=1` makes CPU embedding ~10x slower (a 900-entity index took 7 min); use `--gpu` for scratch runs.
-- Starting a host from `D:\Projects\telecode` picks up telecode's own `docgraph/` package (`No module named docgraph.__main__`): set the working directory to this repo.
+- Starting a host from `D:\Projects\Telecode` picks up telecode's own `docgraph/` package (`No module named docgraph.__main__`): set the working directory to this repo.
 - A script that runs `Indexer.index_all` must guard its body with `if __name__ == "__main__":` -- the parse pool spawns (Windows) re-import `__main__`, and an unguarded script re-opens the DB in every worker (`Could not set lock on file`).
 - UI checks in headless Chrome: `--use-angle=swiftshader` is software GL (compositing-bound); add `--use-angle=d3d11 --enable-gpu` for the real GPU. A tab opened over CDP must be brought to front (`Page.bringToFront`) or rAF is throttled.
 
