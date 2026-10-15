@@ -92,7 +92,9 @@ class Reranker:
                     self._encoder = CrossEncoder(self.model_name, device="cpu")
                 else:
                     raise
-            if self.torch_compile:
+            # torch.compile on CPU initialises CUDA (pins a context, no benefit), so
+            # only compile when actually on cuda.
+            if self.torch_compile and self._resolved_device == "cuda":
                 # CrossEncoder wraps the inner HF model on `.model`; compile
                 # that, not the wrapper.
                 try:

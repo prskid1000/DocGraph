@@ -256,7 +256,9 @@ class Embedder:
                 except Exception:
                     pass
             model.eval()
-            if self.torch_compile:
+            # torch.compile on CPU initialises CUDA (pins a context, no benefit), so
+            # only compile when actually on cuda.
+            if self.torch_compile and on_cuda:
                 # `reduce-overhead` is the right mode for many small inference
                 # calls (our hot path). `default` would be safer but slower.
                 # Wrapping in try/except because compile fails on older
