@@ -500,8 +500,13 @@ def test_embed_profiles_no_download():
     from docgraph.embed import Embedder, dim_for_model, model_profile
     assert dim_for_model("nomic-ai/CodeRankEmbed") == 768
     assert dim_for_model("Qodo/Qodo-Embed-1-1.5B") == 1536
-    assert model_profile("jinaai/jina-embeddings-v2-base-code")["trust_remote_code"] is True
+    assert model_profile("nomic-ai/CodeRankEmbed")["trust_remote_code"] is True
+    assert model_profile("nomic-ai/CodeRankEmbed")["max_seq"] == 512
     assert model_profile("BAAI/bge-small-en-v1.5") == {}
+    # removed: their Hub code no longer loads on transformers 5 (Jina) or crashes CUDA (SFR)
+    assert model_profile("jinaai/jina-embeddings-v2-base-code") == {}
+    assert model_profile("Salesforce/SFR-Embedding-Code-400M_R") == {}
+    assert dim_for_model("Alibaba-NLP/gte-modernbert-base") == 768
     e = Embedder("nomic-ai/CodeRankEmbed")
     assert e._prefixed(["q"], "query") == ["Represent this query for searching relevant code: q"]
     assert e._prefixed(["d"], "document") == ["d"]

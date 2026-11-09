@@ -58,6 +58,8 @@ tree-sitter-vhdl
 # `setup.ps1` does this automatically; pip install -r alone gives the CPU wheel.
 torch>=2.4
 sentence-transformers>=3.0
+# the default embedder (nomic-ai/CodeRankEmbed, NomicBert remote code) imports einops
+einops>=0.7
 
 # MCP / HTTP
 fastmcp>=2.0

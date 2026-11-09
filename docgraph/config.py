@@ -26,7 +26,7 @@ class Config:
     # Cross-encoder reranker (opt-in per search call). When `rerank_default`
     # is True the API/MCP `search` endpoints default `rerank=True` so callers
     # don't have to ask for it. `rerank_model` empty = use Reranker's default
-    # (jinaai/jina-reranker-v1-tiny-en).
+    # (Alibaba-NLP/gte-reranker-modernbert-base).
     rerank_default: bool = False
     rerank_model: str = ""
     # Run the cross-encoder reranker on NVIDIA CUDA via torch, falling back

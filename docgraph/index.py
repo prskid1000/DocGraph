@@ -828,6 +828,14 @@ class Indexer:
                 log.warning("schema v%s -> v%s: forcing full reindex of %s",
                             state0.get("schema_version", 1), SCHEMA_VERSION, self.cfg.repo_root)
             incremental = False
+        prev_model = state0.get("embedding_model")
+        if incremental and prev_model and prev_model != self.embedder.model_name:
+            # Vectors of two models cannot be mixed (and the size may differ: the schema column is sized for
+            # the model): a model switch, including a changed default, rebuilds the index once.
+            _console.print(f"[yellow]Embedding model {prev_model} -> {self.embedder.model_name}: running a full reindex[/]")
+            log.warning("embedding model %s -> %s: forcing full reindex of %s",
+                        prev_model, self.embedder.model_name, self.cfg.repo_root)
+            incremental = False
         if incremental and not cache:
             incremental = False          # no per-file state: a delta cannot be computed
         cache_was_present = bool(cache) and incremental

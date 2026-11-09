@@ -1203,7 +1203,7 @@ def daemon_start(
     rerank_model: str = typer.Option(
         "", "--rerank-model",
         help="Cross-encoder reranker model. Empty = Reranker's default "
-             "(jinaai/jina-reranker-v1-tiny-en). The daemon serves rerank "
+             "(Alibaba-NLP/gte-reranker-modernbert-base). The daemon serves rerank "
              "scoring alongside embeddings.",
     ),
     dtype: str = typer.Option(
@@ -1483,7 +1483,7 @@ def embed_models() -> None:
     table = Table(show_header=True)
     for col in ("model", "dim", "query prefix", "remote code", "notes"):
         table.add_column(col)
-    table.add_row("BAAI/bge-small-en-v1.5 (default)", "384", "-", "no", "general text; fast on CPU")
+    table.add_row("BAAI/bge-small-en-v1.5 (default)", "384", "-", "no", "best end to end and fastest")
     for name, p in MODEL_PROFILES.items():
         table.add_row(name, str(p["dim"]), "yes" if p.get("query_prefix") else "-",
                       "yes" if p.get("trust_remote_code") else "no", p.get("notes", ""))

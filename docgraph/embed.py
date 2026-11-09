@@ -28,6 +28,12 @@ log = logging.getLogger(__name__)
 _MODEL_CACHE: dict[tuple, Any] = {}
 _MODEL_CACHE_LOCK = threading.Lock()
 
+# Default embedder, chosen by measurement (2026-11-09, README "Embedding models"). End to end (`docgraph bench
+# --runner search`, the full hybrid search) bge-small is best AND fastest: recall@5 0.433 / MRR 0.373, 0.09 s per
+# query, vs CodeRankEmbed 0.333 / 0.284 (0.86 s) and gte-modernbert-base 0.300 / 0.249. On pure docstring -> function
+# vector matching (1,468 queries) CodeRankEmbed leads (recall@1 0.712 vs 0.520), but that is its training task.
+DEFAULT_EMBED_MODEL = "BAAI/bge-small-en-v1.5"
+
 # Common embedding dims so schema-init doesn't have to load the model just
 # to size Kuzu's `embedding DOUBLE[N]` column. Unknown models fall through
 # to a one-time `SentenceTransformer.get_sentence_embedding_dimension()`
@@ -52,6 +58,8 @@ _KNOWN_DIMS: dict[str, int] = {
     "jinaai/jina-embeddings-v2-small-en":              512,
     "jinaai/jina-embeddings-v2-base-en":               768,
     "nomic-ai/nomic-embed-text-v1.5":                  768,
+    "nomic-ai/CodeRankEmbed":                          768,
+    "Alibaba-NLP/gte-modernbert-base":                 768,
     "mixedbread-ai/mxbai-embed-large-v1":              1024,
 }
 
@@ -68,21 +76,19 @@ _KNOWN_DIMS: dict[str, int] = {
 #                      otherwise allocate 8k-token attention per chunk)
 MODEL_PROFILES: dict[str, dict] = {
     "nomic-ai/CodeRankEmbed": {
-        "dim": 768, "trust_remote_code": True, "max_seq": 1024,
+        # 512 tokens: what it was measured with; half the attention memory of 1024 (it shares a 12 GB GPU with
+        # llama-server) and functions are chunked below that anyway
+        "dim": 768, "trust_remote_code": True, "max_seq": 512,
         "query_prefix": "Represent this query for searching relevant code: ",
-        "notes": "137M code retriever (CoRNStack); query prefix required",
+        "notes": "137M code retriever: best on docstring-style queries (R@1 0.712), weaker end to end; needs einops",
     },
-    "jinaai/jina-embeddings-v2-base-code": {
-        "dim": 768, "trust_remote_code": True, "max_seq": 1024,
-        "notes": "161M, 30 languages; its Hub remote code needs transformers < 5",
+    "Alibaba-NLP/gte-modernbert-base": {
+        "dim": 768, "max_seq": 512,
+        "notes": "149M ModernBERT, no remote code; R@1 0.568",
     },
     "Qodo/Qodo-Embed-1-1.5B": {
         "dim": 1536, "trust_remote_code": False, "max_seq": 1024,
         "notes": "1.5B Qwen2-based code embedder; GPU strongly recommended",
-    },
-    "Salesforce/SFR-Embedding-Code-400M_R": {
-        "dim": 1024, "trust_remote_code": True, "max_seq": 1024,
-        "notes": "400M code retriever",
     },
     "nomic-ai/nomic-embed-text-v1.5": {
         "dim": 768, "trust_remote_code": True, "max_seq": 1024,
@@ -196,7 +202,7 @@ class Embedder:
 
     def __init__(
         self,
-        model_name: str = "BAAI/bge-small-en-v1.5",
+        model_name: str = DEFAULT_EMBED_MODEL,
         device: str | None = None,
         dtype: str = "auto",
         torch_compile: bool = False,

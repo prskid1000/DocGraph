@@ -60,6 +60,7 @@ dependencies = [
     "tree-sitter-vhdl",
     "torch>=2.4",
     "sentence-transformers>=3.0",
+    "einops>=0.7",
     "fastmcp>=2.0",
     "fastapi>=0.115",
     "uvicorn[standard]>=0.32",

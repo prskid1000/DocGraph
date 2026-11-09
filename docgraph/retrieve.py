@@ -86,7 +86,7 @@ class Retriever:
             return self.workspace.reranker_for(self.cfg)
         if self._reranker is None:
             # cfg.rerank_model may be "" — Reranker falls back to its built-in
-            # default (jinaai/jina-reranker-v1-tiny-en).
+            # default (Alibaba-NLP/gte-reranker-modernbert-base).
             model = getattr(self.cfg, "rerank_model", "") or None
             from .embed import resolve_device
             self._reranker = Reranker(

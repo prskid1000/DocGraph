@@ -19,7 +19,12 @@ from typing import Any
 
 log = logging.getLogger(__name__)
 
-DEFAULT_RERANK_MODEL = "jinaai/jina-reranker-v1-tiny-en"
+# The only reranker measured to help on code (2026-11-09, README "Reranker"): over bge-small's top 20, recall@1
+# 0.520 -> 0.668; every other one tried made results worse (MiniLM, mxbai xsmall/base, bge-reranker base/v2-m3).
+# End to end (README) it lifts recall@5 0.433 -> 0.467 but lowers MRR 0.373 -> 0.261 and adds ~0.5 s per search,
+# so reranking stays opt-in.
+# (jina-reranker-v1-tiny-en, the previous default, does not load on transformers >= 5.)
+DEFAULT_RERANK_MODEL = "Alibaba-NLP/gte-reranker-modernbert-base"
 RERANK_TOP_K = 50  # how many candidates feed into the cross-encoder
 
 

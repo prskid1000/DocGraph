@@ -45,7 +45,7 @@ Most code-intelligence tools either ship a heavy multi-service stack (Neo4j + a 
 - **Differentiator edges** — `SIMILAR_TO` (vector top-K), `CO_CHANGED_WITH` (git history), `TESTS` (heuristic). Answers "what else will my change break?".
 - **Differentiator MCP tools** — `explore` (multi-hop BFS), `impact_of` (blast radius), `test_impact` (which tests cover this?), `cypher` (raw read-only graph query — rejects writes server-side).
 - **Personalized PageRank** — `search` accepts `focus_file` / `focus_symbol` and ranks by proximity to what the agent is editing.
-- **Cross-encoder reranker** — opt-in `search(rerank=True)` lifts top-K precision via a 33 MB Jina cross-encoder (local, torch).
+- **Cross-encoder reranker** — opt-in `search(rerank=True)`: a cross-encoder (`Alibaba-NLP/gte-reranker-modernbert-base`, 150M, local, torch) re-scores the top candidates. See [Reranker](#reranker) for when it helps.
 - **Scope-aware resolution** — `CALLS` / `INSTANTIATES` / `INHERITS` prefer same-file then imported-file targets, killing most overload hallucinations without an LSP daemon.
 - **Symbol-level imports + method overrides** — `IMPORTS_SYMBOL` (file → exact Class / Function imported by name) and `OVERRIDES` (child method → parent via the inheritance closure).
 - **Sub-function chunking** — long bodies split + embedded per chunk; search max-pools across chunks so a 1000-line class still has fine recall.
@@ -261,23 +261,45 @@ Any sentence-transformers id works with `--embed-model`. Code-specific models ge
 
 | Model | Dim | Notes |
 |---|---|---|
-| `BAAI/bge-small-en-v1.5` (default) | 384 | general text, fast on CPU |
-| `nomic-ai/CodeRankEmbed` | 768 | code retriever; query prefix; remote code; needs `pip install einops` |
-| `Qodo/Qodo-Embed-1-1.5B` | 1536 | 1.5B code embedder; GPU strongly recommended (6.2 GB download) |
-| `jinaai/jina-embeddings-v2-base-code` | 768 | profile present, but its Hub remote code does not load on transformers >= 5 |
-| `Salesforce/SFR-Embedding-Code-400M_R`, `nomic-ai/nomic-embed-text-v1.5`, `intfloat/e5-*-v2` | 1024 / 768 / 384-1024 | prefixes / remote code handled |
+| `BAAI/bge-small-en-v1.5` (default) | 384 | best end to end and fastest |
+| `nomic-ai/CodeRankEmbed` | 768 | code retriever; query prefix; remote code; needs `einops` (in the requirements); capped at 512 tokens |
+| `Alibaba-NLP/gte-modernbert-base` | 768 | ModernBERT, no remote code |
+| `Qodo/Qodo-Embed-1-1.5B` | 1536 | 1.5B code embedder; ~3 GB of VRAM, 6.2 GB download |
+| `nomic-ai/nomic-embed-text-v1.5`, `intfloat/e5-*-v2` | 768 / 384-1024 | prefixes / remote code handled |
 
-**Switching model changes the vector size: `docgraph clear` (or `POST /api/admin/clear`) and a full reindex are required.**
+`jinaai/jina-embeddings-v2-base-code` and `Salesforce/SFR-Embedding-Code-400M_R` no longer have profiles: Jina's Hub code does not load on transformers >= 5, SFR's triggers a CUDA device-side assert.
 
-Measured on this repository (65 files, 1,135 entities, full index on an RTX 5070 Ti; `docgraph bench --runner search`, 15 questions, recall@5 / MRR of the reference symbols through the full hybrid search):
+**Switching model changes the vector size: the next index pass notices the different model in `state.json` and runs one full reindex** (a model's vectors are never mixed with another's).
 
-| Model | recall@5 | MRR | embed time (GPU) |
-|---|---|---|---|
-| bge-small-en-v1.5 | 0.533 | 0.462 | ~5 s |
-| CodeRankEmbed | 0.467 | 0.325 | ~25 s |
-| Qodo-Embed-1-1.5B | 0.633 | 0.519 | 68 s |
+Measured 2026-11-09 on an RTX 5070 Ti (fp16), two ways:
 
-The default stays `bge-small-en-v1.5`: CodeRankEmbed is worse here, and Qodo's gain (1–2 of 15 questions) does not justify a 6 GB model, a GPU requirement and 4x larger vectors as a default. Pick Qodo explicitly if you have the GPU.
+- **End to end** (`docgraph bench --runner search` on this repository, 82 files / 1,732 entities, 15 questions through the full hybrid search, recall@5 / MRR of the reference symbols) -- what an agent gets.
+- **Docstring -> function** (1,468 queries from this repository and telecode: the first sentence of a function's docstring must find that function's code, docstring removed; pure vector matching) -- many queries, but it is the task CodeRankEmbed was trained on.
+
+| Model | end to end recall@5 | MRR | s / query | index | docstring recall@1 | MRR@10 | GPU docs/s |
+|---|---|---|---|---|---|---|---|
+| bge-small-en-v1.5 | **0.433** | **0.373** | **0.09** | **35 s** | 0.520 | 0.637 | 337 |
+| CodeRankEmbed | 0.333 | 0.284 | 0.86 | 77 s | **0.712** | **0.798** | 81 |
+| gte-modernbert-base | 0.300 | 0.249 | 0.25 | 50 s | 0.568 | 0.680 | 264 |
+| bge-base-en-v1.5 | | | | | 0.565 | 0.670 | 600 |
+| e5-base-v2 | | | | | 0.527 | 0.642 | 337 |
+
+The default stays `bge-small-en-v1.5`: it is the best and the fastest end to end (an earlier run with 1.5B Qodo-Embed gave it 1-2 more of the 15 questions for a 6 GB model, a GPU requirement and 4x larger vectors). Pick CodeRankEmbed when searches are mostly "what does this do"-style descriptions of single functions.
+
+### Reranker
+
+`search(rerank=True)` (or `--rerank-default`) re-scores the top candidates with a cross-encoder. Default model: `Alibaba-NLP/gte-reranker-modernbert-base` (the previous default, `jinaai/jina-reranker-v1-tiny-en`, does not load on transformers >= 5; search then silently ran without reranking). Measured 2026-11-09:
+
+| Reranker | docstring set: recall@1 over bge-small's top 20 (0.520 without) | ms / query (top 20, GPU) |
+|---|---|---|
+| **gte-reranker-modernbert-base** | **0.668** | 137 |
+| bge-reranker-v2-m3 (568M) | 0.496 | 194 |
+| mxbai-rerank-base-v1 | 0.482 | 188 |
+| ms-marco-MiniLM-L6-v2 | 0.475 | 29 |
+| mxbai-rerank-xsmall-v1 | 0.470 | 90 |
+| bge-reranker-base | 0.445 | 70 |
+
+Only gte-reranker helps on code; the rest are trained on web text and make the order worse. End to end it lifts recall@5 0.433 -> 0.467 but lowers MRR 0.373 -> 0.261 and adds ~0.5 s per search, and over CodeRankEmbed it lowers recall@1 (0.712 -> 0.692): reranking stays opt-in.
 
 ### Embedding daemon (shared model, optional)
 
@@ -533,7 +555,7 @@ docgraph/
   agent_setup.py     # `docgraph agent-setup` + hook runtime
   bench.py           # `docgraph bench` harness (+ bench_questions.json)
   rename.py          # apply a rename plan (API only)
-  rerank.py          # lazy Jina cross-encoder (~33 MB), GPU-capable
+  rerank.py          # lazy cross-encoder (gte-reranker-modernbert-base), GPU-capable
   llm.py             # urllib client + set_docstring_prompt(text) override
   mcp_tools.py       # 26 MCP tools + resources + prompts, all with closed-enum `root`
   mcp_stdio_proxy.py # strict stdio↔HTTP proxy for editors

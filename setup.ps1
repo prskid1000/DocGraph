@@ -134,8 +134,8 @@ if ($PredownloadModels) {
     & $VenvPython -c @"
 from sentence_transformers import SentenceTransformer, CrossEncoder
 SentenceTransformer('BAAI/bge-small-en-v1.5', device='cpu')
-CrossEncoder('jinaai/jina-reranker-v1-tiny-en', device='cpu')
-print('  cached BAAI/bge-small-en-v1.5 + jinaai/jina-reranker-v1-tiny-en')
+CrossEncoder('Alibaba-NLP/gte-reranker-modernbert-base', device='cpu')
+print('  cached BAAI/bge-small-en-v1.5 + Alibaba-NLP/gte-reranker-modernbert-base')
 "@
 }
 
