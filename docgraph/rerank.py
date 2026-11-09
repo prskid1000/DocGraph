@@ -94,7 +94,10 @@ class Reranker:
                     raise
             # torch.compile on CPU initialises CUDA (pins a context, no benefit), so
             # only compile when actually on cuda.
-            if self.torch_compile and self._resolved_device == "cuda":
+            from docgraph.embed import triton_available
+            if self.torch_compile and self._resolved_device == "cuda" and not triton_available():
+                log.info("Reranker %s: torch.compile skipped (Triton is not installed)", self.model_name)
+            elif self.torch_compile and self._resolved_device == "cuda":
                 # CrossEncoder wraps the inner HF model on `.model`; compile
                 # that, not the wrapper.
                 try:

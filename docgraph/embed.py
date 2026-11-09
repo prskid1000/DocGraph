@@ -167,6 +167,14 @@ def _pick_dtype(pref: str, on_cuda: bool):
     return torch.float32
 
 
+def triton_available() -> bool:
+    """torch.compile's default backend (inductor) generates Triton kernels. Without Triton (no official Windows
+    build) the compile fails on the first forward - measured 6.2 s for bge-small - and the model runs eager
+    anyway, so callers skip the attempt."""
+    import importlib.util
+    return importlib.util.find_spec("triton") is not None
+
+
 def _empty_cuda_cache() -> None:
     try:
         import torch
@@ -258,7 +266,9 @@ class Embedder:
             model.eval()
             # torch.compile on CPU initialises CUDA (pins a context, no benefit), so
             # only compile when actually on cuda.
-            if self.torch_compile and on_cuda:
+            if self.torch_compile and on_cuda and not triton_available():
+                log.info("Embedder %s: torch.compile skipped (Triton is not installed)", self.model_name)
+            elif self.torch_compile and on_cuda:
                 # `reduce-overhead` is the right mode for many small inference
                 # calls (our hot path). `default` would be safer but slower.
                 # Wrapping in try/except because compile fails on older

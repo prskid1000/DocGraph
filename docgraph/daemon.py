@@ -287,6 +287,13 @@ def client_rerank_model() -> str | None:
 # ----- Server side -------------------------------------------------------
 
 
+def _busy(ctx: dict, delta: int) -> None:
+    """Requests in flight. The idle monitor leaves a busy daemon alone: a first request that is still loading
+    its model (10 s and more) used to count as idle with nothing loaded, and the daemon exited mid-request."""
+    with ctx["busy_lock"]:
+        ctx["busy"] += delta
+
+
 def _serve_one(conn: socket.socket, ctx: dict) -> bool:
     """Handle one request on `conn`. Returns False if the daemon should exit.
 
@@ -335,6 +342,7 @@ def _serve_one(conn: socket.socket, ctx: dict) -> bool:
         return False
     if op == "embed":
         texts = req.get("texts") or []
+        _busy(ctx, +1)
         try:
             ctx["last_embed"] = time.monotonic()
             import torch
@@ -353,11 +361,15 @@ def _serve_one(conn: socket.socket, ctx: dict) -> bool:
             payload: dict[str, Any] = {"embeddings": vecs}
         except Exception as e:
             payload = {"error": str(e)}
+        finally:
+            ctx["last_embed"] = time.monotonic()  # idle counts from the end of the work, not its start
+            _busy(ctx, -1)
         _send(conn, payload)
         return True
     if op == "rerank":
         query = req.get("query") or ""
         documents = req.get("documents") or []
+        _busy(ctx, +1)
         try:
             ctx["last_rerank"] = time.monotonic()
             with ctx["lock"]:
@@ -367,6 +379,9 @@ def _serve_one(conn: socket.socket, ctx: dict) -> bool:
             payload = {"scores": [float(s) for s in scores]}
         except Exception as e:
             payload = {"error": str(e)}
+        finally:
+            ctx["last_rerank"] = time.monotonic()
+            _busy(ctx, -1)
         _send(conn, payload)
         return True
     _send(conn, {"error": f"unknown op: {op}"})
@@ -460,20 +475,26 @@ def run_daemon(
         "idle_exit_sec": idle_exit_sec,
         "last_embed": now0,
         "last_rerank": now0,
+        "busy": 0,                   # requests in flight (see _busy)
+        "busy_lock": threading.Lock(),
     }
     shutdown = threading.Event()
 
     def idle_monitor() -> None:
         """Two-stage idle: unload weights, then exit to free the context."""
         while not shutdown.wait(2.0):
+            if ctx["busy"] > 0:
+                continue  # never unload or exit under a running request
             now = time.monotonic()
-            if (embed_idle_unload_sec > 0 and embedder.is_loaded()
-                    and now - ctx["last_embed"] >= embed_idle_unload_sec):
-                embedder.unload()
-            if (rerank_idle_unload_sec > 0 and reranker.is_loaded()
-                    and now - ctx["last_rerank"] >= rerank_idle_unload_sec):
-                reranker.unload()
-            if (idle_exit_sec > 0
+            # under the inference lock: an unload never interleaves with a request that just started
+            with ctx["lock"]:
+                if (embed_idle_unload_sec > 0 and embedder.is_loaded() and ctx["busy"] == 0
+                        and now - ctx["last_embed"] >= embed_idle_unload_sec):
+                    embedder.unload()
+                if (rerank_idle_unload_sec > 0 and reranker.is_loaded() and ctx["busy"] == 0
+                        and now - ctx["last_rerank"] >= rerank_idle_unload_sec):
+                    reranker.unload()
+            if (idle_exit_sec > 0 and ctx["busy"] == 0
                     and not embedder.is_loaded() and not reranker.is_loaded()):
                 idle_for = now - max(ctx["last_embed"], ctx["last_rerank"])
                 if idle_for >= idle_exit_sec:
